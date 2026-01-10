@@ -1,0 +1,19 @@
+{
+  "scene": "scenes/house/scene.xml",
+  "num_probes": 15000,
+  "num_moments": 2,
+  "sun_hours": [
+    6,
+    9,
+    12,
+    15,
+    18,
+    21
+  ],
+  "spp": 256,
+  "num_sh_samples": 16,
+  "num_gt_images": 10,
+  "scene_bounds": null,
+  "timestamp": "2025-12-09T17:45:17.137925",
+  "generated_by": "generate_dataset.py (CLI mode)"
+}

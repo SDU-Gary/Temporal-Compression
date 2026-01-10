@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data files (too large for git)
+data_generation/output/dataset_2k/
+data_generation/output/dataset_15k/
+data_generation/output/method_test_v1/
+
+# Temporary files
+*.log
+*.tmp
+*.cache
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Mitsuba cache
+*.exr
+*.hdr
+
+# Training outputs
+multi_time_compression/experiments/
+multi_time_compression/output/*/checkpoint_*.pt
+
+# Large reference files
+reference/*.pdf

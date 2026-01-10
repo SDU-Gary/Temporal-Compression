@@ -1,0 +1,17 @@
+{
+  "num_probes": 8,
+  "num_light_positions": 2,
+  "num_samples": 16,
+  "spp": 16,
+  "light_intensity": 50.0,
+  "box_size": 1.0,
+  "grid_resolution": 2,
+  "rendering_time_hours": 0.0002406427777777778,
+  "tensor_stats": {
+    "mean": 0.04636382311582565,
+    "std": 0.49180367588996887,
+    "min": -2.071538209915161,
+    "max": 1.6411246061325073
+  },
+  "created_at": "2026-01-02T16:44:29.633660"
+}

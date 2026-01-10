@@ -1,0 +1,37 @@
+{
+  "model": "K30_r8",
+  "checkpoint_epoch": 906,
+  "n_samples": 5,
+  "test_indices": [
+    121,
+    530,
+    495,
+    612,
+    597
+  ],
+  "psnr_list": [
+    33.031308533496734,
+    22.02144593246706,
+    25.479961171506076,
+    24.677513435851644,
+    32.59950996377679
+  ],
+  "ssim_list": [
+    0.9399758434306514,
+    0.34452495277108575,
+    0.9469647407735066,
+    0.40342051589284517,
+    0.8595796300840581
+  ],
+  "avg_psnr": 27.56194780741966,
+  "std_psnr": 4.441682794920745,
+  "avg_ssim": 0.6988931365904294,
+  "std_ssim": 0.26771679843295987,
+  "min_psnr": 22.02144593246706,
+  "max_psnr": 33.031308533496734,
+  "target_psnr": 30.0,
+  "target_ssim": 0.95,
+  "pass_psnr": false,
+  "pass_ssim": false,
+  "note": "Envmap-based rendering comparison (simplified, no full path tracing)"
+}

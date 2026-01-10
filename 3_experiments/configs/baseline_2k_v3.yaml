@@ -1,0 +1,84 @@
+# Baseline 2K V3 - Aggressive optimization
+# Fix: Reduced temporal_smooth from 0.05 to 0.01 (80% reduction)
+# Also: Slightly increased learning rate and model capacity
+# Expected: temporal_smooth占比~8%, PSNR提升至36-38/33-35 dB
+
+experiment:
+  name: "baseline_2k_v3"
+  output_dir: "experiments/baseline_2k_v3"
+  device: "cuda"
+  seed: 42
+
+data:
+  dataset_path: "../data_generation/output/dataset_2k"
+  train_ratio: 0.6           # 6,220 training samples
+  val_ratio: 0.2             # 2,073 validation samples
+  batch_size: 64             # ~97 batches per epoch
+  num_workers: 4
+  pin_memory: true
+
+model:
+  # Increased model capacity slightly
+  num_gaussians: 300         # Increased from 250
+  latent_dim_base: 6
+  latent_dim_time: 9
+
+  temporal_mlp:
+    input_dim: 9
+    hidden_dim: 32
+    num_layers: 2
+    activation: "relu"
+
+  decoder_mlp:
+    input_dim: 15
+    hidden_dim: 64
+    num_layers: 2
+    output_dim: 27
+    activation: "relu"
+
+training:
+  num_steps: 15000           # Longer training
+  log_interval: 100
+  val_interval: 250
+  save_interval: 1000
+  max_checkpoints: 3
+
+  optimizer:
+    gaussians:
+      type: "Adam"
+      lr: 0.01               # Increased from 0.008
+      betas: [0.9, 0.999]
+      weight_decay: 0.01     # Reduced from 0.015
+
+    mlp:
+      type: "Adam"
+      lr: 0.001              # Increased from 0.0008
+      betas: [0.9, 0.999]
+      weight_decay: 0.0001   # Reduced from 0.0005
+
+  scheduler:
+    enabled: true
+    warmup_steps: 1000
+    min_lr: 1.0e-6
+
+  # KEY CHANGE: Minimal temporal regularization
+  loss:
+    reconstruction: 1.0
+    temporal_smooth: 0.01    # Reduced from 0.05 → 0.01 (80% reduction)
+    energy_conservation: 0.0
+    temporal_norm: "l2"
+
+  grad_clip: 1.0
+
+  early_stopping:
+    enabled: true
+    patience: 30             # More patience
+    min_delta: 1.0e-5
+
+validation:
+  num_visualization: 4
+
+gaussian_init:
+  method: "kmeans"
+  max_iter: 100
+  tol: 1.0e-4

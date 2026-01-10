@@ -1,0 +1,30 @@
+{
+  "num_probes": 8,
+  "num_moments": 2,
+  "period": 3.0,
+  "intensity_function": "sinusoidal",
+  "intensity_formula": "I(t) = 0.5 + 0.5 * sin(2\u03c0 * t / T)",
+  "intensity_range": [
+    0.0,
+    1.0
+  ],
+  "spp": 32,
+  "sh_samples": 16,
+  "sh_order": 2,
+  "sh_coeffs_dim": 27,
+  "scene": "cornell-box",
+  "light_type": "area_light_ceiling",
+  "scene_bounds": [
+    -0.9,
+    0.9,
+    -0.9,
+    0.9,
+    0.1,
+    0.9
+  ],
+  "time_range": [
+    0.0,
+    3.0
+  ],
+  "time_step": 1.5
+}

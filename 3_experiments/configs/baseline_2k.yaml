@@ -1,0 +1,90 @@
+# Baseline configuration for dataset_2k (1,728 probes, 10,368 samples)
+# With 6,220 training samples, we can use full model capacity
+# Params/sample ratio: 2.03:1 (excellent - no overfitting risk)
+
+experiment:
+  name: "baseline_2k_house"
+  output_dir: "experiments/baseline_2k"
+  device: "cuda"
+  seed: 42
+
+data:
+  dataset_path: "../data_generation/output/dataset_2k"
+  train_ratio: 0.6           # 6,220 training samples
+  val_ratio: 0.2             # 2,073 validation samples
+  batch_size: 64             # ~97 batches per epoch (much better than previous ~3)
+  num_workers: 4
+  pin_memory: true
+
+model:
+  # Full model capacity - we have enough data now
+  num_gaussians: 250         # Can support up to ~300 with 6k+ samples
+  latent_dim_base: 6         # Base latent code dimension (F_j^base)
+  latent_dim_time: 9         # Time-varying latent code dimension (F_j(t))
+
+  # Temporal MLP: [F_j^base, sun_dir] -> F_j(t)
+  temporal_mlp:
+    input_dim: 9             # latent_dim_base (6) + sun_dir (3)
+    hidden_dim: 32
+    num_layers: 2
+    activation: "relu"
+
+  # Decoder MLP: [F(p,t), p, sun_dir] -> SH coefficients
+  decoder_mlp:
+    input_dim: 15            # latent_dim_time (9) + position (3) + sun_dir (3)
+    hidden_dim: 64
+    num_layers: 2
+    output_dim: 27           # 2nd order SH (9 bases × 3 RGB)
+    activation: "relu"
+
+training:
+  num_steps: 10000           # Full training with sufficient data
+  log_interval: 100          # Log every N steps
+  val_interval: 250          # More frequent validation to monitor progress
+  save_interval: 1000        # Save checkpoint every N steps
+  max_checkpoints: 3         # Keep last 3 checkpoints
+
+  # Dual optimizer setup with moderate regularization
+  optimizer:
+    gaussians:
+      type: "Adam"           # Adam instead of Adan for stability
+      lr: 0.008              # Moderate learning rate
+      betas: [0.9, 0.999]
+      weight_decay: 0.015    # Moderate regularization (between baseline 0.02 and regularized 0.01)
+
+    mlp:
+      type: "Adam"
+      lr: 0.0008             # Moderate learning rate
+      betas: [0.9, 0.999]
+      weight_decay: 0.0005   # Light regularization (between baseline 1e-5 and regularized 0.001)
+
+  # Learning rate scheduling
+  scheduler:
+    enabled: true
+    warmup_steps: 1000       # Standard warmup
+    min_lr: 1.0e-6
+
+  # Loss weights - moderate temporal constraint
+  loss:
+    reconstruction: 1.0      # L2 loss on SH coefficients
+    temporal_smooth: 0.05    # Moderate temporal consistency (between 0.01 and 0.1)
+    energy_conservation: 0.0 # Physics constraint (Stage 3+)
+    temporal_norm: "l2"      # l2 norm for smoothness
+
+  # Gradient clipping
+  grad_clip: 1.0
+
+  # Early stopping with more patience (we have good data)
+  early_stopping:
+    enabled: true
+    patience: 20             # More patience than regularized (10) - we expect stable training
+    min_delta: 1.0e-5        # Minimum change to qualify as improvement
+
+validation:
+  num_visualization: 4       # Number of samples to visualize
+
+# Gaussian initialization
+gaussian_init:
+  method: "kmeans"           # K-Means clustering on probe positions
+  max_iter: 100
+  tol: 1.0e-4

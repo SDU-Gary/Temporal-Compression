@@ -1,0 +1,33 @@
+{
+  "num_probes": 125,
+  "num_configs": 41,
+  "num_geometric": 12,
+  "num_intensity": 20,
+  "num_atmospheric": 9,
+  "num_samples": 64,
+  "spp": 128,
+  "box_size": 1.0,
+  "generation_date": "2026-01-03T11:43:49.367763",
+  "parameter_ranges": {
+    "sun_zenith": [
+      0,
+      90
+    ],
+    "sun_azimuth": [
+      0,
+      360
+    ],
+    "intensity": [
+      0.5,
+      1.5
+    ],
+    "color_temp": [
+      3000,
+      8500
+    ],
+    "cloud_cover": [
+      0.0,
+      0.9
+    ]
+  }
+}

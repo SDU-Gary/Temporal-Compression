@@ -1,0 +1,21 @@
+{
+  "mean_abs_residual": 0.046100928497566376,
+  "max_abs_residual": 0.1843381759614457,
+  "std_residual": 0.05368562964022968,
+  "min_abs_residual": 0.004888572832678979,
+  "residual_percentage": 84.88757969712341,
+  "threshold_percent": 5.0,
+  "needs_hybrid": true,
+  "residual_norms": [
+    0.32693603430274193,
+    0.23447845310387566,
+    0.33076503120178274,
+    0.3269360442737943
+  ],
+  "hours_analyzed": [
+    6,
+    9,
+    15,
+    18
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "config_name": "K30_r5",
+  "num_gaussians": 30,
+  "rank": 5,
+  "compressed_params": 5280,
+  "original_params": 138375,
+  "compression_ratio": 26.207386363636363,
+  "best_epoch": 751,
+  "val_mae": 0.031522962264716625,
+  "test_metrics": {
+    "mae": 0.03248764108866453,
+    "rmse": 0.05231216363608837,
+    "charbonnier": 0.032574279233813286
+  },
+  "target_range": [
+    14.0,
+    18.0
+  ],
+  "in_target_range": false
+}

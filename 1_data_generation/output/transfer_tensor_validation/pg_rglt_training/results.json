@@ -1,0 +1,26 @@
+{
+  "config": {
+    "rank": 5,
+    "num_epochs": 1000,
+    "learning_rate": 0.001,
+    "batch_size": 64,
+    "train_ratio": 0.7,
+    "svd_init": true
+  },
+  "compression_stats": {
+    "params_per_probe": 150,
+    "total_params": 51450,
+    "uncompressed_size": 111132,
+    "compression_ratio": 2.16,
+    "rank": 5,
+    "num_probes": 343,
+    "num_lights": 12
+  },
+  "final_metrics": {
+    "loss": 0.2178642255974433,
+    "mae": 0.21763826168856573,
+    "rmse": 0.4078226903159631
+  },
+  "best_val_loss": 0.2178642255974433,
+  "training_date": "2026-01-02T22:17:39.599781"
+}

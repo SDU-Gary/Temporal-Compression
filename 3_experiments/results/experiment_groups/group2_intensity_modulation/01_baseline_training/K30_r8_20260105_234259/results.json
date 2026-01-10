@@ -1,0 +1,40 @@
+{
+  "experiment_name": "1D_intensity_modulation_K30_r8_20260105_234259",
+  "dataset": "/home/kyrie/\u6bd5\u8bbe/data_generation/output/intensity_modulation_343_simple",
+  "hyperparameters": {
+    "num_gaussians": 30,
+    "rank": 8,
+    "top_k": 3,
+    "learning_rate": 0.001,
+    "num_epochs": 2000,
+    "batch_size": 256
+  },
+  "compression": {
+    "num_probes": 343,
+    "num_moments": 12,
+    "naive_params": 111132,
+    "compressed_params": 7140,
+    "compression_ratio": 15.564705882352941
+  },
+  "training": {
+    "best_epoch": 1997,
+    "best_val_mae": 0.7817105650901794,
+    "initial_gaussian_coverage": 100.0,
+    "final_gaussian_coverage": 100.0
+  },
+  "test_metrics": {
+    "mae": 0.7241204082965851,
+    "rmse": 1.414467203617096,
+    "per_coeff_mae_mean": 0.5136805176734924,
+    "per_coeff_mae_max": 0.6060341596603394,
+    "pred_range": [
+      -80.87128448486328,
+      71.0637435913086
+    ],
+    "target_range": [
+      -80.72627258300781,
+      70.39978790283203
+    ]
+  },
+  "training_completed_at": "2026-01-05T23:52:31.472548"
+}

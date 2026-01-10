@@ -1,0 +1,20 @@
+{
+  "config_name": "K20_r8",
+  "num_gaussians": 20,
+  "rank": 8,
+  "compressed_params": 5560,
+  "original_params": 138375,
+  "compression_ratio": 24.887589928057555,
+  "best_epoch": 986,
+  "val_mae": 0.03307145927101374,
+  "test_metrics": {
+    "mae": 0.033979203552007675,
+    "rmse": 0.05542759224772453,
+    "charbonnier": 0.03405969962477684
+  },
+  "target_range": [
+    14.0,
+    18.0
+  ],
+  "in_target_range": false
+}

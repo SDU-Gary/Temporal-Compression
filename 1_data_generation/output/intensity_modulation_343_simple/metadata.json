@@ -1,0 +1,23 @@
+{
+  "num_probes": 343,
+  "num_moments": 12,
+  "period": 3.0,
+  "intensity_function": "sinusoidal",
+  "intensity_range": [
+    0.0,
+    1.0
+  ],
+  "spp": 128,
+  "sh_samples": 64,
+  "scene": "simple_geometry",
+  "scene_type": "sphere_floor_point_light",
+  "scene_bounds": [
+    -0.4,
+    0.4,
+    -0.4,
+    0.4,
+    0.1,
+    0.7
+  ],
+  "note": "Emergency fix: simple geometry to avoid Cornell Box transform issues"
+}

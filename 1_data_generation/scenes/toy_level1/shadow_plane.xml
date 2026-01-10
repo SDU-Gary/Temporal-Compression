@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+TPE Level 1 Validation Scene A: Shadow on Plane
+Purpose: Validate that shadow movement can be approximated by coordinate perturbation
+Expected: Linear shadow translation as sun direction changes
+-->
+<scene version="3.0.0">
+    <!-- Path tracer integrator -->
+    <integrator type="path">
+        <integer name="max_depth" value="8"/>
+    </integrator>
+
+    <!-- Ground plane: 10m × 10m white diffuse surface -->
+    <shape type="rectangle" id="ground">
+        <transform name="to_world">
+            <scale value="10, 10, 1"/>
+            <translate value="0, 0, 0"/>
+        </transform>
+        <bsdf type="diffuse">
+            <rgb name="reflectance" value="0.8, 0.8, 0.8"/>
+        </bsdf>
+    </shape>
+
+    <!-- Shadow-casting obstacle: 1m cube -->
+    <shape type="cube" id="obstacle">
+        <transform name="to_world">
+            <translate value="0, 0, 0.5"/>
+            <scale value="0.5"/>
+        </transform>
+        <bsdf type="diffuse">
+            <rgb name="reflectance" value="0.6, 0.3, 0.2"/>
+        </bsdf>
+    </shape>
+
+    <!-- Directional sun light (will be modified dynamically) -->
+    <emitter type="directional" id="sun">
+        <vector name="direction" value="0, 0.866, -0.5"/>
+        <rgb name="irradiance" value="2.0, 1.9, 1.7"/>
+    </emitter>
+
+    <!-- Ambient environment light -->
+    <emitter type="constant">
+        <rgb name="radiance" value="0.2, 0.25, 0.3"/>
+    </emitter>
+
+    <!-- Default camera (for visualization, not used in probe baking) -->
+    <sensor type="perspective" id="camera">
+        <float name="fov" value="45"/>
+        <transform name="to_world">
+            <lookat origin="5, 5, 3" target="0, 0, 0.5" up="0, 0, 1"/>
+        </transform>
+        <film type="hdrfilm">
+            <integer name="width" value="512"/>
+            <integer name="height" value="512"/>
+        </film>
+    </sensor>
+</scene>
