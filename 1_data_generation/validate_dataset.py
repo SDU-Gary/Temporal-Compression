@@ -29,6 +29,7 @@ class DatasetValidator:
         self.errors = []
         self.warnings = []
         self.stats = {}
+        self.is_parametric = False
 
     def validate(self) -> Dict:
         """执行完整验证"""
@@ -43,22 +44,28 @@ class DatasetValidator:
         # 2. 配置文件
         print("\n[2/7] 验证配置文件...")
         self.check_config()
+        self.check_manifest()
 
         # 3. 探针数据
         print("\n[3/7] 验证探针数据...")
         self.check_probes()
 
-        # 4. 时刻数据
-        print("\n[4/7] 验证时刻数据...")
-        self.check_moments()
+        if self.is_parametric:
+            # 4. 参数化张量
+            print("\n[4/7] 验证参数化张量...")
+            self.check_parametric_tensor()
+        else:
+            # 4. 时刻数据
+            print("\n[4/7] 验证时刻数据...")
+            self.check_moments()
 
-        # 5. 球谐系数
-        print("\n[5/7] 分析球谐系数...")
-        self.analyze_sh_coefficients()
+            # 5. 球谐系数
+            print("\n[5/7] 分析球谐系数...")
+            self.analyze_sh_coefficients()
 
-        # 6. 图像数据
-        print("\n[6/7] 检查图像数据...")
-        self.check_images()
+            # 6. 图像数据
+            print("\n[6/7] 检查图像数据...")
+            self.check_images()
 
         # 7. 数据一致性
         print("\n[7/7] 验证数据一致性...")
@@ -77,7 +84,11 @@ class DatasetValidator:
 
     def check_file_completeness(self):
         """检查必需文件是否存在"""
-        required_files = ['config.json', 'probes.npz']
+        if (self.dataset_path / 'parametric_tensor.npz').exists():
+            self.is_parametric = True
+            required_files = ['parametric_tensor.npz']
+        else:
+            required_files = ['config.json', 'probes.npz']
 
         for filename in required_files:
             filepath = self.dataset_path / filename
@@ -86,16 +97,34 @@ class DatasetValidator:
             else:
                 print(f"  ✓ {filename}")
 
-        # 检查时刻目录
-        moment_dirs = sorted(self.dataset_path.glob('moment_*'))
-        if len(moment_dirs) == 0:
-            self.errors.append("没有找到任何时刻数据目录")
-        else:
-            print(f"  ✓ 发现 {len(moment_dirs)} 个时刻目录")
-            self.stats['num_moments'] = len(moment_dirs)
+        # 检查时刻目录（仅 legacy 数据集）
+        if not self.is_parametric:
+            moment_dirs = sorted(self.dataset_path.glob('moment_*'))
+            if len(moment_dirs) == 0:
+                self.errors.append("没有找到任何时刻数据目录")
+            else:
+                print(f"  ✓ 发现 {len(moment_dirs)} 个时刻目录")
+                self.stats['num_moments'] = len(moment_dirs)
 
     def check_config(self):
         """验证配置文件"""
+        if self.is_parametric:
+            metadata_path = self.dataset_path / 'metadata.json'
+            if metadata_path.exists():
+                try:
+                    with open(metadata_path, 'r') as f:
+                        metadata = json.load(f)
+                    print(f"  场景: {metadata.get('scene', 'N/A')}")
+                    print(f"  探针数: {metadata.get('num_probes', 'N/A')}")
+                    print(f"  配置数: {metadata.get('num_configs', 'N/A')}")
+                    print(f"  SPP: {metadata.get('spp', 'N/A')}")
+                    self.stats['config'] = metadata
+                except Exception as e:
+                    self.errors.append(f"无法读取metadata.json: {e}")
+            else:
+                self.warnings.append("未找到metadata.json")
+            return
+
         config_path = self.dataset_path / 'config.json'
 
         try:
@@ -115,13 +144,41 @@ class DatasetValidator:
         except Exception as e:
             self.errors.append(f"无法读取config.json: {e}")
 
+    def check_manifest(self):
+        """验证manifest.json"""
+        manifest_path = self.dataset_path / 'manifest.json'
+        if not manifest_path.exists():
+            self.warnings.append("未找到manifest.json")
+            return
+        try:
+            with open(manifest_path, 'r') as f:
+                manifest = json.load(f)
+            self.stats['manifest'] = manifest
+            print(f"  数据集ID: {manifest.get('dataset_id', 'N/A')}")
+            print(f"  生成脚本: {manifest.get('generator', 'N/A')}")
+        except Exception as e:
+            self.errors.append(f"无法读取manifest.json: {e}")
+
     def check_probes(self):
         """验证探针数据"""
-        probes_path = self.dataset_path / 'probes.npz'
+        if self.is_parametric:
+            tensor_path = self.dataset_path / 'parametric_tensor.npz'
+            try:
+                data = np.load(tensor_path, allow_pickle=True)
+                positions = data['probe_positions']
+            except Exception as e:
+                self.errors.append(f"无法读取 parametric_tensor.npz 中的探针: {e}")
+                return
+        else:
+            probes_path = self.dataset_path / 'probes.npz'
+            try:
+                data = np.load(probes_path)
+                positions = data['positions']
+            except Exception as e:
+                self.errors.append(f"无法读取探针数据: {e}")
+                return
 
         try:
-            data = np.load(probes_path)
-            positions = data['positions']
 
             print(f"  探针数量: {len(positions)}")
             print(f"  数据形状: {positions.shape}")
@@ -156,6 +213,22 @@ class DatasetValidator:
 
         except Exception as e:
             self.errors.append(f"无法读取探针数据: {e}")
+
+    def check_parametric_tensor(self):
+        """验证参数化张量数据"""
+        tensor_path = self.dataset_path / 'parametric_tensor.npz'
+        try:
+            data = np.load(tensor_path, allow_pickle=True)
+            tensor = data['tensor']
+            self.stats['num_probes'] = int(tensor.shape[0])
+            self.stats['num_configs'] = int(tensor.shape[1])
+            print(f"  Tensor 形状: {tensor.shape}")
+            if 'probe_positions' in data:
+                probes = data['probe_positions']
+                if probes.shape[0] != tensor.shape[0]:
+                    self.errors.append("probe_positions 与 tensor probes 数不一致")
+        except Exception as e:
+            self.errors.append(f"无法读取 parametric_tensor.npz: {e}")
 
     def check_moments(self):
         """验证时刻数据完整性"""
@@ -329,7 +402,7 @@ class DatasetValidator:
                         f"时刻{stat['moment']}: 探针数不一致 "
                         f"(probes.npz有{self.stats['num_probes']}个, "
                         f"SH系数有{stat['shape'][0]}个)"
-                    )
+                        )
 
         # 检查配置与实际数据一致性
         if 'config' in self.stats:
@@ -344,6 +417,15 @@ class DatasetValidator:
                         self.warnings.append(
                             f"时刻数不匹配: 配置{expected_moments}, 实际{actual_moments}"
                         )
+
+        if 'manifest' in self.stats:
+            manifest = self.stats['manifest']
+            if 'num_probes' in manifest and 'num_probes' in self.stats:
+                if int(manifest['num_probes']) != int(self.stats['num_probes']):
+                    self.errors.append("manifest.json 中 num_probes 与实际不一致")
+            if 'num_configs' in manifest and 'num_configs' in self.stats:
+                if int(manifest['num_configs']) != int(self.stats['num_configs']):
+                    self.errors.append("manifest.json 中 num_configs 与实际不一致")
 
         print("  ✓ 数据一致性检查完成")
 

@@ -1,0 +1,21 @@
+id: PGCPL_BISTRO_DEV
+
+dataset:
+  config: 1_data_generation/configs/bistro_dev.yaml
+  preset: dev
+
+train:
+  entry: 3_experiments/scripts/train.py
+  args:
+    variant: unified_set
+    batch_size: 128
+    num_steps: 1000
+    seed: 42
+
+eval:
+  entry: 3_experiments/scripts/evaluation/run_all.py
+  args:
+    output_dir: 3_experiments/output/bistro_dev_eval
+
+viz:
+  rerun: true

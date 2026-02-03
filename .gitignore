@@ -24,10 +24,24 @@ ENV/
 .DS_Store
 Thumbs.db
 
-# Data files (too large for git)
-data_generation/output/dataset_2k/
-data_generation/output/dataset_15k/
-data_generation/output/method_test_v1/
+# Local env / UI configs
+.envrc
+.falcor_home/
+.polyscope.ini
+imgui.ini
+rerun_render.log
+codex.txt
+
+# Data files / outputs (too large for git)
+1_data_generation/output/
+3_experiments/output/
+3_experiments/results/
+3_experiments/test_rerun*/
+metadata/
+archive/
+1_data_generation/scenes/Bistro_v5_2/
+1_data_generation/Bistro_v5_2.zip
+Falcor/
 
 # Temporary files
 *.log

@@ -1,0 +1,21 @@
+id: PGCPL_BISTRO_SMOKE
+
+dataset:
+  config: 1_data_generation/configs/bistro_smoke.yaml
+  preset: smoke
+
+train:
+  entry: 3_experiments/scripts/train.py
+  args:
+    variant: unified_set
+    batch_size: 64
+    num_steps: 100
+    seed: 42
+
+eval:
+  entry: 3_experiments/scripts/evaluation/run_all.py
+  args:
+    output_dir: 3_experiments/output/bistro_smoke_eval
+
+viz:
+  rerun: true

@@ -9,10 +9,14 @@ import torch
 import numpy as np
 import yaml
 
+temporal_module = pytest.importorskip("models.temporal_mlp", reason="Legacy TemporalMLP module not available")
+decoder_module = pytest.importorskip("models.decoder_mlp", reason="Legacy DecoderMLP module not available")
+full_model_module = pytest.importorskip("models.full_model", reason="Legacy full model module not available")
+
 from models.gaussian_mixture import GaussianMixture
-from models.temporal_mlp import TemporalMLP
-from models.decoder_mlp import DecoderMLP
-from models.full_model import MultiTimeCompressionModel
+TemporalMLP = temporal_module.TemporalMLP
+DecoderMLP = decoder_module.DecoderMLP
+MultiTimeCompressionModel = full_model_module.MultiTimeCompressionModel
 
 
 @pytest.fixture

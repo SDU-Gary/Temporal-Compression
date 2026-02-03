@@ -1,0 +1,24 @@
+name: bistro_prod
+output_dir: 1_data_generation/output/bistro_temporal/prod
+
+generator:
+  script: 1_data_generation/falcor/generate_bistro_temporal_spheres.py
+  args:
+    scene: 1_data_generation/falcor/scenes/bistro_exterior_emissive_spheres.pyscene
+    num_frames: 600
+    fps: 30
+    sh_mode: cubemap
+    cube_res: 64
+    spp: 512
+    accum_frames: 1
+    probe_mode: adaptive
+    max_probes: 800
+    probe_uniform_ratio: 0.7
+    use_emissive_lights: true
+
+presets:
+  prod:
+    args:
+      cube_res: 64
+      spp: 512
+      max_probes: 800

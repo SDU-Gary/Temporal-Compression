@@ -1,0 +1,141 @@
+# Bistro exterior with three emissive sphere meshes (RGB) + baked animation.
+#
+# Usage:
+#   BISTRO_FBX=/path/to/BistroExterior.fbx
+#   BISTRO_NUM_FRAMES=600
+#   BISTRO_FPS=30
+#   BISTRO_BALL_RADIUS=0.3
+#   BISTRO_BALL_INTENSITY=20
+#   BISTRO_HEIGHT_BASE_RATIO=0.08
+#   BISTRO_HEIGHT_AMP_RATIO=0.06
+#   BISTRO_AXIS_MARGIN_RATIO=0.15
+#   BISTRO_ORTH_OFFSET_RATIO=0.12
+#
+# The sphere positions are baked into animation keyframes.
+
+import os
+import math
+
+scene_path = os.environ.get("BISTRO_FBX", "BistroExterior.fbx")
+sceneBuilder.importScene(scene_path)
+try:
+    bistro_dir = os.path.dirname(scene_path)
+    env_path = os.path.join(bistro_dir, "san_giuseppe_bridge_4k.hdr")
+    if os.path.exists(env_path):
+        sceneBuilder.envMap = EnvMap(env_path)
+        sceneBuilder.envMap.intensity = 10
+except Exception:
+    pass
+
+def _parse_float(name, default):
+    val = os.environ.get(name, "")
+    try:
+        return float(val) if val != "" else float(default)
+    except Exception:
+        return float(default)
+
+def _parse_int(name, default):
+    val = os.environ.get(name, "")
+    try:
+        return int(val) if val != "" else int(default)
+    except Exception:
+        return int(default)
+
+radius = _parse_float("BISTRO_BALL_RADIUS", 0.3)
+intensity = _parse_float("BISTRO_BALL_INTENSITY", 20.0)
+num_frames = _parse_int("BISTRO_NUM_FRAMES", 600)
+fps = _parse_float("BISTRO_FPS", 30.0)
+height_base_ratio = _parse_float("BISTRO_HEIGHT_BASE_RATIO", 0.08)
+height_amp_ratio = _parse_float("BISTRO_HEIGHT_AMP_RATIO", 0.06)
+axis_margin_ratio = _parse_float("BISTRO_AXIS_MARGIN_RATIO", 0.15)
+orth_offset_ratio = _parse_float("BISTRO_ORTH_OFFSET_RATIO", 0.12)
+
+def _make_emissive_material(name, rgb):
+    mat = StandardMaterial(name)
+    mat.baseColor = float4(1, 1, 1, 1)
+    mat.roughness = 0.2
+    mat.emissiveColor = float3(rgb[0], rgb[1], rgb[2])
+    mat.emissiveFactor = intensity
+    return mat
+
+red_mat = _make_emissive_material("BallRedMat", (1.0, 0.0, 0.0))
+green_mat = _make_emissive_material("BallGreenMat", (0.0, 1.0, 0.0))
+blue_mat = _make_emissive_material("BallBlueMat", (0.0, 0.0, 1.0))
+
+sphere_mesh = TriangleMesh.createSphere(radius=1.0, segmentsU=32, segmentsV=16)
+
+red_mesh_id = sceneBuilder.addTriangleMesh(sphere_mesh, red_mat)
+green_mesh_id = sceneBuilder.addTriangleMesh(sphere_mesh, green_mat)
+blue_mesh_id = sceneBuilder.addTriangleMesh(sphere_mesh, blue_mat)
+
+red_node = sceneBuilder.addNode("BallRedNode", Transform(scaling=float3(radius)))
+green_node = sceneBuilder.addNode("BallGreenNode", Transform(scaling=float3(radius)))
+blue_node = sceneBuilder.addNode("BallBlueNode", Transform(scaling=float3(radius)))
+
+sceneBuilder.addMeshInstance(red_node, red_mesh_id)
+sceneBuilder.addMeshInstance(green_node, green_mesh_id)
+sceneBuilder.addMeshInstance(blue_node, blue_mesh_id)
+
+duration = max(0.0, (num_frames - 1) / fps)
+red_anim = Animation("BallRedAnim", red_node, duration)
+green_anim = Animation("BallGreenAnim", green_node, duration)
+blue_anim = Animation("BallBlueAnim", blue_node, duration)
+sceneBuilder.addAnimation(red_anim)
+sceneBuilder.addAnimation(green_anim)
+sceneBuilder.addAnimation(blue_anim)
+
+def _parse_vec3(text, default):
+    if text is None or text == "":
+        return default
+    parts = [p.strip() for p in text.split(",") if p.strip()]
+    if len(parts) != 3:
+        return default
+    return float3(float(parts[0]), float(parts[1]), float(parts[2]))
+
+min_pt = _parse_vec3(os.environ.get("BISTRO_BOUNDS_MIN", ""), float3(-10.0, 0.0, -10.0))
+max_pt = _parse_vec3(os.environ.get("BISTRO_BOUNDS_MAX", ""), float3(10.0, 5.0, 10.0))
+size = max_pt - min_pt
+center = (min_pt + max_pt) * 0.5
+
+axis_is_x = size.x >= size.z
+axis_len = size.x if axis_is_x else size.z
+orth_len = size.z if axis_is_x else size.x
+
+axis_margin = axis_margin_ratio * axis_len
+orth_offset = orth_offset_ratio * orth_len
+height = size.y
+
+y_base = min_pt.y + height_base_ratio * height
+y_amp = height_amp_ratio * height
+
+start_axis = (min_pt.x + axis_margin) if axis_is_x else (min_pt.z + axis_margin)
+end_axis = (max_pt.x - axis_margin) if axis_is_x else (max_pt.z - axis_margin)
+
+for frame in range(num_frames):
+    t = frame / fps
+    u = 0.5 - 0.5 * math.cos(2.0 * math.pi * frame / max(num_frames - 1, 1))
+    y = y_base + y_amp * math.sin(2.0 * math.pi * frame / max(num_frames - 1, 1))
+
+    # Red: vertical motion
+    red_pos = float3(center.x, y, center.z)
+    if axis_is_x:
+        red_pos.z = center.z - orth_offset
+    else:
+        red_pos.x = center.x - orth_offset
+
+    # Green: forward-back along street axis
+    if axis_is_x:
+        green_pos = float3(start_axis + u * (end_axis - start_axis), y_base + 0.3 * y_amp, center.z)
+    else:
+        green_pos = float3(center.x, y_base + 0.3 * y_amp, start_axis + u * (end_axis - start_axis))
+
+    # Blue: static
+    blue_pos = float3(center.x, y_base + 0.1 * y_amp, center.z)
+    if axis_is_x:
+        blue_pos.z = center.z + orth_offset
+    else:
+        blue_pos.x = center.x + orth_offset
+
+    red_anim.addKeyframe(t, Transform(translation=red_pos, scaling=float3(radius)))
+    green_anim.addKeyframe(t, Transform(translation=green_pos, scaling=float3(radius)))
+    blue_anim.addKeyframe(t, Transform(translation=blue_pos, scaling=float3(radius)))
