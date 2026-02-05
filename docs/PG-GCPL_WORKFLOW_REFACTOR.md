@@ -452,9 +452,16 @@ python tools/run_dataset.py --config configs/bistro.yaml --preset smoke
 - 数据集配置：`1_data_generation/configs/*.yaml`  
 - Pipeline 示例：`pipelines/*.yaml`  
 - 备注：pipeline 的 eval 若未显式给 output_dir，会优先使用 **train args 的 output_dir**，或 **train config 里的 output_dir**；两者都没有时需手动指定。  
+- YAML 模板：`3_experiments/configs/template_unified_set.yaml`  
+- YAML Schema：`metadata/schemas/train.schema.json`（训练/评估脚本可选校验）  
 
 ## J) Python 选择规则（避免环境混用）
 
 - **dataset 生成**：优先使用 `dataset.config` 内的 `python` 字段，其次 `generator.python` 字段，再次环境变量 `FALCOR_PYTHON`。  
 - **train/eval**：优先使用 pipeline 层 `python_train/python_eval` 或各自 `train.python / eval.python` 字段；若未指定，使用当前默认 Python。  
 - **说明**：Falcor Python 与训练 Python 应严格隔离，避免依赖缺失导致崩溃。  
+
+## K) 旧训练脚本的处理策略
+
+- 历史 1D/5D 训练脚本已迁移到 `3_experiments/scripts/legacy_training/`  
+- 统一入口为 `3_experiments/scripts/train.py`  

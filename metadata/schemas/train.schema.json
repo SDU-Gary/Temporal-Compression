@@ -1,0 +1,103 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PG-GCPL Training/Eval Config",
+  "type": "object",
+  "properties": {
+    "experiment": {
+      "type": "object",
+      "properties": {
+        "variant": {
+          "type": "string",
+          "enum": ["1d", "5d", "unified_1d", "unified_5d", "unified_set"]
+        },
+        "output_dir": { "type": "string" },
+        "device": { "type": "string" },
+        "seed": { "type": "integer" },
+        "run_id": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "data": {
+      "type": "object",
+      "properties": {
+        "data_root": { "type": "string" },
+        "dataset_path": { "type": "string" },
+        "manifest": { "type": "string" },
+        "train_ratio": { "type": "number" },
+        "val_ratio": { "type": "number" },
+        "batch_size": { "type": "integer" },
+        "num_workers": { "type": "integer" }
+      },
+      "additionalProperties": true
+    },
+    "model": {
+      "type": "object",
+      "properties": {
+        "num_gaussians": { "type": "integer" },
+        "rank": { "type": "integer" },
+        "top_k": { "type": "integer" },
+        "light_dim": { "type": "integer" },
+        "embed_dim": { "type": "integer" },
+        "intensity_dim": { "type": "integer" },
+        "intensity_offset": { "type": "integer" },
+        "disable_film": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "training": {
+      "type": "object",
+      "properties": {
+        "epochs": { "type": "integer" },
+        "num_epochs": { "type": "integer" },
+        "batch_size": { "type": "integer" },
+        "lr": { "type": "number" },
+        "weight_decay": { "type": "number" },
+        "lr_scheduler": {
+          "type": "string",
+          "enum": ["none", "cosine", "plateau"]
+        },
+        "lr_min": { "type": "number" },
+        "recon_loss": {
+          "type": "string",
+          "enum": ["mse", "l1", "charbonnier"]
+        },
+        "charbonnier_eps": { "type": "number" },
+        "lambda_temporal": { "type": "number" },
+        "grad_clip": { "type": "number" },
+        "lambda_linearity": { "type": "number" },
+        "linearity_aug_pairs": { "type": "integer" },
+        "lambda_spatial": { "type": "number" },
+        "spatial_k": { "type": "integer" },
+        "enable_sh_scaler": { "type": "boolean" },
+        "sh_scaler_path": { "type": "string" },
+        "sh_scaler_max_samples": { "type": "integer" },
+        "no_init": { "type": "boolean" },
+        "load_model": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "evaluation": {
+      "type": "object",
+      "properties": {
+        "output_dir": { "type": "string" },
+        "checkpoint": { "type": "string" },
+        "data_root": { "type": "string" },
+        "manifest": { "type": "string" },
+        "device": { "type": "string" },
+        "rank": { "type": "integer" },
+        "n_samples": { "type": "integer" },
+        "seed": { "type": "integer" },
+        "probe_idx": { "type": "integer" },
+        "train_mae": { "type": "number" }
+      },
+      "additionalProperties": true
+    },
+    "eval": { "type": "object", "additionalProperties": true },
+    "train": { "type": "object", "additionalProperties": true },
+    "variant": { "type": "string" },
+    "output_dir": { "type": "string" },
+    "data_root": { "type": "string" },
+    "manifest": { "type": "string" }
+  },
+  "additionalProperties": true
+}

@@ -37,7 +37,10 @@ codex.txt
 3_experiments/output/
 3_experiments/results/
 3_experiments/test_rerun*/
-metadata/
+metadata/*
+!metadata/
+!metadata/schemas/
+!metadata/schemas/*.json
 archive/
 1_data_generation/scenes/Bistro_v5_2/
 1_data_generation/Bistro_v5_2.zip

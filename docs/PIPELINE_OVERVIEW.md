@@ -186,6 +186,20 @@
 - 是。可以用 `tools/run_pipeline.py` 只跑 train/eval（跳过 dataset），或用单独命令调用对应脚本。
 - 小提示：pipeline 的 eval 若未显式给 output_dir，会优先使用 **train args 的 output_dir**，或 **train config 里的 output_dir**；若两者都没有，则需要在 eval 配置里手动指定。
 
+## YAML 模板与 Schema（轻量校验）
+
+- 模板：`3_experiments/configs/template_unified_set.yaml`
+- Schema：`metadata/schemas/train.schema.json`
+- 训练/评估脚本支持：
+  - `--schema` 指定 schema 路径
+  - `--strict-schema` 在校验失败时直接报错
+- 如果未安装 `jsonschema`，会自动跳过校验并给出提示。
+
+## 旧版训练脚本去向
+
+- 旧的 1D/5D 训练脚本已迁移到 `3_experiments/scripts/legacy_training/`
+- 当前推荐入口：`3_experiments/scripts/train.py`
+
 ---
 
 ## Kubuntu 主机必做任务（Falcor + 重计算）

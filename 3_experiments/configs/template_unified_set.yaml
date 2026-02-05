@@ -1,0 +1,41 @@
+# PG-GCPL unified_set template (train + eval)
+
+experiment:
+  variant: unified_set
+  output_dir: 3_experiments/results/unified_set/example_run
+  device: cuda
+  seed: 42
+
+data:
+  data_root: 1_data_generation/output/bistro_clean_v2
+  train_ratio: 0.7
+  val_ratio: 0.15
+  batch_size: 256
+  num_workers: 4
+
+model:
+  num_gaussians: 30
+  rank: 8
+  top_k: 3
+  light_dim: 12
+  embed_dim: 32
+  intensity_dim: 3
+  intensity_offset: 1
+  disable_film: false
+
+training:
+  epochs: 2000
+  lr: 1.0e-3
+  recon_loss: charbonnier
+  lambda_temporal: 0.001
+  lambda_linearity: 0.1
+  linearity_aug_pairs: 2
+  enable_sh_scaler: false
+
+evaluation:
+  output_dir: 3_experiments/results/unified_set/example_run/eval
+  checkpoint: 3_experiments/results/unified_set/example_run/best_model.pt
+  data_root: 1_data_generation/output/bistro_clean_v2
+  rank: 8
+  n_samples: 20
+  probe_idx: 0

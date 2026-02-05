@@ -1,6 +1,7 @@
 """Configuration utilities for loading and validating YAML configs."""
 
 import yaml
+import json
 from pathlib import Path
 from typing import Dict, Any
 from dataclasses import dataclass, field
@@ -155,3 +156,43 @@ def merge_configs(base_config: Dict, override_config: Dict) -> Dict:
             merged[key] = value
 
     return merged
+
+
+def validate_with_schema(config: Dict[str, Any], schema_path: Path | str, strict: bool = False) -> list[str]:
+    """Validate a config dict against a JSON schema if jsonschema is available.
+
+    Returns a list of warning/error messages. If strict=True, raises ValueError on violations.
+    """
+    schema_path = Path(schema_path)
+    messages: list[str] = []
+    try:
+        import jsonschema
+    except Exception:
+        messages.append("jsonschema not installed; skipping schema validation")
+        return messages
+
+    if not schema_path.exists():
+        messages.append(f"schema not found: {schema_path}")
+        return messages
+
+    try:
+        with open(schema_path, "r") as f:
+            schema = json.load(f)
+    except Exception as exc:
+        messages.append(f"failed to load schema: {exc}")
+        return messages
+
+    try:
+        validator = jsonschema.Draft7Validator(schema)
+        errors = sorted(validator.iter_errors(config), key=lambda e: e.path)
+        for err in errors:
+            path = ".".join([str(p) for p in err.path])
+            prefix = f"{path}: " if path else ""
+            messages.append(prefix + err.message)
+        if errors and strict:
+            raise ValueError("schema validation failed")
+    except Exception as exc:
+        if strict:
+            raise
+        messages.append(f"schema validation error: {exc}")
+    return messages

@@ -27,7 +27,7 @@ from utils.light_descriptor import build_descriptor_5d, build_descriptor_1d
 from tools.manifest_utils import load_manifest
 from tools.manifest_utils import get_git_commit
 from tools.logexp import log_experiment
-from utils.config import merge_configs
+from utils.config import merge_configs, validate_with_schema
 
 
 def _load_yaml(path: str | Path) -> Dict[str, Any]:
@@ -437,6 +437,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--variant", choices=["1d", "5d", "unified_1d", "unified_5d", "unified_set"], required=False)
     parser.add_argument("--config", default=None, help="YAML config for training")
+    parser.add_argument(
+        "--schema",
+        default=str(_ROOT / "metadata" / "schemas" / "train.schema.json"),
+        help="Optional JSON schema for config validation",
+    )
+    parser.add_argument("--strict-schema", action="store_true", help="Fail if schema validation fails")
     parser.add_argument("--data-root", default=None)
     parser.add_argument("--manifest", default=None, help="Path to dataset manifest.json")
     parser.add_argument("--output-dir", default=None)
@@ -589,6 +595,10 @@ if __name__ == "__main__":
 
     if args.config:
         cfg = _load_yaml(args.config)
+        if args.schema:
+            messages = validate_with_schema(cfg, args.schema, strict=args.strict_schema)
+            for msg in messages:
+                print(f"[schema] {msg}")
         # Allow legacy "train" section at top.
         if "train" in cfg and isinstance(cfg["train"], dict):
             cfg = merge_configs(cfg, cfg["train"])

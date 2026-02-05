@@ -1,0 +1,42 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "BlenderSceneExport",
+  "type": "object",
+  "required": ["scene", "frames", "fps", "emissive_objects"],
+  "properties": {
+    "scene": {"type": "string"},
+    "frames": {"type": "integer", "minimum": 1},
+    "fps": {"type": "number", "minimum": 0.1},
+    "emissive_objects": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "trajectory"],
+        "properties": {
+          "name": {"type": "string"},
+          "trajectory": {"type": "string"},
+          "color": {"type": "array", "minItems": 3, "maxItems": 3},
+          "radius": {"type": "number", "minimum": 0.0}
+        }
+      }
+    },
+    "probes": {
+      "type": "object",
+      "properties": {
+        "file": {"type": "string"},
+        "mode": {"type": "string"}
+      }
+    },
+    "render": {
+      "type": "object",
+      "properties": {
+        "sh_mode": {"type": "string"},
+        "cube_res": {"type": "integer"},
+        "num_sh_samples": {"type": "integer"},
+        "spp": {"type": "integer"},
+        "accum_frames": {"type": "integer"}
+      }
+    },
+    "lighting_mode": {"type": "string"}
+  }
+}

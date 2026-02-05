@@ -6,6 +6,16 @@ import argparse
 from pathlib import Path
 from typing import Dict, List
 import yaml
+import sys
+
+_ROOT = Path(__file__).resolve().parents[3]
+_SRC = _ROOT / "2_src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from utils.config import validate_with_schema
 
 
 def build_eval_steps(output_dir: str | Path, args: argparse.Namespace) -> List[Dict[str, str]]:
@@ -68,6 +78,12 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--probe-idx", type=int, default=None)
     parser.add_argument("--config", default=None, help="YAML config containing evaluation section")
+    parser.add_argument(
+        "--schema",
+        default=str(_ROOT / "metadata" / "schemas" / "train.schema.json"),
+        help="Optional JSON schema for config validation",
+    )
+    parser.add_argument("--strict-schema", action="store_true", help="Fail if schema validation fails")
     parser.add_argument("--python", default=None)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -75,6 +91,10 @@ def main() -> None:
     if args.config:
         with open(args.config, "r") as f:
             cfg = yaml.safe_load(f) or {}
+        if args.schema:
+            messages = validate_with_schema(cfg, args.schema, strict=args.strict_schema)
+            for msg in messages:
+                print(f"[schema] {msg}")
         eval_cfg = cfg.get("evaluation", cfg.get("eval", {})) if isinstance(cfg, dict) else {}
         if args.output_dir is None and eval_cfg.get("output_dir"):
             args.output_dir = eval_cfg.get("output_dir")
