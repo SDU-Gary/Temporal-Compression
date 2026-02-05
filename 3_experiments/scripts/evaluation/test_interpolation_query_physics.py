@@ -6,6 +6,7 @@ Week 4.1: Physics-only内插查询测试
 """
 
 import sys
+import argparse
 from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent))
 
@@ -18,6 +19,19 @@ from datetime import datetime
 
 from models.physics_low_rank import PhysicsLowRank5D
 from data.transfer_tensor_dataset import TransferTensorDataset5D
+from tools.manifest_utils import load_manifest
+
+
+def resolve_data_root(data_root: str | None, manifest_path: str | None) -> str:
+    if data_root:
+        return data_root
+    if not manifest_path:
+        raise ValueError("data_root is required when manifest is not provided")
+    manifest = load_manifest(manifest_path)
+    output_dir = manifest.get("output_dir")
+    if not output_dir:
+        raise ValueError("manifest missing output_dir")
+    return str(output_dir)
 
 
 def sample_interpolation_configs(
@@ -217,11 +231,23 @@ def visualize_results(
 
 
 def main():
-    # 配置
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    data_dir = Path('../data_generation/output/5D_parametric_validation')
-    checkpoint_path = Path('archive/Week3-4_MLP_Hybrid_Failed/checkpoints/stage1_best.pt')
-    output_dir = Path('experiments/week4_interpolation_query')
+    parser = argparse.ArgumentParser(description="Physics-only interpolation query test")
+    parser.add_argument("--data-root", default=None)
+    parser.add_argument("--manifest", default=None)
+    parser.add_argument("--checkpoint", default="archive/Week3-4_MLP_Hybrid_Failed/checkpoints/stage1_best.pt")
+    parser.add_argument("--output", default="experiments/week4_interpolation_query")
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--n-samples", type=int, default=20)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--probe-idx", type=int, default=0)
+    parser.add_argument("--rank", type=int, default=5)
+    parser.add_argument("--train-mae", type=float, default=None)
+    args = parser.parse_args()
+
+    device = torch.device(args.device) if args.device else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    data_dir = Path(resolve_data_root(args.data_root, args.manifest))
+    checkpoint_path = Path(args.checkpoint)
+    output_dir = Path(args.output)
 
     print("=" * 80)
     print("Week 4.1: Physics-only内插查询测试")
@@ -229,7 +255,7 @@ def main():
 
     # 1. 生成测试配置
     print("\n[1/5] 生成20个内插查询配置...")
-    test_configs = sample_interpolation_configs(n_samples=20, seed=42)
+    test_configs = sample_interpolation_configs(n_samples=args.n_samples, seed=args.seed)
     print(f"配置范围验证:")
     print(f"  Zenith: [{test_configs[:, 0].min():.1f}, {test_configs[:, 0].max():.1f}] deg")
     print(f"  Azimuth: [{test_configs[:, 1].min():.1f}, {test_configs[:, 1].max():.1f}] deg")
@@ -244,7 +270,7 @@ def main():
         print("请确保Week 3-4 Stage 1训练已完成")
         return
 
-    model = PhysicsLowRank5D(rank=5)
+    model = PhysicsLowRank5D(rank=args.rank)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     # Extract only physics components from hybrid checkpoint
@@ -257,13 +283,13 @@ def main():
     model.to(device)
     print(f"模型已加载: {checkpoint_path}")
     print(f"  训练轮数: {checkpoint.get('epoch', 'N/A')}")
-    train_mae = checkpoint.get('val_mae', 0.0391)  # 从checkpoint或默认值
+    train_mae = args.train_mae if args.train_mae is not None else checkpoint.get('val_mae', 0.0391)
     print(f"  训练Val MAE: {train_mae:.4f}")
 
     # 3. 获取ground truth
     print("\n[3/5] 获取ground truth SH系数...")
     print("  注意: 当前使用最近邻近似，实际应重新渲染")
-    gt_sh = load_ground_truth_sh(test_configs, data_dir, probe_idx=0)
+    gt_sh = load_ground_truth_sh(test_configs, data_dir, probe_idx=args.probe_idx)
     print(f"  Ground truth shape: {gt_sh.shape}")
 
     # 4. 计算内插误差

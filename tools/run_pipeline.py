@@ -37,10 +37,15 @@ def build_pipeline_steps(pipeline: Dict[str, Any]) -> List[Dict[str, Any]]:
     train_cfg = pipeline.get("train") or {}
     pipeline_python_train = pipeline.get("python_train")
     pipeline_python_eval = pipeline.get("python_eval")
+    train_output_dir = None
     if train_cfg:
         args = train_cfg.get("args", {})
+        if "config" in train_cfg and "config" not in args:
+            args["config"] = train_cfg["config"]
         if dataset_output_dir and "data_root" not in args:
             args["data_root"] = dataset_output_dir
+        if "output_dir" in args:
+            train_output_dir = str(args["output_dir"])
         cmd = [train_cfg["entry"]]
         python_bin = train_cfg.get("python") or pipeline_python_train
         for key, value in args.items():
@@ -54,8 +59,12 @@ def build_pipeline_steps(pipeline: Dict[str, Any]) -> List[Dict[str, Any]]:
     eval_cfg = pipeline.get("eval") or {}
     if eval_cfg:
         args = eval_cfg.get("args", {})
+        if "config" in eval_cfg and "config" not in args:
+            args["config"] = eval_cfg["config"]
         if dataset_output_dir and "data_root" not in args:
             args["data_root"] = dataset_output_dir
+        if "output_dir" not in args and train_output_dir:
+            args["output_dir"] = str(Path(train_output_dir) / "eval")
         cmd = [eval_cfg["entry"]]
         python_bin = eval_cfg.get("python") or pipeline_python_eval
         for key, value in args.items():

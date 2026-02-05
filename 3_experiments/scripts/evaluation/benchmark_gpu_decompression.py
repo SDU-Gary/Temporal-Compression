@@ -12,6 +12,7 @@ Date: 2026-01-04
 """
 
 import sys
+import argparse
 from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
@@ -432,12 +433,21 @@ VERDICT: {'✓ ALL TARGETS MET' if all([success_latency, success_throughput, suc
 # ============================================================================
 
 def main():
-    # 配置
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    checkpoint_path = Path('PG-GCPL/experiments/04_ablation_and_visualization/ablation/K30_r8/best_model.pt')
-    output_dir = Path('experiments/gpu_benchmark')
-    threshold_latency_ms = 0.5
-    threshold_throughput_M = 1.0
+    parser = argparse.ArgumentParser(description="GPU decompression benchmark")
+    parser.add_argument("--checkpoint", default="PG-GCPL/experiments/04_ablation_and_visualization/ablation/K30_r8/best_model.pt")
+    parser.add_argument("--output", default="experiments/gpu_benchmark")
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--threshold-latency-ms", type=float, default=0.5)
+    parser.add_argument("--threshold-throughput-m", type=float, default=1.0)
+    parser.add_argument("--latency-samples", type=int, default=1000)
+    parser.add_argument("--warmup-runs", type=int, default=100)
+    args = parser.parse_args()
+
+    device = torch.device(args.device) if args.device else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    checkpoint_path = Path(args.checkpoint)
+    output_dir = Path(args.output)
+    threshold_latency_ms = args.threshold_latency_ms
+    threshold_throughput_M = args.threshold_throughput_m
 
     print("=" * 80)
     print("GPU性能基准测试: PG-GCPL实时解压性能验证")
@@ -474,7 +484,12 @@ def main():
 
     # 2. 单探针延迟测试
     print("[2/5] 单探针延迟测试...")
-    latency_metrics = benchmark_single_probe_latency(model, device, n_samples=1000)
+    latency_metrics = benchmark_single_probe_latency(
+        model,
+        device,
+        n_samples=args.latency_samples,
+        warmup_runs=args.warmup_runs,
+    )
     print(f"  P95: {latency_metrics['p95']:.4f} ms (目标: <{threshold_latency_ms}ms)")
     print()
 

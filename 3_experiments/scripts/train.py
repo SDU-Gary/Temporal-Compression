@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Any
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SRC = _ROOT / "2_src"
@@ -25,6 +25,79 @@ from models.gaussian_physics_5D import GaussianPhysicsCompression5D
 from models.gaussian_physics_unified import GaussianPhysicsCompressionUnified
 from utils.light_descriptor import build_descriptor_5d, build_descriptor_1d
 from tools.manifest_utils import load_manifest
+from tools.manifest_utils import get_git_commit
+from tools.logexp import log_experiment
+from utils.config import merge_configs
+
+
+def _load_yaml(path: str | Path) -> Dict[str, Any]:
+    import yaml
+    path = Path(path)
+    with open(path, "r") as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise ValueError("Config YAML root must be a mapping")
+    return data
+
+
+def _apply_config(args: argparse.Namespace, defaults: argparse.Namespace, cfg: Dict[str, Any]) -> None:
+    # Support both flat and sectioned configs.
+    experiment = cfg.get("experiment", {})
+    data = cfg.get("data", {})
+    model = cfg.get("model", {})
+    training = cfg.get("training", {})
+    evaluation = cfg.get("evaluation", cfg.get("eval", {}))
+
+    # Map config keys to argparse args.
+    mapping = {
+        "variant": experiment.get("variant") or cfg.get("variant"),
+        "output_dir": experiment.get("output_dir") or cfg.get("output_dir"),
+        "device": experiment.get("device") or cfg.get("device"),
+        "seed": experiment.get("seed") or cfg.get("seed"),
+        "data_root": data.get("data_root") or data.get("dataset_path") or cfg.get("data_root"),
+        "manifest": data.get("manifest") or cfg.get("manifest"),
+        "train_ratio": data.get("train_ratio"),
+        "val_ratio": data.get("val_ratio"),
+        "batch_size": data.get("batch_size"),
+        "num_workers": data.get("num_workers"),
+        "num_gaussians": model.get("num_gaussians"),
+        "rank": model.get("rank"),
+        "top_k": model.get("top_k"),
+        "light_dim": model.get("light_dim"),
+        "embed_dim": model.get("embed_dim"),
+        "intensity_dim": model.get("intensity_dim"),
+        "intensity_offset": model.get("intensity_offset"),
+        "disable_film": model.get("disable_film"),
+        "epochs": training.get("epochs") or training.get("num_epochs"),
+        "lr": training.get("lr"),
+        "weight_decay": training.get("weight_decay"),
+        "lr_scheduler": training.get("lr_scheduler"),
+        "lr_min": training.get("lr_min"),
+        "recon_loss": training.get("recon_loss"),
+        "charbonnier_eps": training.get("charbonnier_eps"),
+        "lambda_temporal": training.get("lambda_temporal"),
+        "grad_clip": training.get("grad_clip"),
+        "lambda_linearity": training.get("lambda_linearity"),
+        "linearity_aug_pairs": training.get("linearity_aug_pairs"),
+        "lambda_spatial": training.get("lambda_spatial"),
+        "spatial_k": training.get("spatial_k"),
+        "enable_sh_scaler": training.get("enable_sh_scaler"),
+        "sh_scaler_path": training.get("sh_scaler_path"),
+        "sh_scaler_max_samples": training.get("sh_scaler_max_samples"),
+        "no_init": training.get("no_init"),
+        "load_model": training.get("load_model"),
+        # Eval defaults to keep in same config file for run_all.py consumption.
+        "eval_output_dir": evaluation.get("output_dir") or evaluation.get("out_dir"),
+        "eval_checkpoint": evaluation.get("checkpoint"),
+    }
+
+    for key, value in mapping.items():
+        if value is None or not hasattr(args, key):
+            continue
+        current = getattr(args, key)
+        default = getattr(defaults, key, None)
+        if current == default:
+            setattr(args, key, value)
 
 
 def _device_from_arg(device_arg: str) -> torch.device:
@@ -190,6 +263,12 @@ def run_training(args: argparse.Namespace) -> None:
     device = _device_from_arg(args.device)
     output_dir = Path(args.output_dir) if args.output_dir else None
 
+    if output_dir is None:
+        from datetime import datetime
+        run_id = args.run_id or datetime.now().strftime("%Y%m%d-%H%M%S")
+        output_dir = _ROOT / "3_experiments" / "results" / args.variant / run_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     model, adapter, loaders, helpers = build_variant(args.variant, args, device)
     train_loader, val_loader, test_loader = loaders
 
@@ -291,15 +370,78 @@ def run_training(args: argparse.Namespace) -> None:
         if history["val"]["mae"]:
             print("Val history (last epoch):", {k: v[-1] for k, v in history["val"].items()})
 
+    if not args.no_auto_log:
+        # Summarize metrics for logging.
+        train_last = {k: (v[-1] if v else None) for k, v in history["train"].items()}
+        val_last = {k: (v[-1] if v else None) for k, v in history["val"].items()}
+        result_metrics: Dict[str, Any] = {}
+        result_metrics.update({f"train_{k}": v for k, v in train_last.items() if v is not None})
+        result_metrics.update({f"val_{k}": v for k, v in val_last.items() if v is not None})
+        if test_loader is not None:
+            result_metrics.update({f"test_{k}": v for k, v in test_metrics.items()})
+        result_metrics["param_count"] = sum(p.numel() for p in model.parameters())
+        result_metrics["git_commit"] = get_git_commit()
+
+        dataset_id = args.log_dataset_id
+        if dataset_id is None and args.manifest:
+            try:
+                manifest = load_manifest(args.manifest)
+                dataset_id = manifest.get("dataset_id")
+            except Exception:
+                dataset_id = None
+        if dataset_id is None:
+            dataset_id = Path(args.data_root).name
+
+        hyperparams = {
+            "variant": args.variant,
+            "num_gaussians": args.num_gaussians,
+            "rank": args.rank,
+            "top_k": args.top_k,
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "lr_scheduler": args.lr_scheduler,
+            "lr_min": args.lr_min,
+            "recon_loss": args.recon_loss,
+            "charbonnier_eps": args.charbonnier_eps,
+            "lambda_temporal": args.lambda_temporal,
+            "lambda_linearity": args.lambda_linearity,
+            "linearity_aug_pairs": args.linearity_aug_pairs,
+            "lambda_spatial": args.lambda_spatial,
+            "spatial_k": args.spatial_k,
+            "light_dim": args.light_dim,
+            "embed_dim": args.embed_dim,
+            "intensity_dim": args.intensity_dim,
+            "intensity_offset": args.intensity_offset,
+        }
+
+        try:
+            exp_id = log_experiment(
+                phase=args.log_phase,
+                stage=args.log_stage,
+                script_id=args.log_script_id,
+                dataset_id=dataset_id,
+                hyperparams=hyperparams,
+                results=result_metrics,
+                checkpoint_path=str(output_dir),
+                notes=args.log_notes,
+            )
+            print(f"✅ Logged experiment: {exp_id}")
+        except Exception as e:
+            print(f"Warning: Auto-log failed: {e}")
+
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Unified Gaussian-Physics trainer")
 
-    parser.add_argument("--variant", choices=["1d", "5d", "unified_1d", "unified_5d", "unified_set"], required=True)
+    parser.add_argument("--variant", choices=["1d", "5d", "unified_1d", "unified_5d", "unified_set"], required=False)
+    parser.add_argument("--config", default=None, help="YAML config for training")
     parser.add_argument("--data-root", default=None)
     parser.add_argument("--manifest", default=None, help="Path to dataset manifest.json")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--run-id", default=None, help="Optional run id for output directory naming")
 
     parser.add_argument("--num-gaussians", type=int, default=None)
     parser.add_argument("--rank", type=int, default=None)
@@ -359,6 +501,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help="Log visualizations every N epochs")
     parser.add_argument("--rerun-save-path", type=str, default=None,
                        help="Save .rrd file to path (optional)")
+
+    # Auto logging
+    parser.add_argument("--no-auto-log", action="store_true", help="Disable auto experiment logging")
+    parser.add_argument("--log-phase", default="Phase2_PGCPL")
+    parser.add_argument("--log-stage", default="training")
+    parser.add_argument("--log-script-id", default="train")
+    parser.add_argument("--log-dataset-id", default=None)
+    parser.add_argument("--log-notes", default=None)
 
     return parser
 
@@ -433,7 +583,19 @@ def apply_variant_defaults(args: argparse.Namespace) -> None:
 
 
 if __name__ == "__main__":
-    args = build_arg_parser().parse_args()
+    parser = build_arg_parser()
+    defaults = parser.parse_args([])
+    args = parser.parse_args()
+
+    if args.config:
+        cfg = _load_yaml(args.config)
+        # Allow legacy "train" section at top.
+        if "train" in cfg and isinstance(cfg["train"], dict):
+            cfg = merge_configs(cfg, cfg["train"])
+        _apply_config(args, defaults, cfg)
+
+    if args.variant is None:
+        raise ValueError("variant must be provided via --variant or config")
     args.data_root = resolve_data_root(args.data_root, args.manifest)
     apply_variant_defaults(args)
     run_training(args)

@@ -6,6 +6,7 @@ Week 4.3: Physics-only查询延迟测试
 """
 
 import sys
+import argparse
 from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent))
 
@@ -203,12 +204,22 @@ Result: {'PASS ✓' if success else 'FAIL ✗'}
 
 
 def main():
-    # 配置
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    checkpoint_path = Path('archive/Week3-4_MLP_Hybrid_Failed/checkpoints/stage1_best.pt')
-    output_dir = Path('experiments/week4_query_latency')
-    n_queries = 100
-    threshold_ms = 0.5
+    parser = argparse.ArgumentParser(description="Physics-only query latency test")
+    parser.add_argument("--checkpoint", default="archive/Week3-4_MLP_Hybrid_Failed/checkpoints/stage1_best.pt")
+    parser.add_argument("--output", default="experiments/week4_query_latency")
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--n-queries", type=int, default=100)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--threshold-ms", type=float, default=0.5)
+    parser.add_argument("--rank", type=int, default=5)
+    parser.add_argument("--warmup-runs", type=int, default=10)
+    args = parser.parse_args()
+
+    device = torch.device(args.device) if args.device else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    checkpoint_path = Path(args.checkpoint)
+    output_dir = Path(args.output)
+    n_queries = args.n_queries
+    threshold_ms = args.threshold_ms
 
     print("=" * 80)
     print("Week 4.3: Physics-only查询延迟测试")
@@ -216,7 +227,7 @@ def main():
 
     # 1. 生成随机查询配置
     print(f"\n[1/4] 生成{n_queries}个随机查询配置...")
-    test_configs = sample_random_configs(n_samples=n_queries, seed=42)
+    test_configs = sample_random_configs(n_samples=n_queries, seed=args.seed)
     print(f"配置范围:")
     print(f"  Zenith: [{test_configs[:, 0].min():.1f}, {test_configs[:, 0].max():.1f}] deg")
     print(f"  Azimuth: [{test_configs[:, 1].min():.1f}, {test_configs[:, 1].max():.1f}] deg")
@@ -230,7 +241,7 @@ def main():
         print(f"ERROR: Checkpoint不存在: {checkpoint_path}")
         return
 
-    model = PhysicsLowRank5D(rank=5)
+    model = PhysicsLowRank5D(rank=args.rank)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     # Extract only physics components from hybrid checkpoint
@@ -251,7 +262,7 @@ def main():
         model=model,
         test_configs=test_configs,
         device=device,
-        warmup_runs=10
+        warmup_runs=args.warmup_runs
     )
 
     # 结果

@@ -16,6 +16,7 @@ Week 6.1: Ablation实验 - Gaussian-Physics 5D模型
 """
 
 import sys
+import argparse
 from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent))
 
@@ -28,6 +29,19 @@ import matplotlib.pyplot as plt
 from models.gaussian_physics_5D import GaussianPhysicsCompression5D
 from data.transfer_tensor_dataset import TransferTensorDataset5D
 from training import BatchAdapter, GaussianPhysicsTrainer
+from tools.manifest_utils import load_manifest
+
+
+def resolve_data_root(data_root: str | None, manifest_path: str | None) -> str:
+    if data_root:
+        return data_root
+    if not manifest_path:
+        raise ValueError("data_root is required when manifest is not provided")
+    manifest = load_manifest(manifest_path)
+    output_dir = manifest.get("output_dir")
+    if not output_dir:
+        raise ValueError("manifest missing output_dir")
+    return str(output_dir)
 
 
 def compute_expected_params(K, rank):
@@ -172,9 +186,17 @@ def train_single_config(
 
 
 def main():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    data_dir = Path('../data_generation/output/5D_parametric_validation')
-    output_dir = Path('experiments/week6_ablation_5D')
+    parser = argparse.ArgumentParser(description="Gaussian-Physics 5D ablation")
+    parser.add_argument("--data-root", default=None)
+    parser.add_argument("--manifest", default=None)
+    parser.add_argument("--output", default="experiments/week6_ablation_5D")
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--epochs", type=int, default=1000)
+    args = parser.parse_args()
+
+    device = torch.device(args.device) if args.device else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    data_dir = Path(resolve_data_root(args.data_root, args.manifest))
+    output_dir = Path(args.output)
 
     print("=" * 80)
     print("Week 6.1: Ablation实验 - Gaussian-Physics 5D")
@@ -239,7 +261,7 @@ def main():
             test_dataset=test_dataset,
             device=device,
             output_dir=output_dir,
-            num_epochs=1000
+            num_epochs=args.epochs
         )
         all_results.append(result)
 
