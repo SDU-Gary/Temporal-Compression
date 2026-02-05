@@ -184,6 +184,7 @@
 
 是否可抽象为「一条命令 + 配置」
 - 是。可以用 `tools/run_pipeline.py` 只跑 train/eval（跳过 dataset），或用单独命令调用对应脚本。
+- 小提示：pipeline 的 eval 若未显式给 output_dir，会优先使用 **train args 的 output_dir**，或 **train config 里的 output_dir**；若两者都没有，则需要在 eval 配置里手动指定。
 
 ---
 

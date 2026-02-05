@@ -451,6 +451,7 @@ python tools/run_dataset.py --config configs/bistro.yaml --preset smoke
 - 场景/清单 schema：`metadata/schemas/*.json`  
 - 数据集配置：`1_data_generation/configs/*.yaml`  
 - Pipeline 示例：`pipelines/*.yaml`  
+- 备注：pipeline 的 eval 若未显式给 output_dir，会优先使用 **train args 的 output_dir**，或 **train config 里的 output_dir**；两者都没有时需手动指定。  
 
 ## J) Python 选择规则（避免环境混用）
 

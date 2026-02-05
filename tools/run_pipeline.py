@@ -25,6 +25,24 @@ def _load_pipeline(path: str | Path) -> Dict[str, Any]:
     return data
 
 
+def _load_train_output_dir(config_path: str | Path) -> str | None:
+    """Try to read output_dir from a training YAML config."""
+    try:
+        cfg_path = Path(config_path)
+        with open(cfg_path, "r") as f:
+            cfg = yaml.safe_load(f) or {}
+        if not isinstance(cfg, dict):
+            return None
+        experiment = cfg.get("experiment", {})
+        if isinstance(experiment, dict) and experiment.get("output_dir"):
+            return str(experiment["output_dir"])
+        if cfg.get("output_dir"):
+            return str(cfg["output_dir"])
+    except Exception:
+        return None
+    return None
+
+
 def build_pipeline_steps(pipeline: Dict[str, Any]) -> List[Dict[str, Any]]:
     steps: List[Dict[str, Any]] = []
     dataset_cfg = pipeline.get("dataset") or {}
@@ -46,6 +64,8 @@ def build_pipeline_steps(pipeline: Dict[str, Any]) -> List[Dict[str, Any]]:
             args["data_root"] = dataset_output_dir
         if "output_dir" in args:
             train_output_dir = str(args["output_dir"])
+        elif "config" in args:
+            train_output_dir = _load_train_output_dir(args["config"])
         cmd = [train_cfg["entry"]]
         python_bin = train_cfg.get("python") or pipeline_python_train
         for key, value in args.items():
