@@ -116,5 +116,5 @@ def main() -> None:
     print(f"Saved {len(emissive_entries)} emissive objects to {out_dir}")
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     main()

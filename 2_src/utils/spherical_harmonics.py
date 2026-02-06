@@ -169,7 +169,7 @@ def compute_sh_reconstruction_error(
     return mse, relative_error * 100
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     # 测试代码
     print("Testing Spherical Harmonics utilities...")
 

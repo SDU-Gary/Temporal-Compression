@@ -302,7 +302,7 @@ class DualGaussianFBT(nn.Module):
         )
 
 
-if __name__ == '__main__':
+if __name__ == '__main__':  # pragma: no cover
     """Test dual-gaussian FBT model."""
     # Create model
     model = DualGaussianFBT(

@@ -254,7 +254,7 @@ class GaussianPhysicsCompression1D(nn.Module):
         return naive_params / compressed_params
 
 
-if __name__ == '__main__':
+if __name__ == '__main__':  # pragma: no cover
     """Test 1D model."""
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")

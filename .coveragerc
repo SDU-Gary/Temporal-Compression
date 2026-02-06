@@ -1,0 +1,39 @@
+[run]
+source =
+    2_src
+    tools
+    3_experiments/scripts
+omit =
+    */__pycache__/*
+    2_src/tests/*
+    3_experiments/scripts/legacy_training/*
+    3_experiments/scripts/visualization/*
+    3_experiments/scripts/analysis/analyze_*
+    3_experiments/scripts/analysis/verify_*
+    3_experiments/scripts/analysis/diagnose_*
+    3_experiments/scripts/analysis/quick_diagnose.py
+    3_experiments/scripts/evaluation/benchmark_gpu_decompression.py
+    3_experiments/scripts/evaluation/test_*_query_physics.py
+    3_experiments/scripts/evaluation/ablation_gaussian_physics_5D.py
+    tools/render_*
+    tools/run_parallel_bistro_bakes.py
+    tools/run_probe_diagnostics.py
+    tools/run_quick_bistro_experiments.py
+    tools/sample_surface_probes.py
+    tools/render_bistro_preview.py
+    tools/render_single_envmap_frame.py
+    tools/import_existing_data.py
+    tools/summarize_state.py
+    tools/fix_database_errors.py
+    2_src/models/*
+    2_src/training/*
+    2_src/utils/__init__.py
+    2_src/utils/logger.py
+    2_src/utils/rendering_utils.py
+    2_src/utils/rerun_logger.py
+    2_src/utils/falcor_render_cli.py
+
+[report]
+fail_under = 100
+show_missing = True
+skip_empty = True

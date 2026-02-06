@@ -86,6 +86,10 @@ def _apply_config(args: argparse.Namespace, defaults: argparse.Namespace, cfg: D
         "sh_scaler_max_samples": training.get("sh_scaler_max_samples"),
         "no_init": training.get("no_init"),
         "load_model": training.get("load_model"),
+        "enable_rerun": training.get("enable_rerun") or training.get("rerun"),
+        "rerun_log_freq": training.get("rerun_log_freq"),
+        "rerun_save_path": training.get("rerun_save_path"),
+        "show_progress": training.get("show_progress") or training.get("progress"),
         # Eval defaults to keep in same config file for run_all.py consumption.
         "eval_output_dir": evaluation.get("output_dir") or evaluation.get("out_dir"),
         "eval_checkpoint": evaluation.get("checkpoint"),
@@ -269,12 +273,18 @@ def run_training(args: argparse.Namespace) -> None:
         output_dir = _ROOT / "3_experiments" / "results" / args.variant / run_id
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.show_progress:
+        print("[init] loading dataset and building model...")
     model, adapter, loaders, helpers = build_variant(args.variant, args, device)
     train_loader, val_loader, test_loader = loaders
 
     if not args.no_init:
+        if args.show_progress:
+            print("[init] running K-Means/SVD initialization...")
         helpers["init_fn"](model, train_loader)
         model.to(device)
+        if args.show_progress:
+            print("[init] initialization done.")
 
     # Optional SH scaling
     if args.enable_sh_scaler:
@@ -313,6 +323,9 @@ def run_training(args: argparse.Namespace) -> None:
             print(f"Warning: Unexpected keys when loading model: {unexpected}")
 
     # Initialize Rerun logger if enabled
+    if args.enable_rerun and not args.rerun_save_path and output_dir is not None:
+        args.rerun_save_path = str(output_dir / "train.rrd")
+
     rerun_logger = None
     if args.enable_rerun:
         try:
@@ -350,6 +363,7 @@ def run_training(args: argparse.Namespace) -> None:
         spatial_weight=args.lambda_spatial,
         spatial_k=args.spatial_k,
         rerun_logger=rerun_logger,  # Pass logger to trainer
+        show_progress=args.show_progress,
     )
 
     history = trainer.fit(
@@ -501,12 +515,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--print-history", action="store_true")
 
     # Rerun visualization arguments
-    parser.add_argument("--enable-rerun", action="store_true",
-                       help="Enable Rerun visualization")
+    parser.add_argument("--enable-rerun", action="store_true", dest="enable_rerun",
+                       help="Enable Rerun visualization (default on)")
+    parser.add_argument("--no-rerun", action="store_false", dest="enable_rerun",
+                       help="Disable Rerun visualization")
+    parser.set_defaults(enable_rerun=True)
     parser.add_argument("--rerun-log-freq", type=int, default=10,
                        help="Log visualizations every N epochs")
     parser.add_argument("--rerun-save-path", type=str, default=None,
-                       help="Save .rrd file to path (optional)")
+                       help="Save .rrd file to path (default: output_dir/train.rrd)")
+
+    # Progress display
+    parser.add_argument("--no-progress", action="store_false", dest="show_progress",
+                       help="Disable progress bars and init status logs")
+    parser.set_defaults(show_progress=True)
 
     # Auto logging
     parser.add_argument("--no-auto-log", action="store_true", help="Disable auto experiment logging")
@@ -588,7 +610,7 @@ def apply_variant_defaults(args: argparse.Namespace) -> None:
             setattr(args, key, value)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     parser = build_arg_parser()
     defaults = parser.parse_args([])
     args = parser.parse_args()

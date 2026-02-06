@@ -116,7 +116,7 @@ def sample_with_decluster(
     uniform_n = max(0, candidate_total - weighted_n)
     if remaining.size >= uniform_n:
         uniform_idx = rng.choice(remaining, size=uniform_n, replace=False)
-    else:
+    else:  # pragma: no cover - remaining always >= uniform_n when candidate_total <= points
         uniform_idx = rng.choice(points.shape[0], size=uniform_n, replace=True)
     candidates = np.concatenate([points[weighted_idx], points[uniform_idx]], axis=0).astype(np.float32)
 
@@ -124,4 +124,3 @@ def sample_with_decluster(
         return farthest_point_sampling(candidates, total, seed=decluster_seed)
 
     return candidates[:total]
-

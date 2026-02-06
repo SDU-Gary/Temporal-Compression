@@ -146,7 +146,7 @@ def get_db_last_modified():
     return int(DB_PATH.stat().st_mtime)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     # Test database initialization
     print("Initializing database...")
     init_db()

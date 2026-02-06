@@ -370,5 +370,5 @@ def test_pg_rglt():
     print("\n✓ All tests passed!")
 
 
-if __name__ == '__main__':
+if __name__ == '__main__':  # pragma: no cover
     test_pg_rglt()

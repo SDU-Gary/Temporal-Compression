@@ -218,7 +218,7 @@ def compute_sun_elevation(hour, latitude=40.0):
 
 # ============ 使用示例 ============
 
-if __name__ == '__main__':
+if __name__ == '__main__':  # pragma: no cover
     """
     简单的训练示例
     """
@@ -597,6 +597,6 @@ def test_physics_low_rank_5D():
     print("\n✓ All tests passed!")
 
 
-if __name__ == '__main__':
+if __name__ == '__main__':  # pragma: no cover
     # 运行5D测试
     test_physics_low_rank_5D()

@@ -284,7 +284,7 @@ def create_dataloaders(
     return train_loader, val_loader, test_loader
 
 
-if __name__ == '__main__':
+if __name__ == '__main__':  # pragma: no cover
     """Test dataset loader."""
     import sys
 

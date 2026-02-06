@@ -151,7 +151,7 @@ def plot_sun_trajectory(trajectory: List[Tuple[float, np.ndarray]], save_path: s
         print("Warning: matplotlib not installed, skipping visualization")
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     print("Testing Sun Position calculations...")
 
     # 生成24小时太阳轨迹

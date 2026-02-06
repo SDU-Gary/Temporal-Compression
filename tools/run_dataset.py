@@ -66,5 +66,5 @@ def main() -> None:
     write_run_summary(output_dir / "run_summary.md", "Dataset Run Summary", summary_items)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     main()

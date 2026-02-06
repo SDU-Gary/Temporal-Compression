@@ -229,7 +229,7 @@ def query_experiments(
         params.append(phase)
 
     if dataset_id:
-        conditions.append("dataset_id = ?")
+        conditions.append("d.dataset_id = ?")
         params.append(dataset_id)
 
     if min_psnr is not None:
@@ -386,5 +386,5 @@ def main():
         sys.exit(1)
 
 
-if __name__ == '__main__':
+if __name__ == '__main__':  # pragma: no cover
     main()

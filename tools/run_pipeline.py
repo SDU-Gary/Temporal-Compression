@@ -136,5 +136,5 @@ def main() -> None:
     write_run_summary(run_dir / "run_summary.md", "Pipeline Run Summary", summary_items, sections=sections)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     main()

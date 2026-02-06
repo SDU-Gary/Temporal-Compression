@@ -389,5 +389,5 @@ def main():
     print(f"\n结果已保存至: {output_dir}")
 
 
-if __name__ == '__main__':
+if __name__ == '__main__':  # pragma: no cover
     main()

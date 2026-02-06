@@ -386,5 +386,5 @@ def visualize_ablation_results(results, output_dir):
     plt.close()
 
 
-if __name__ == '__main__':
+if __name__ == '__main__':  # pragma: no cover
     main()

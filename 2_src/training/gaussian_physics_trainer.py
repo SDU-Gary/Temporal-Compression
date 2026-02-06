@@ -58,6 +58,12 @@ class BatchAdapter:
         return self.target_inverse(preds), self.target_inverse(targets)
 
 
+try:
+    from tqdm import tqdm as _tqdm
+except Exception:
+    _tqdm = None
+
+
 class GaussianPhysicsTrainer:
     """Standardized trainer for Gaussian-Physics variants."""
 
@@ -81,6 +87,7 @@ class GaussianPhysicsTrainer:
         spatial_weight: float = 0.0,
         spatial_k: int = 1,
         rerun_logger=None,  # Optional RerunLogger instance
+        show_progress: bool = True,
     ):
         self.model = model
         self.device = device
@@ -98,6 +105,8 @@ class GaussianPhysicsTrainer:
         self.spatial_weight = spatial_weight
         self.spatial_k = spatial_k
         self.rerun_logger = rerun_logger
+        self.show_progress = show_progress
+        self._progress_prefix = ""
         self._probe_positions = None
         self._probe_neighbors = None
 
@@ -372,7 +381,12 @@ class GaussianPhysicsTrainer:
         post_clip_norms_list = []
         num_batches = 0
 
-        for batch in train_loader:
+        loader = train_loader
+        if self.show_progress and _tqdm is not None:
+            desc = self._progress_prefix + " [train]" if self._progress_prefix else "train"
+            loader = _tqdm(train_loader, desc=desc, leave=False, unit="batch")
+
+        for batch in loader:
             unpacked = self.adapter.unpack(batch, self.device)
             if len(unpacked) == 4:
                 positions, params, targets, mask = unpacked
@@ -437,7 +451,12 @@ class GaussianPhysicsTrainer:
         sums = {"mae": 0.0, "rmse": 0.0, "charbonnier": 0.0, "superposition": 0.0}
         num_batches = 0
 
-        for batch in val_loader:
+        loader = val_loader
+        if self.show_progress and _tqdm is not None:
+            desc = self._progress_prefix + " [val]" if self._progress_prefix else "val"
+            loader = _tqdm(val_loader, desc=desc, leave=False, unit="batch")
+
+        for batch in loader:
             unpacked = self.adapter.unpack(batch, self.device)
             if len(unpacked) == 4:
                 positions, params, targets, mask = unpacked
@@ -613,6 +632,8 @@ class GaussianPhysicsTrainer:
         self._init_spatial_neighbors(train_loader)
 
         for epoch in range(1, num_epochs + 1):
+            if self.show_progress:
+                self._progress_prefix = f"epoch {epoch}/{num_epochs}"
             train_metrics = self.train_epoch(train_loader)
             history["train"]["total"].append(train_metrics["total"])
             history["train"]["recon"].append(train_metrics["recon"])
@@ -658,6 +679,9 @@ class GaussianPhysicsTrainer:
                         scheduler.step()
             elif scheduler is not None:
                 scheduler.step()
+
+            if self.show_progress:
+                self._progress_prefix = ""
 
             if log_every and (epoch == 1 or epoch % log_every == 0):
                 msg = (
