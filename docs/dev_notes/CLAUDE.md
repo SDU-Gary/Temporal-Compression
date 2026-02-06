@@ -18,32 +18,24 @@ This is a graduate thesis project on **hierarchical neural compression for multi
 ## Repository Structure
 
 ```
-毕设/
-├── data_generation/           # Mitsuba 3-based dataset generation
-│   ├── generate_dataset.py    # Main generation script
-│   ├── core/                  # Core rendering logic
-│   ├── utils/                 # SH fitting, sun position calculation
-│   └── output/                # Generated datasets
-├── multi_time_compression/    # Main compression system
-│   ├── configs/               # Training configurations (YAML)
-│   ├── data/                  # Dataset loaders
-│   ├── models/                # Neural network models
-│   │   ├── gaussian_mixture.py        # 3D Gaussian spatial representation
-│   │   ├── temporal_mlp.py            # Time-varying latent code MLP (TASK SPEC)
-│   │   ├── decoder_mlp.py             # SH coefficient decoder
-│   │   ├── full_model.py              # Full integration (TASK SPEC)
-│   │   ├── physics_low_rank.py        # Experimental: physics-guided low-rank
-│   │   └── gaussian_physics_compression.py  # Experimental: hybrid method
-│   ├── training/              # Training loop, losses, metrics
-│   ├── scripts/               # Training and evaluation scripts
-│   ├── experiments/           # Training outputs and checkpoints
-│   ├── docs/experiment_reports/  # 10 detailed experiment reports
-│   └── tests/                 # Unit tests
-├── docs/                      # Thesis and research notes
-│   ├── thesis/多时刻光照压缩任务书.md  # **AUTHORITATIVE TASK SPECIFICATION**
-│   └── research_notes/        # Research notes on related work
-├── mitsuba-docs/              # Local Mitsuba documentation
-└── venv/                      # Python virtual environment
+Temporal-Compression/
+├── 1_data_generation/         # Stage 1: dataset generation (Mitsuba/Falcor)
+│   ├── generate_dataset.py
+│   ├── core/
+│   ├── utils/
+│   └── output/
+├── 2_src/                     # Stage 2: core algorithms
+│   ├── data/
+│   ├── models/
+│   ├── training/
+│   ├── utils/
+│   └── tests/
+├── 3_experiments/             # Stage 3: configs + scripts + results
+├── docs/                      # thesis + design + dev notes
+├── archive/                   # historical methods (TemporalMLP / TPE)
+├── metadata/                  # project DB + JSON schemas
+├── pipelines/                 # pipeline YAMLs
+└── tools/                     # tooling (experiment logging, manifests, ...)
 ```
 
 ## Development Environment
@@ -68,7 +60,7 @@ source venv/bin/activate
 #### Data Generation
 
 ```bash
-cd data_generation
+cd 1_data_generation
 
 # Generate dataset with multiple time moments
 python generate_dataset.py
@@ -83,34 +75,16 @@ python analyze_sh_quality.py --data_dir output/method_test_v1
 #### Training
 
 ```bash
-cd multi_time_compression
+cd 3_experiments
 
-# Train full model (task specification architecture)
-python scripts/train.py --config configs/baseline.yaml
-
-# Quick diagnostic (checks data loading and model forward pass)
-python scripts/quick_diagnose.py
-
-# Detailed training diagnostics
-python scripts/diagnose_training.py --config configs/baseline.yaml --steps 100
-
-# Experimental methods (exploratory, not main task)
-python scripts/train_physics_low_rank_proper.py
-python scripts/train_gaussian_physics.py
+# Current PG-GCPL mainline (Gaussian-Physics variants)
+python scripts/train.py --config configs/bistro_clean_train.yaml
 ```
 
 #### Testing
 
 ```bash
-cd multi_time_compression
-
-# Test dataset loading
-python tests/test_dataset.py
-
-# Test model components
-python tests/test_models.py
-
-# Run all tests
+cd 2_src
 pytest tests/
 ```
 
@@ -188,7 +162,7 @@ SH_coeff(p,t) = MLP_decoder([F(p,t), p, sun_dir(t)])
 2. ✅ **Temporal MLP** (`models/temporal_mlp.py`): Time-varying latent code generation
 3. ✅ **Gaussian Mixture** (`models/gaussian_mixture.py`): Spatial latent code representation
 4. ✅ **Decoder MLP** (`models/decoder_mlp.py`): SH coefficient reconstruction
-5. ✅ **Data Generation** (`data_generation/`): Mitsuba 3-based multi-moment rendering
+5. ✅ **Data Generation** (`1_data_generation/`): Mitsuba/Falcor based multi-moment rendering
 6. ✅ **Dataset Loader** (`data/dataset.py`): Multi-temporal lighting data loading
 7. ✅ **Training Loop** (`training/trainer.py`): Basic training infrastructure
 8. ✅ **Loss Functions** (`training/losses.py`): Reconstruction, temporal smoothness
@@ -239,14 +213,14 @@ All training parameters are in YAML files (`configs/`):
 
 ### Data Flow
 
-1. **Dataset Generation** (data_generation/):
+1. **Dataset Generation** (`1_data_generation/`):
    - Mitsuba 3 renders scenes at T time moments with different sun positions
    - Generates N probe positions via uniform grid sampling
    - Bakes spherical harmonics (2nd order, 27 coefficients) for each probe/moment
    - Computes sun directions using astronomical algorithms
    - Outputs: probes.npz, moment_XX/sh_coeffs.npz, moment_XX/images/
 
-2. **Training** (multi_time_compression/):
+2. **Training** (`3_experiments/` + `2_src/`):
    - Loads multi-temporal data (probe positions, SH coefficients, sun directions)
    - Initializes K Gaussians via K-Means clustering on probe positions
    - For each Gaussian: stores base latent code F_j^base
@@ -373,7 +347,7 @@ Used to compactly represent directional radiance:
 - Coefficients computed by projecting radiance onto SH basis
 - Reconstruction: L(ω) = Σ c_lm · Y_lm(ω)
 
-**Implementation**: `data_generation/utils/spherical_harmonics.py`
+**Implementation**: `1_data_generation/utils/spherical_harmonics.py`
 
 ### Sun Position Calculation
 
@@ -382,15 +356,22 @@ Astronomical algorithm to compute sun direction from time:
 - Output: Unit direction vector [x,y,z] + solar zenith angle θ
 - Based on standard astronomical calculations
 
-**Implementation**: `data_generation/utils/sun_position.py`
+**Implementation**: `1_data_generation/utils/sun_position.py`
 
-**Usage**:
+**Usage** (import by adding `1_data_generation/` to `sys.path`):
 ```python
-from data_generation.utils.sun_position import compute_sun_directions
+from pathlib import Path
+import sys
+
+ROOT = Path.cwd()  # run from repo root
+sys.path.insert(0, str(ROOT / "1_data_generation"))
+
+from utils.sun_position import compute_sun_directions
+
 sun_dirs, zeniths = compute_sun_directions(
     hours=[6, 12, 18],
     latitude=40.0,
-    longitude=116.0
+    longitude=116.0,
 )
 ```
 
@@ -578,8 +559,8 @@ python tools/logexp.py query --min-psnr 30 --limit 5
 ## References
 
 - **Task specification** (AUTHORITATIVE): `docs/thesis/多时刻光照压缩任务书.md`
-- Experiment reports: `multi_time_compression/docs/experiment_reports/` (exploratory work)
-- Data generation guide: `data_generation/README.md`
+- Experiment reports: `docs/dev_notes/experiment_reports/` (historical exploratory work)
+- Data generation guide: `1_data_generation/README.md`
 - Mitsuba 3 docs: `mitsuba-docs/` (local copy)
 - Gaussian Compression paper: SIGGRAPH 2025 (base architecture)
 - K-Planes: CVPR 2023 (temporal smoothness inspiration)

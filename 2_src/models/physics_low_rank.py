@@ -1,6 +1,10 @@
 """
 Physics-Guided Low-Rank Temporal Compression
 
+NOTE: This module implements hard-coded physics basis functions (trigonometric).
+It has been superseded by the FiLM-based unified architecture (gaussian_physics_unified.py).
+Consider this module as legacy_experiment for historical reference.
+
 核心思想：
   SH(t) ≈ U @ Φ(t)
 
@@ -29,7 +33,7 @@ class PhysicsLowRank(nn.Module):
     例如 k=5: 150参数，2.3x压缩
     """
 
-    def __init__(self, rank=5, init_method='random'):
+    def __init__(self, rank=5, init_method="random"):
         """
         Args:
             rank: 秩（推荐4-5）
@@ -70,11 +74,14 @@ class PhysicsLowRank(nn.Module):
         batch_size = sun_elevation.shape[0]
 
         # 物理基函数 [B, 3]
-        basis = torch.stack([
-            torch.cos(sun_elevation),
-            torch.sin(sun_elevation),
-            torch.ones_like(sun_elevation)
-        ], dim=-1)  # [B, 3]
+        basis = torch.stack(
+            [
+                torch.cos(sun_elevation),
+                torch.sin(sun_elevation),
+                torch.ones_like(sun_elevation),
+            ],
+            dim=-1,
+        )  # [B, 3]
 
         # 时间权重 [B, k]
         # Φ(t) = coeffs @ basis^T
@@ -102,7 +109,9 @@ class PhysicsLowRank(nn.Module):
         effective_rank = min(self.rank, available_rank)
 
         if effective_rank < self.rank:
-            print(f"  Warning: Only {available_rank} components available, using rank={effective_rank}")
+            print(
+                f"  Warning: Only {available_rank} components available, using rank={effective_rank}"
+            )
 
         # 提取前k个分量
         # 注意：numpy的SVD返回的是V^T，要转置
@@ -121,7 +130,9 @@ class PhysicsLowRank(nn.Module):
         self.U.data = torch.from_numpy(U_init).float()
 
         print(f"✓ U initialized from SVD")
-        print(f"  Captured energy: {S[:effective_rank].sum()/S.sum()*100:.2f}% (using {effective_rank}/{self.rank} components)")
+        print(
+            f"  Captured energy: {S[:effective_rank].sum() / S.sum() * 100:.2f}% (using {effective_rank}/{self.rank} components)"
+        )
 
 
 class PhysicsLowRankTrainer:
@@ -176,11 +187,7 @@ class PhysicsLowRankTrainer:
         # 最大误差
         max_error = torch.abs(sh_pred - sh_gt).max().item()
 
-        return {
-            'mae': mae,
-            'rmse': rmse,
-            'max_error': max_error
-        }
+        return {"mae": mae, "rmse": rmse, "max_error": max_error}
 
 
 def compute_sun_elevation(hour, latitude=40.0):
@@ -208,8 +215,9 @@ def compute_sun_elevation(hour, latitude=40.0):
     lat_rad = np.deg2rad(latitude)
 
     # 高度角
-    sin_elevation = (np.sin(lat_rad) * np.sin(declination) +
-                     np.cos(lat_rad) * np.cos(declination) * np.cos(hour_angle_rad))
+    sin_elevation = np.sin(lat_rad) * np.sin(declination) + np.cos(lat_rad) * np.cos(
+        declination
+    ) * np.cos(hour_angle_rad)
 
     elevation = np.arcsin(np.clip(sin_elevation, -1, 1))
 
@@ -218,7 +226,7 @@ def compute_sun_elevation(hour, latitude=40.0):
 
 # ============ 使用示例 ============
 
-if __name__ == '__main__':  # pragma: no cover
+if __name__ == "__main__":  # pragma: no cover
     """
     简单的训练示例
     """
@@ -235,7 +243,7 @@ if __name__ == '__main__':  # pragma: no cover
     sh_gt_t = torch.from_numpy(sh_gt_np).float()
 
     # 2. 创建模型
-    model = PhysicsLowRank(rank=5, init_method='random')
+    model = PhysicsLowRank(rank=5, init_method="random")
 
     # 可选：SVD初始化
     model.init_from_svd(sh_gt_np)
@@ -249,7 +257,7 @@ if __name__ == '__main__':  # pragma: no cover
 
         if (epoch + 1) % 200 == 0:
             metrics = trainer.evaluate(sun_elevations_t, sh_gt_t)
-            print(f"Epoch {epoch+1}: Loss={loss:.6f}, MAE={metrics['mae']:.6f}")
+            print(f"Epoch {epoch + 1}: Loss={loss:.6f}, MAE={metrics['mae']:.6f}")
 
     # 4. 最终评估
     final_metrics = trainer.evaluate(sun_elevations_t, sh_gt_t)
@@ -262,10 +270,11 @@ if __name__ == '__main__':  # pragma: no cover
     print(f"\nCompression Analysis:")
     print(f"  Spline:      351 params")
     print(f"  Ours (k={model.rank}):  {model.num_params()} params")
-    print(f"  Compression: {351/model.num_params():.2f}x")
+    print(f"  Compression: {351 / model.num_params():.2f}x")
 
 
 # ============ 5D扩展 (Week 1-2 验证) ============
+
 
 class ExtendedPhysicsBasis5D(nn.Module):
     """
@@ -281,11 +290,7 @@ class ExtendedPhysicsBasis5D(nn.Module):
     - 云量: 指数衰减模拟大气透射率
     """
 
-    def __init__(
-        self,
-        ref_color_temp: float = 5500.0,
-        temp_scale: float = 2000.0
-    ):
+    def __init__(self, ref_color_temp: float = 5500.0, temp_scale: float = 2000.0):
         """
         Args:
             ref_color_temp: 参考色温（K），用于归一化
@@ -343,15 +348,18 @@ class ExtendedPhysicsBasis5D(nn.Module):
         atmos_basis = torch.exp(-cloud_cover)
 
         # 拼接为7维基
-        basis = torch.stack([
-            cos_zenith,
-            sin_zenith,
-            cos_azimuth,
-            sin_azimuth,
-            intensity_basis,
-            temp_basis,
-            atmos_basis
-        ], dim=-1)  # [B, 7]
+        basis = torch.stack(
+            [
+                cos_zenith,
+                sin_zenith,
+                cos_azimuth,
+                sin_azimuth,
+                intensity_basis,
+                temp_basis,
+                atmos_basis,
+            ],
+            dim=-1,
+        )  # [B, 7]
 
         return basis
 
@@ -372,7 +380,7 @@ class PhysicsLowRank5D(nn.Module):
         rank: int = 5,
         ref_color_temp: float = 5500.0,
         temp_scale: float = 2000.0,
-        init_method: str = 'random'
+        init_method: str = "random",
     ):
         """
         Args:
@@ -387,8 +395,7 @@ class PhysicsLowRank5D(nn.Module):
 
         # 物理基编码器
         self.physics_encoder = ExtendedPhysicsBasis5D(
-            ref_color_temp=ref_color_temp,
-            temp_scale=temp_scale
+            ref_color_temp=ref_color_temp, temp_scale=temp_scale
         )
 
         # 空间基 U [27, rank]
@@ -430,11 +437,7 @@ class PhysicsLowRank5D(nn.Module):
         return sh
 
     @torch.no_grad()
-    def init_from_svd(
-        self,
-        light_params_np: np.ndarray,
-        sh_matrix: np.ndarray
-    ):
+    def init_from_svd(self, light_params_np: np.ndarray, sh_matrix: np.ndarray):
         """
         用SVD初始化U，用最小二乘初始化coeffs
 
@@ -451,7 +454,9 @@ class PhysicsLowRank5D(nn.Module):
         effective_rank = min(self.rank, available_rank)
 
         if effective_rank < self.rank:
-            print(f"  Warning: Only {available_rank} components available, using rank={effective_rank}")
+            print(
+                f"  Warning: Only {available_rank} components available, using rank={effective_rank}"
+            )
 
         # 提取前rank个右奇异向量作为空间基U
         U_init = Vt[:effective_rank, :].T  # [27, effective_rank]
@@ -486,7 +491,7 @@ class PhysicsLowRank5D(nn.Module):
         self.time_coeffs.data = torch.from_numpy(coeffs_init).float()
 
         print(f"✓ Initialized from SVD + least-squares")
-        print(f"  Captured energy: {S[:effective_rank].sum()/S.sum()*100:.2f}%")
+        print(f"  Captured energy: {S[:effective_rank].sum() / S.sum() * 100:.2f}%")
         print(f"  U shape: {self.U.shape}")
         print(f"  Coeffs shape: {self.time_coeffs.shape}")
 
@@ -531,11 +536,7 @@ class PhysicsLowRank5DTrainer:
         rmse = torch.sqrt(F.mse_loss(sh_pred, sh_gt)).item()
         max_error = torch.abs(sh_pred - sh_gt).max().item()
 
-        return {
-            'mae': mae,
-            'rmse': rmse,
-            'max_error': max_error
-        }
+        return {"mae": mae, "rmse": rmse, "max_error": max_error}
 
 
 def test_physics_low_rank_5D():
@@ -579,7 +580,7 @@ def test_physics_low_rank_5D():
 
         if (epoch + 1) % 100 == 0:
             metrics = trainer.evaluate(light_params, sh_gt)
-            print(f"Epoch {epoch+1}: Loss={loss:.6f}, MAE={metrics['mae']:.6f}")
+            print(f"Epoch {epoch + 1}: Loss={loss:.6f}, MAE={metrics['mae']:.6f}")
 
     # 5. 最终评估
     final_metrics = trainer.evaluate(light_params, sh_gt)
@@ -592,11 +593,11 @@ def test_physics_low_rank_5D():
     print(f"\nCompression Analysis:")
     print(f"  Spline (41 configs × 27 SH × 3 RGB / 3 basis):  ~810 params")
     print(f"  Ours (rank={model.rank}):  {model.num_params()} params")
-    print(f"  Compression: {810/model.num_params():.2f}x")
+    print(f"  Compression: {810 / model.num_params():.2f}x")
 
     print("\n✓ All tests passed!")
 
 
-if __name__ == '__main__':  # pragma: no cover
+if __name__ == "__main__":  # pragma: no cover
     # 运行5D测试
     test_physics_low_rank_5D()

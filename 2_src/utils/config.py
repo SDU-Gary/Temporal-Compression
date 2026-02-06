@@ -110,27 +110,59 @@ def validate_config(config: Config) -> bool:
     Raises:
         ValueError: If configuration is missing required fields
     """
-    required_fields = [
-        'experiment.name',
-        'experiment.output_dir',
-        'experiment.device',
-        'data.dataset_path',
-        'data.batch_size',
-        'model.num_gaussians',
-        'model.latent_dim_base',
-        'model.latent_dim_time',
-        'training.num_steps',
+    # This repository contains both the current PG-GCPL (Gaussian-Physics) mainline
+    # and archived TemporalMLP baseline configs. For historical reasons, we accept
+    # either schema here and recommend JSON-schema validation for strict checks.
+
+    temporal_mlp_required = [
+        "experiment.name",
+        "experiment.output_dir",
+        "experiment.device",
+        "data.dataset_path",
+        "data.batch_size",
+        "model.num_gaussians",
+        "model.latent_dim_base",
+        "model.latent_dim_time",
+        "training.num_steps",
     ]
 
-    missing_fields = []
-    for field in required_fields:
-        if config.get(field) is None:
-            missing_fields.append(field)
+    pg_gcpl_required = [
+        "experiment.variant",
+        "experiment.output_dir",
+        "experiment.device",
+        "data.data_root",
+        "data.batch_size",
+        "model.num_gaussians",
+        "model.rank",
+        # scripts/train.py supports either "epochs" or "num_epochs".
+        "training.epochs|training.num_epochs",
+    ]
 
-    if missing_fields:
-        raise ValueError(f"Missing required configuration fields: {missing_fields}")
+    def _missing(required: list[str]) -> list[str]:
+        missing: list[str] = []
+        for field in required:
+            if "|" in field:
+                options = field.split("|")
+                if all(config.get(opt) is None for opt in options):
+                    missing.append(field)
+                continue
+            if config.get(field) is None:
+                missing.append(field)
+        return missing
 
-    return True
+    missing_temporal = _missing(temporal_mlp_required)
+    if not missing_temporal:
+        return True
+
+    missing_pg = _missing(pg_gcpl_required)
+    if not missing_pg:
+        return True
+
+    raise ValueError(
+        "Missing required configuration fields. "
+        f"TemporalMLP missing: {missing_temporal}. "
+        f"PG-GCPL missing: {missing_pg}."
+    )
 
 
 def merge_configs(base_config: Dict, override_config: Dict) -> Dict:

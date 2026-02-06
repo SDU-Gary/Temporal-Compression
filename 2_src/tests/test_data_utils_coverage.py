@@ -339,6 +339,16 @@ def test_config_utils(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     )
     assert config_utils.validate_config(valid_cfg) is True
 
+    valid_pg_gcpl_cfg = config_utils.Config(
+        {
+            "experiment": {"variant": "unified_set", "output_dir": "b", "device": "cpu"},
+            "data": {"data_root": "x", "batch_size": 1},
+            "model": {"num_gaussians": 1, "rank": 1},
+            "training": {"epochs": 1},
+        }
+    )
+    assert config_utils.validate_config(valid_pg_gcpl_cfg) is True
+
     merged = config_utils.merge_configs({"a": {"b": 1}}, {"a": {"c": 2}, "d": 3})
     assert merged["a"]["b"] == 1 and merged["a"]["c"] == 2 and merged["d"] == 3
 

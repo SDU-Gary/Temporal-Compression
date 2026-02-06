@@ -1,239 +1,65 @@
-# 多时刻光照压缩 - 毕业设计项目
+# PG‑GCPL：多时刻光照压缩（毕业设计仓库）
 
-**学生**：葛恺尧
-**时间**：2025学年
-**主题**：基于高斯混合和物理引导的多时刻光照神经压缩
+本仓库是一个图形学向的**多时刻/多光源全局光照压缩**项目，核心方向为 **PG‑GCPL (Physics‑Guided, GMM‑constrained Probe Learning)**：
 
----
+- **空间**：用少量 3D Gaussians 做 probe 空间软分区/聚合。
+- **时间/光照状态**：用物理可解释的“线性调制”思想（以及 FiLM 动态基调制）驱动低秩基函数权重变化。
+- **目标**：高压缩比（~1:17）、可控误差、实时解压（<0.5ms）。
 
-## 📁 项目结构
+如果你要快速理解“主线/历史线/候选清理项”，建议先看：
 
-```
-毕设/
-├── README.md                    # 本文件
-├── CLAUDE.md                    # Claude Code 使用指南
-│
-├── docs/                        # 文档目录
-│   ├── thesis/                  # 论文相关
-│   │   └── 多时刻光照压缩任务书.md
-│   ├── research_notes/          # 研究笔记
-│   │   ├── 研究故事_多时刻光照压缩.md
-│   │   ├── TPE_Temporal_Perturbation_Embedding.md
-│   │   ├── G2_CS-LT_研究报告.md
-│   │   └── TAD-GF.md
-│   └── assets/                  # 资源文件
-│       ├── sun_trajectory.png
-│       └── sun_directions_24h.txt
-│
-├── data_generation/             # 数据生成模块 (757MB)
-│   ├── core/                    # 核心渲染逻辑
-│   ├── utils/                   # 工具函数
-│   ├── scenes/                  # 场景定义
-│   ├── output/                  # 生成的数据集
-│   │   ├── level1_tpe/          # (188K)
-│   │   ├── level2_tpe/          # (452K)
-│   │   ├── method_test_v1/      # (63M)
-│   │   ├── dataset_2k/          # (190M)
-│   │   └── dataset_15k/         # (203M)
-│   ├── generate_dataset.py      # 主生成脚本
-│   └── README.md
-│
-├── multi_time_compression/      # 主压缩系统 (6.9MB)
-│   ├── models/                  # 神经网络模型
-│   │   ├── physics_low_rank.py           # 物理引导低秩模型
-│   │   ├── gaussian_physics_compression.py  # 高斯-物理混合模型
-│   │   ├── temporal_mlp.py
-│   │   └── ...
-│   ├── scripts/                 # 训练和评估脚本
-│   │   ├── train_physics_low_rank_proper.py
-│   │   ├── train_gaussian_physics.py
-│   │   └── experiments/         # P0实验脚本
-│   ├── docs/                    # 实验报告
-│   │   └── experiment_reports/  # 9篇详细报告
-│   │       ├── 00_README.md
-│   │       ├── 01-07_*.md      # TPE实验
-│   │       ├── 08_Physics_Low_Rank_Results.md
-│   │       └── 09_Gaussian_Physics_Hybrid.md
-│   ├── output/                  # 实验结果
-│   │   ├── p0_results/
-│   │   ├── physics_low_rank/
-│   │   └── gaussian_physics/
-│   ├── configs/                 # 配置文件
-│   ├── data/                    # 数据加载器
-│   ├── training/                # 训练循环
-│   └── tests/                   # 单元测试
-│
-├── mitsuba-docs/                # Mitsuba 3 本地文档 (3.2MB)
-├── reference/                   # 参考论文 (35MB)
-├── analysis/                    # 论文分析 (300KB)
-├── venv/                        # Python虚拟环境 (7.4GB)
-└── 202200300003-葛恺尧-开题报告.docx
+- `docs/PGGCPL_AUDIT.md`：全仓库审计与主线定位
+- `docs/PGGCPL_TIME_MODELS.md`：时间建模路线对比与演进
+
+## 📁 当前目录结构（以 numbered stages 为主）
 
 ```
+Temporal-Compression/
+├── 1_data_generation/          # Stage 1: 数据生成（Mitsuba/Falcor）
+├── 2_src/                      # Stage 2: 核心算法（models/training/data/utils）
+├── 3_experiments/              # Stage 3: 训练/评估/可视化（configs/scripts/results）
+├── 4_thesis/                   # Stage 4: 论文材料
+├── archive/                    # 历史/弃用路线（TemporalMLP/TPE等）
+├── docs/                       # 文档与开发笔记
+├── metadata/                   # 项目数据库与 schema
+├── pipelines/                  # workflow pipeline 定义
+└── tools/                      # 工具（实验记录、manifest等）
+```
 
----
+## ✅ 当前主线（PG‑GCPL / FiLM Unified）
 
-## 🎯 项目目标
+主线模型以“**光照描述符 → pooled embedding Z → 低秩权重 + FiLM 动态基**”为核心：
 
-### 核心任务
+- `2_src/models/gaussian_physics_unified.py`：`GaussianPhysicsCompressionUnified` + `LightSetEncoder`
+- `2_src/utils/light_descriptor.py`：把 1D/5D 参数构建为统一 descriptor（默认 12D）
+- `2_src/training/gaussian_physics_trainer.py`：统一 trainer（recon/temporal/linearity/spatial 等 loss）
+- `3_experiments/scripts/train.py`：统一训练入口（`variant: unified_set/unified_5d/...`）
+- `metadata/schemas/train.schema.json`：训练配置 schema（YAML 可做校验）
 
-在保证渲染质量的前提下，压缩多时刻光照场景的存储空间，实现实时查询。
+## 🗃️ 历史路线（已归档但保留参考价值）
 
-### 技术路线
+- `archive/TemporalMLP/`：TemporalMLP（三层结构基线，已弃用）
+- `archive/TPE_Method_Archived/`：TPE 失败路线存档
+- `2_src/models/physics_low_rank.py` 等：硬编码物理基函数的低秩模型（legacy_experiment）
 
-1. **空间压缩**：高斯混合模型表示探针分布
-2. **时间压缩**：物理引导的低秩因子分解
-3. **混合方法**：空间高斯 + 时间物理基函数
-
-### 目标指标
-
-- 压缩比：> 10x
-- 精度：PSNR > 35dB
-- 查询速度：< 0.5ms
-
----
-
-## 📊 主要成果
-
-### 1. TPE方法验证（文档1-7）
-
-- ✗ TPE假设在真实场景失效
-- Cornell Box: 84.9% 误差来自TPE假设
-- House: 虽然贡献率96.5%，但绝对误差极小
-
-### 2. 物理引导低秩压缩（文档8）
-
-- ✅ Cornell Box: 2.34x压缩 + **33.5%精度提升**
-- ✅ House: 2.92x压缩
-- 方法：SH(t) ≈ U @ (coeffs @ [cos(θ), sin(θ), 1])
-- 参数：150个（rank=5）
-
-### 3. 高斯-物理混合压缩（文档9）
-
-- ✅ **17.8x压缩比**（343探针 × 6时刻）
-- 参数：3,120个（K=20高斯）
-- 方法：F(p,t) = Σ G_j(p) \* [U_j @ Φ(t)]
-
----
-
-## 🚀 快速开始
-
-### 环境配置
+## 🚀 快速开始（主线示例）
 
 ```bash
-# 激活虚拟环境
+# 1) 激活环境
 source venv/bin/activate
 
-# 验证安装
-python -c "import mitsuba as mi; print(mi.variants())"
-python -c "import torch; print(torch.__version__)"
-```
-
-### 数据生成
-
-```bash
-cd data_generation
+# 2) 生成数据（示例）
+cd 1_data_generation
 python generate_dataset.py
+
+# 3) 训练主线模型（示例配置）
+cd ../3_experiments
+python scripts/train.py --config configs/bistro_clean_train.yaml
 ```
 
-### 训练模型
-
-```bash
-cd multi_time_compression
-
-# 物理引导低秩模型（单探针）
-python scripts/train_physics_low_rank_proper.py
-
-# 高斯-物理混合模型（多探针）
-python scripts/train_gaussian_physics.py
-```
-
----
-
-## 📖 文档导航
-
-### 核心文档
-
-- **项目指南**：[CLAUDE.md](CLAUDE.md) - Claude Code使用说明
-- **任务书**：[docs/thesis/多时刻光照压缩任务书.md](docs/thesis/多时刻光照压缩任务书.md)
-- **实验报告**：[multi_time_compression/docs/experiment_reports/](multi_time_compression/docs/experiment_reports/)
-
-### 快速链接
-
-- [数据生成指南](data_generation/README.md)
-- [实验总结](multi_time_compression/docs/experiment_reports/00_README.md)
-- [物理低秩方法](multi_time_compression/docs/experiment_reports/08_Physics_Low_Rank_Results.md)
-- [混合压缩方法](multi_time_compression/docs/experiment_reports/09_Gaussian_Physics_Hybrid.md)
-
----
-
-## 🔧 依赖环境
-
-### 主要依赖
+## 🔧 依赖环境（摘要）
 
 - Python 3.13
-- PyTorch 2.9.1 (CUDA 12.8)
-- Mitsuba 3.7.3 (cuda_ad_rgb variant)
-- DrJit 0.4.6
-- NumPy 1.26.4
-- SciPy 1.16.3
+- PyTorch 2.9.1
+- Mitsuba 3.7.3
 
-### 硬件要求
-
-- GPU: NVIDIA RTX 4090 (24GB VRAM)
-- RAM: 32GB+
-- 存储: ~10GB（含数据集）
-
----
-
-## 📈 实验时间线
-
-- **2025-12-07**: 项目启动，环境配置
-- **2025-12-09**: TPE方法提出与初步实验
-- **2025-12-10**: P0实验（Cornell Box）
-- **2025-12-11**: House场景对比实验
-- **2025-12-12**:
-  - 物理引导低秩方法验证
-  - 高斯-物理混合方法实现
-  - 完整实验报告撰写
-
----
-
-## 📝 待办事项
-
-### 短期（1周）
-
-- [ ] 增加高斯数量（K=20→50）
-- [ ] 使用完整训练数据（3→6时刻）
-- [ ] 更长训练（1000→5000 epochs）
-
-### 中期（1月）
-
-- [ ] 加入方位角（3维→5维基函数）
-- [ ] 扩展到24小时实验
-- [ ] 与任务书MLP方法对比
-- [ ] 实现实时解压缩（CUDA kernel）
-
-### 长期（3月+）
-
-- [ ] 多场景泛化测试
-- [ ] 层次化高斯结构
-- [ ] 端到端渲染集成
-- [ ] 论文撰写与投稿
-
----
-
-## 🤝 贡献者
-
-- **葛恺尧** - 主要开发者
-- **指导老师** - [待补充]
-
----
-
-## 📄 许可证
-
-本项目仅用于学术研究和毕业设计，未经许可不得用于商业用途。
-
----
-
-**最后更新**: 2025-12-12
