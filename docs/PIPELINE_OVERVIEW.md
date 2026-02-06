@@ -169,7 +169,7 @@
   - `3_experiments/scripts/train.py`
   - 调用方式示例：`python 3_experiments/scripts/train.py --variant unified_set --data-root <dataset_dir> --num-steps 100 --batch-size 16`
 - 评估（只跑小规模或已有模型）
-  - `3_experiments/scripts/evaluation/run_all.py`（注意内部脚本仍有硬编码数据路径，需先对齐路径或改为参数化）
+  - `3_experiments/scripts/evaluation/run_all.py`（根据 config 中 variant 自动选择 physics 或 unified 套件）
   - 调用方式示例：`python 3_experiments/scripts/evaluation/run_all.py --output-dir <out>`
 - 可视化/分析（纯 Python）
   - `3_experiments/scripts/visualization/*`

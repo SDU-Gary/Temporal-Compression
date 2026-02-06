@@ -454,6 +454,7 @@ python tools/run_dataset.py --config configs/bistro.yaml --preset smoke
 - 备注：pipeline 的 eval 若未显式给 output_dir，会优先使用 **train args 的 output_dir**，或 **train config 里的 output_dir**；两者都没有时需手动指定。  
 - YAML 模板：`3_experiments/configs/template_unified_set.yaml`  
 - YAML Schema：`metadata/schemas/train.schema.json`（训练/评估脚本可选校验）  
+- 评估入口 `run_all.py` 会根据 config 中 `experiment.variant` 自动选择评估套件（physics/unified）。  
 
 ## J) Python 选择规则（避免环境混用）
 
