@@ -1,0 +1,2 @@
+# This lockfile is intentionally minimal. Generate a full lock with:
+#   uv lock

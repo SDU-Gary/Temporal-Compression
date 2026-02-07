@@ -1,7 +1,8 @@
-"""Configuration utilities for loading and validating YAML configs."""
+"""Configuration utilities for loading and validating YAML configs.
 
-import yaml
-import json
+This module is imported by CLI entrypoints. Keep imports lightweight so that
+`--help` can work even when the Python environment isn't fully provisioned.
+"""
 from pathlib import Path
 from typing import Dict, Any
 from dataclasses import dataclass, field
@@ -48,6 +49,8 @@ class Config:
         if not config_path.exists():
             raise FileNotFoundError(f"Config file not found: {config_path}")
 
+        import yaml
+
         with open(config_path, 'r') as f:
             config_dict = yaml.safe_load(f)
 
@@ -61,6 +64,8 @@ class Config:
         """
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        import yaml
 
         with open(output_path, 'w') as f:
             yaml.dump(self.config, f, default_flow_style=False, indent=2)
@@ -110,22 +115,6 @@ def validate_config(config: Config) -> bool:
     Raises:
         ValueError: If configuration is missing required fields
     """
-    # This repository contains both the current PG-GCPL (Gaussian-Physics) mainline
-    # and archived TemporalMLP baseline configs. For historical reasons, we accept
-    # either schema here and recommend JSON-schema validation for strict checks.
-
-    temporal_mlp_required = [
-        "experiment.name",
-        "experiment.output_dir",
-        "experiment.device",
-        "data.dataset_path",
-        "data.batch_size",
-        "model.num_gaussians",
-        "model.latent_dim_base",
-        "model.latent_dim_time",
-        "training.num_steps",
-    ]
-
     pg_gcpl_required = [
         "experiment.variant",
         "experiment.output_dir",
@@ -150,18 +139,13 @@ def validate_config(config: Config) -> bool:
                 missing.append(field)
         return missing
 
-    missing_temporal = _missing(temporal_mlp_required)
-    if not missing_temporal:
-        return True
-
     missing_pg = _missing(pg_gcpl_required)
     if not missing_pg:
         return True
 
     raise ValueError(
-        "Missing required configuration fields. "
-        f"TemporalMLP missing: {missing_temporal}. "
-        f"PG-GCPL missing: {missing_pg}."
+        "Missing required configuration fields for PG-GCPL mainline. "
+        f"Missing: {missing_pg}."
     )
 
 
@@ -195,6 +179,8 @@ def validate_with_schema(config: Dict[str, Any], schema_path: Path | str, strict
 
     Returns a list of warning/error messages. If strict=True, raises ValueError on violations.
     """
+    import json
+
     schema_path = Path(schema_path)
     messages: list[str] = []
     try:

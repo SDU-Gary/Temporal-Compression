@@ -41,7 +41,7 @@ def log_experiment(
     Log experiment to database with auto-incrementing run_order.
 
     Args:
-        phase: Experiment phase (Phase0_TPE, Phase1_TemporalMLP, Phase2_PGCPL)
+        phase: Experiment phase (e.g. Phase2_PGCPL)
         stage: Experiment stage (validation, training, ablation, visualization, evaluation)
         script_id: Script identifier (short name from scripts table)
         dataset_id: Dataset identifier (short name from datasets table)

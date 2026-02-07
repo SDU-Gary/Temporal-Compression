@@ -8,8 +8,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-import numpy as np
-
 
 def _git_commit(root: Path) -> Optional[str]:
     try:
@@ -35,6 +33,7 @@ def read_parametric_stats(output_dir: Path) -> Dict[str, Any]:
     stats: Dict[str, Any] = {}
     tensor_path = output_dir / "parametric_tensor.npz"
     if tensor_path.exists():
+        import numpy as np
         data = np.load(tensor_path, allow_pickle=True)
         tensor = data["tensor"]
         stats["num_probes"] = int(tensor.shape[0])

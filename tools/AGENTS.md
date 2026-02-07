@@ -9,12 +9,12 @@ tools/
 ├── logexp.py                    # Experiment logging CLI (most used)
 ├── run_pipeline.py             # Workflow orchestration
 ├── run_dataset.py              # Dataset generation orchestration
-├── summarize_state.py          # Project context regeneration
+├── (removed)                  # summarize_state.py (historical)
 ├── db_utils.py                 # Database connection utilities
 ├── workflow_config.py          # Python environment management
 ├── run_summary.py              # Pipeline summary generation
 ├── fix_database_errors.py      # Database repair utilities
-├── import_existing_data.py     # Data import utilities
+├── (removed)                  # import_existing_data.py (historical)
 ├── manifest_utils.py           # Dataset manifest handling
 ├── median_filter_dataset.py    # Data preprocessing
 ├── ema_smooth_dataset.py       # Temporal smoothing
@@ -38,7 +38,6 @@ tools/
 ### DATABASE TOOLS
 - **logexp.py**: CLI for experiment logging, task management, and baseline setting
 - **db_utils.py**: SQLite database connection utilities (project.db)
-- **summarize_state.py**: Generates project_state.md from database for context regeneration
 - **fix_database_errors.py**: Database repair and validation utilities
 
 ### PIPELINE TOOLS
@@ -75,11 +74,6 @@ python tools/logexp.py log --phase Phase2_PGCPL --stage training \
 python tools/run_pipeline.py --config pipelines/pgcpl_bistro_dev.yaml
 ```
 
-### Context Regeneration
-```bash
-python tools/summarize_state.py  # Creates project_state.md
-```
-
 ### Dataset Processing
 ```bash
 python tools/median_filter_dataset.py --input probes.npz --output probes_filtered.npz
@@ -89,7 +83,7 @@ python tools/ema_smooth_dataset.py --input probes.npz --alpha 0.3
 ## CONVENTIONS
 - **Database-first**: All experiments logged to SQLite (project.db)
 - **YAML-driven**: Pipelines configured via YAML files in `pipelines/` directory
-- **Context persistence**: Use `summarize_state.py` after conversation compaction
+- **Context persistence**: Prefer writing concise docs under `docs/` and logging experiments via `tools/logexp.py`
 - **Blender integration**: Scene export utilities in `blender/` subdirectory
 - **Parallel execution**: Tools support parallel processing for large datasets
 - **GPU acceleration**: Rendering tools have GPU-accelerated variants
@@ -97,6 +91,5 @@ python tools/ema_smooth_dataset.py --input probes.npz --alpha 0.3
 ## MOST FREQUENTLY USED
 1. `logexp.py` - Daily experiment tracking
 2. `run_pipeline.py` - Workflow automation
-3. `summarize_state.py` - Context regeneration
-4. `render_probe_video.py` - Result visualization
-5. `median_filter_dataset.py` - Data preprocessing
+3. `render_probe_video.py` - Result visualization
+4. `median_filter_dataset.py` - Data preprocessing

@@ -1,6 +1,6 @@
 # Deprecated Training Scripts
 
-旧版 1D/5D 训练脚本已迁移到 `3_experiments/scripts/legacy_training/`。
+仓库仅保留 PG‑GCPL 主线（FiLM unified_set）训练入口：`3_experiments/scripts/train.py`。
 
 当前推荐入口：
 - `3_experiments/scripts/train.py`

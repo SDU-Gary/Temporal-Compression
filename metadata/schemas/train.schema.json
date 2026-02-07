@@ -8,7 +8,7 @@
       "properties": {
         "variant": {
           "type": "string",
-          "enum": ["1d", "5d", "unified_1d", "unified_5d", "unified_set"]
+          "enum": ["unified_set"]
         },
         "output_dir": { "type": "string" },
         "device": { "type": "string" },

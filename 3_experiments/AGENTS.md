@@ -11,14 +11,11 @@ Stage 3: Experimentation and evaluation for hierarchical neural compression of m
 ```
 3_experiments/
 ├── configs/                    # YAML configuration files
-│   ├── baseline.yaml           # Main baseline configuration
-│   ├── baseline_regularized.yaml
-│   └── baseline_2k.yaml        # 2K resolution variants
+│   ├── bistro_clean_train.yaml # Mainline FiLM unified_set config (K30_r8)
+│   └── template_unified_set.yaml
 ├── scripts/                    # Experiment execution scripts
 │   ├── training/               # Training scripts and utilities
-│   ├── evaluation/             # Evaluation and validation scripts
 │   ├── analysis/               # Diagnostic and analysis tools
-│   ├── visualization/          # Visualization and rendering scripts
 │   └── train.py                # Unified training entry point
 └── results/                    # Experiment outputs
     └── experiment_groups/      # Hierarchical experiment organization
@@ -41,12 +38,11 @@ Stage 3: Experimentation and evaluation for hierarchical neural compression of m
 **YAML-Based**: All experiments configured via YAML files in `configs/`.
 
 **Key Configurations**:
-- `baseline.yaml`: Main baseline with optimal K30_r8 parameters
-- `baseline_regularized.yaml`: Regularized variants for stability
-- `baseline_2k.yaml`: High-resolution 2K probe configurations
+- `bistro_clean_train.yaml`: Mainline config with optimal K30_r8 parameters
+- `template_unified_set.yaml`: Template for new experiments
 
 **Modification Workflow**:
-1. Copy existing config: `cp configs/baseline.yaml configs/my_experiment.yaml`
+1. Copy existing config: `cp configs/bistro_clean_train.yaml configs/my_experiment.yaml`
 2. Modify parameters (Gaussian count, rank, learning rates)
 3. Run: `python scripts/train.py --config configs/my_experiment.yaml`
 
@@ -56,20 +52,10 @@ Stage 3: Experimentation and evaluation for hierarchical neural compression of m
 - Checkpoint management and resumption
 - Learning rate scheduling
 
-**Evaluation** (`scripts/evaluation/`):
-- PSNR, SSIM, compression ratio calculation
-- Latency measurement (<0.5ms target)
-- Query performance at 60 FPS @ 1080p
-
 **Analysis** (`scripts/analysis/`):
 - Training diagnostics and convergence analysis
 - Ablation study execution
-- Tucker decomposition verification
 
-**Visualization** (`scripts/visualization/`):
-- Radiance field rendering and comparison
-- SH lobe visualization (`visualize_sh_lobes_interactive.py`)
-- Scene rendering comparisons (`render_scene_comparison_K30_r8.py`)
 
 ## RESULTS STRUCTURE
 **Deep Nested Hierarchy**: Results organized for systematic analysis:
@@ -112,7 +98,7 @@ group1_5D_parametric/
 ## WORKFLOW
 1. **Configure**: Create/modify YAML config in `configs/`
 2. **Train**: `python scripts/train.py --config configs/my_config.yaml`
-3. **Evaluate**: Run evaluation scripts from `scripts/evaluation/`
+3. **Evaluate**: (TODO) reintroduce mainline `scripts/eval.py`
 4. **Analyze**: Use analysis tools to diagnose performance
 5. **Visualize**: Generate visualizations for paper/thesis
 6. **Organize**: Store results in appropriate hierarchical location

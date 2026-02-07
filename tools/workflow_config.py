@@ -8,13 +8,18 @@ from typing import Any, Dict, Tuple
 import os
 import sys
 
-import yaml
+try:
+    import yaml
+except Exception:  # pragma: no cover
+    yaml = None
 
 
 def load_yaml(path: str | Path) -> Dict[str, Any]:
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Config not found: {path}")
+    if yaml is None:
+        raise ImportError("pyyaml is required. Install via `uv pip install pyyaml`.")
     with open(path, "r") as f:
         data = yaml.safe_load(f) or {}
     if not isinstance(data, dict):

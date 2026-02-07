@@ -9,10 +9,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-import numpy as np
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset
+
+def _lazy_imports():
+    import numpy as np
+    import torch
+    from torch.utils.data import Dataset
+
+    return np, torch, Dataset
 
 try:
     import rerun as rr
@@ -45,6 +48,8 @@ class RerunLogger:
         """
         if not RERUN_AVAILABLE:
             raise ImportError("rerun-sdk is required. Install with: pip install rerun-sdk")
+
+        np, torch, Dataset = _lazy_imports()
 
         self.app_id = app_id
         self.log_frequency = log_frequency

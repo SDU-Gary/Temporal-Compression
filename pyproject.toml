@@ -1,0 +1,26 @@
+[project]
+name = "pg-gcpl"
+version = "0.1.0"
+description = "PG-GCPL: Physics-Guided, GMM-constrained Probe Learning (mainline only)"
+requires-python = ">=3.12"
+dependencies = [
+  "numpy>=1.26",
+  "pyyaml>=6.0",
+  "torch>=2.2",
+  "tqdm>=4.66",
+  "rich>=13.7",
+  "jsonschema>=4.22",
+]
+
+[project.optional-dependencies]
+vis = [
+  "matplotlib>=3.8",
+  "pillow>=10.3",
+]
+
+rerun = [
+  "rerun-sdk>=0.17",
+]
+
+[tool.uv]
+# Allow installing PyTorch via the default index; customize as needed.

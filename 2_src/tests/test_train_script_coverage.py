@@ -36,9 +36,7 @@ class DummyDataset5D:
     def __init__(self):
         self.tensor = np.zeros((2, 2, 27), dtype=np.float32)
         self.probe_positions = np.zeros((2, 3), dtype=np.float32)
-        self.light_configs_subset = np.zeros((2, 5), dtype=np.float32)
-        self.param_min = np.zeros((5,), dtype=np.float32)
-        self.param_max = np.ones((5,), dtype=np.float32)
+        self.light_configs_subset = np.zeros((2, 2, 12), dtype=np.float32)
 
 
 class DummyLoader:
@@ -106,13 +104,9 @@ class DummyScaler:
 
 
 def _patch_train_deps(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(train_script, "GaussianPhysicsCompression1D", DummyModel)
-    monkeypatch.setattr(train_script, "GaussianPhysicsCompression5D", DummyModel)
     monkeypatch.setattr(train_script, "GaussianPhysicsCompressionUnified", DummyModel)
     monkeypatch.setattr(train_script, "BatchAdapter", DummyAdapter)
     monkeypatch.setattr(train_script, "GaussianPhysicsTrainer", DummyTrainer)
-    monkeypatch.setattr(train_script, "create_intensity_dataloaders", lambda **_: (DummyLoader(DummyDataset1D()), DummyLoader(DummyDataset1D()), None))
-    monkeypatch.setattr(train_script, "create_dataloaders_5D", lambda **_: (DummyLoader(DummyDataset5D()), DummyLoader(DummyDataset5D()), DummyLoader(DummyDataset5D())))
     monkeypatch.setattr(train_script, "create_dataloaders_lightset", lambda **_: (DummyLoader(DummyDataset5D()), DummyLoader(DummyDataset5D()), DummyLoader(DummyDataset5D())))
 
 
@@ -181,8 +175,8 @@ def test_train_helpers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
     args = SimpleNamespace(variant=None, data_root=None)
     defaults = SimpleNamespace(variant=None, data_root=None)
-    train_script._apply_config(args, defaults, {"experiment": {"variant": "1d"}, "data": {"data_root": "x"}})
-    assert args.variant == "1d"
+    train_script._apply_config(args, defaults, {"experiment": {"variant": "unified_set"}, "data": {"data_root": "x"}})
+    assert args.variant == "unified_set"
     assert args.data_root == "x"
 
     assert train_script._device_from_arg("cpu").type == "cpu"
@@ -205,20 +199,18 @@ def test_build_variant_and_init(monkeypatch: pytest.MonkeyPatch) -> None:
     args = _build_args(Path("/tmp"))
     device = torch.device("cpu")
 
-    for variant in ("1d", "5d", "unified_5d", "unified_set", "unified_1d"):
+    for variant in ("unified_set",):
         args.variant = variant
         model, adapter, loaders, helpers = train_script.build_variant(variant, args, device)
         assert model is not None
         assert adapter is not None
         assert helpers["init_fn"] is not None
         if adapter.params_transform is not None:
-            params = torch.zeros((1, 1)) if variant == "unified_1d" else torch.zeros((1, 5))
-            adapter.params_transform(params)
+            adapter.params_transform(torch.zeros((1, 2, 12)))
 
     with pytest.raises(ValueError):
         train_script.build_variant("bad", args, device)
 
-    train_script._init_1d(DummyModel(), DummyLoader(DummyDataset1D()))
     train_script._init_5d(DummyModel(), DummyLoader(DummyDataset5D()))
 
 

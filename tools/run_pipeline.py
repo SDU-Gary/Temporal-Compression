@@ -1,4 +1,13 @@
-"""Pipeline runner for dataset -> train -> eval."""
+"""Pipeline runner for dataset -> train -> eval.
+
+This runner intentionally keeps the pipeline YAML simple while making execution
+robust:
+
+- Injects `data_root` from the dataset step when missing.
+- Ensures `train.output_dir` is set when an eval step exists.
+- Automatically resolves eval checkpoint from the train output directory:
+  prefers `best_model.pt`, falls back to `last_model.pt`.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +17,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
-import yaml
+try:
+    import yaml
+except Exception:  # pragma: no cover
+    yaml = None
 
 from tools.run_dataset import build_plan
 from tools.run_summary import write_run_summary
@@ -17,6 +29,8 @@ from tools.workflow_config import ensure_python, select_python
 
 def _load_pipeline(path: str | Path) -> Dict[str, Any]:
     path = Path(path)
+    if yaml is None:
+        raise ImportError("pyyaml is required for run_pipeline.py. Install via `uv pip install pyyaml`.")
     with open(path, "r") as f:
         data = yaml.safe_load(f) or {}
     if not isinstance(data, dict):
@@ -45,6 +59,7 @@ def _load_train_output_dir(config_path: str | Path) -> str | None:
 
 def build_pipeline_steps(pipeline: Dict[str, Any]) -> List[Dict[str, Any]]:
     steps: List[Dict[str, Any]] = []
+    run_dir = Path(pipeline.get("run_dir", "."))
     dataset_cfg = pipeline.get("dataset") or {}
     dataset_output_dir = None
     if dataset_cfg:
@@ -62,10 +77,22 @@ def build_pipeline_steps(pipeline: Dict[str, Any]) -> List[Dict[str, Any]]:
             args["config"] = train_cfg["config"]
         if dataset_output_dir and "data_root" not in args:
             args["data_root"] = dataset_output_dir
+
+        # Backward-compat: convert num_steps -> epochs.
+        if "num_steps" in args and "epochs" not in args:
+            args["epochs"] = args.pop("num_steps")
+
         if "output_dir" in args:
             train_output_dir = str(args["output_dir"])
         elif "config" in args:
             train_output_dir = _load_train_output_dir(args["config"])
+
+        # If an eval step exists and train output_dir is not set, force one so
+        # eval can resolve checkpoint paths deterministically.
+        if (pipeline.get("eval") or {}) and not train_output_dir:
+            train_output_dir = str((run_dir / "out_train").resolve())
+            args["output_dir"] = train_output_dir
+
         cmd = [train_cfg["entry"]]
         python_bin = train_cfg.get("python") or pipeline_python_train
         for key, value in args.items():
@@ -75,7 +102,7 @@ def build_pipeline_steps(pipeline: Dict[str, Any]) -> List[Dict[str, Any]]:
                     cmd.append(flag)
                 continue
             cmd.extend([flag, str(value)])
-        steps.append({"name": "train", "cmd": cmd, "python": python_bin})
+        steps.append({"name": "train", "cmd": cmd, "python": python_bin, "output_dir": train_output_dir})
     eval_cfg = pipeline.get("eval") or {}
     if eval_cfg:
         args = eval_cfg.get("args", {})
@@ -83,8 +110,16 @@ def build_pipeline_steps(pipeline: Dict[str, Any]) -> List[Dict[str, Any]]:
             args["config"] = eval_cfg["config"]
         if dataset_output_dir and "data_root" not in args:
             args["data_root"] = dataset_output_dir
-        if "output_dir" not in args and train_output_dir:
-            args["output_dir"] = str(Path(train_output_dir) / "eval")
+
+        # Provide deterministic defaults for eval output + checkpoint.
+        # - output: <train_output_dir>/eval/eval.json
+        # - checkpoint: resolved at runtime after training
+        if "output" not in args and train_output_dir:
+            args["output"] = str(Path(train_output_dir) / "eval" / "eval.json")
+
+        if "checkpoint" not in args and train_output_dir:
+            args["checkpoint"] = str(Path(train_output_dir) / "best_model.pt")
+
         cmd = [eval_cfg["entry"]]
         python_bin = eval_cfg.get("python") or pipeline_python_eval
         for key, value in args.items():
@@ -94,8 +129,47 @@ def build_pipeline_steps(pipeline: Dict[str, Any]) -> List[Dict[str, Any]]:
                     cmd.append(flag)
                 continue
             cmd.extend([flag, str(value)])
-        steps.append({"name": "eval", "cmd": cmd, "python": python_bin})
+        steps.append(
+            {
+                "name": "eval",
+                "cmd": cmd,
+                "python": python_bin,
+                "train_output_dir": train_output_dir,
+            }
+        )
     return steps
+
+
+def _resolve_eval_checkpoint(step: Dict[str, Any]) -> None:
+    """Mutate eval command to point at an existing checkpoint."""
+
+    cmd = step.get("cmd")
+    if not isinstance(cmd, list):
+        return
+
+    # Find current --checkpoint flag.
+    checkpoint_idx = None
+    for i, tok in enumerate(cmd):
+        if tok == "--checkpoint" and i + 1 < len(cmd):
+            checkpoint_idx = i + 1
+            break
+    if checkpoint_idx is None:
+        return
+
+    candidate = Path(cmd[checkpoint_idx])
+    if candidate.exists():
+        return
+
+    train_output_dir = step.get("train_output_dir")
+    if not train_output_dir:
+        return
+
+    best = Path(train_output_dir) / "best_model.pt"
+    last = Path(train_output_dir) / "last_model.pt"
+    if best.exists():
+        cmd[checkpoint_idx] = str(best)
+    elif last.exists():
+        cmd[checkpoint_idx] = str(last)
 
 
 def main() -> None:
@@ -110,6 +184,8 @@ def main() -> None:
 
     start_time = datetime.now().isoformat()
     for step in steps:
+        if step.get("name") == "eval":
+            _resolve_eval_checkpoint(step)
         python_bin = step.get("python") or args.python
         cmd = ensure_python(step["cmd"], python_bin)
         if args.dry_run:

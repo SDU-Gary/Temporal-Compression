@@ -15,19 +15,49 @@ if str(_SRC) not in sys.path:
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-import torch
-from training import BatchAdapter, GaussianPhysicsTrainer
-from data.intensity_modulation_dataset import create_dataloaders as create_intensity_dataloaders
-from data.transfer_tensor_dataset import create_dataloaders_5D
-from data.lightset_dataset import create_dataloaders_lightset
-from models.gaussian_physics_1D import GaussianPhysicsCompression1D
-from models.gaussian_physics_5D import GaussianPhysicsCompression5D
-from models.gaussian_physics_unified import GaussianPhysicsCompressionUnified
-from utils.light_descriptor import build_descriptor_5d, build_descriptor_1d
 from tools.manifest_utils import load_manifest
 from tools.manifest_utils import get_git_commit
 from tools.logexp import log_experiment
 from utils.config import merge_configs, validate_with_schema
+
+
+# Heavy deps (torch + training + model) are imported lazily so that
+# `python3 3_experiments/scripts/train.py --help` works even when the
+# runtime environment hasn't been activated yet.
+torch = None
+BatchAdapter = None
+GaussianPhysicsTrainer = None
+create_dataloaders_lightset = None
+GaussianPhysicsCompressionUnified = None
+
+
+def _lazy_imports() -> None:
+    global torch
+    global BatchAdapter
+    global GaussianPhysicsTrainer
+    global create_dataloaders_lightset
+    global GaussianPhysicsCompressionUnified
+
+    if torch is None:
+        import torch as _torch
+
+        torch = _torch
+    if BatchAdapter is None or GaussianPhysicsTrainer is None:
+        from training import BatchAdapter as _BatchAdapter
+        from training import GaussianPhysicsTrainer as _GaussianPhysicsTrainer
+
+        BatchAdapter = _BatchAdapter
+        GaussianPhysicsTrainer = _GaussianPhysicsTrainer
+    if create_dataloaders_lightset is None:
+        from data.lightset_dataset import create_dataloaders_lightset as _create_dataloaders_lightset
+
+        create_dataloaders_lightset = _create_dataloaders_lightset
+    if GaussianPhysicsCompressionUnified is None:
+        from models.gaussian_physics_unified import (
+            GaussianPhysicsCompressionUnified as _GaussianPhysicsCompressionUnified,
+        )
+
+        GaussianPhysicsCompressionUnified = _GaussianPhysicsCompressionUnified
 
 
 def _load_yaml(path: str | Path) -> Dict[str, Any]:
@@ -90,7 +120,6 @@ def _apply_config(args: argparse.Namespace, defaults: argparse.Namespace, cfg: D
         "rerun_log_freq": training.get("rerun_log_freq"),
         "rerun_save_path": training.get("rerun_save_path"),
         "show_progress": training.get("show_progress") or training.get("progress"),
-        # Eval defaults to keep in same config file for run_all.py consumption.
         "eval_output_dir": evaluation.get("output_dir") or evaluation.get("out_dir"),
         "eval_checkpoint": evaluation.get("checkpoint"),
     }
@@ -104,7 +133,8 @@ def _apply_config(args: argparse.Namespace, defaults: argparse.Namespace, cfg: D
             setattr(args, key, value)
 
 
-def _device_from_arg(device_arg: str) -> torch.device:
+def _device_from_arg(device_arg: str):
+    _lazy_imports()
     if device_arg:
         return torch.device(device_arg)
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -122,13 +152,8 @@ def resolve_data_root(data_root: str | None, manifest_path: str | None) -> str:
     return str(output_dir)
 
 
-def _init_1d(model: GaussianPhysicsCompression1D, train_loader) -> None:
-    dataset = train_loader.dataset
-    probe_positions = dataset.get_full_probe_positions(normalized=True)
-    model.initialize_from_probes(probe_positions, method="kmeans", device=str(next(model.parameters()).device))
-
-
-def _init_5d(model: GaussianPhysicsCompression5D, train_loader) -> None:
+def _init_5d(model, train_loader) -> None:
+    _lazy_imports()
     dataset = train_loader.dataset
     sh_tensor = torch.from_numpy(dataset.tensor).float()
     model.init_from_kmeans(
@@ -143,72 +168,8 @@ def build_variant(
     args: argparse.Namespace,
     device: torch.device,
 ) -> Tuple[torch.nn.Module, BatchAdapter, Tuple, Dict]:
-    if variant == "1d":
-        train_loader, val_loader, test_loader = create_intensity_dataloaders(
-            data_root=args.data_root,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            train_ratio=args.train_ratio,
-            val_ratio=args.val_ratio,
-            random_seed=args.seed,
-        )
-        model = GaussianPhysicsCompression1D(
-            num_gaussians=args.num_gaussians,
-            rank=args.rank,
-            sh_dim=27,
-        ).to(device)
-        adapter = BatchAdapter(params_key="intensity")
-        init_fn = _init_1d
-        temporal_loss_fn = lambda _model: torch.tensor(0.0, device=device)
-    elif variant == "5d":
-        train_loader, val_loader, test_loader = create_dataloaders_5D(
-            data_root=args.data_root,
-            batch_size=args.batch_size,
-            train_ratio=args.train_ratio,
-            val_ratio=args.val_ratio,
-            num_workers=args.num_workers,
-            normalize_probes=True,
-            normalize_params=True,
-        )
-        model = GaussianPhysicsCompression5D(
-            num_gaussians=args.num_gaussians,
-            rank=args.rank,
-            sh_dim=27,
-        ).to(device)
-        adapter = BatchAdapter(params_key="light_params")
-        init_fn = _init_5d
-        temporal_loss_fn = None
-    elif variant == "unified_5d":
-        train_loader, val_loader, test_loader = create_dataloaders_5D(
-            data_root=args.data_root,
-            batch_size=args.batch_size,
-            train_ratio=args.train_ratio,
-            val_ratio=args.val_ratio,
-            num_workers=args.num_workers,
-            normalize_probes=True,
-            normalize_params=True,
-        )
-        dataset = train_loader.dataset
-        param_min = torch.tensor(dataset.param_min, dtype=torch.float32)
-        param_max = torch.tensor(dataset.param_max, dtype=torch.float32)
-
-        def to_descriptor(params: torch.Tensor) -> torch.Tensor:
-            return build_descriptor_5d(params, param_min.to(params.device), param_max.to(params.device))
-
-        model = GaussianPhysicsCompressionUnified(
-            num_gaussians=args.num_gaussians,
-            rank=args.rank,
-            sh_dim=27,
-            light_dim=args.light_dim,
-            embed_dim=args.embed_dim,
-            intensity_dim=args.intensity_dim,
-            intensity_offset=args.intensity_offset,
-            enable_film=not args.disable_film,
-        ).to(device)
-        adapter = BatchAdapter(params_key="light_params", params_transform=to_descriptor)
-        init_fn = _init_5d
-        temporal_loss_fn = None
-    elif variant == "unified_set":
+    _lazy_imports()
+    if variant == "unified_set":
         train_loader, val_loader, test_loader = create_dataloaders_lightset(
             data_root=args.data_root,
             batch_size=args.batch_size,
@@ -230,32 +191,6 @@ def build_variant(
         adapter = BatchAdapter(params_key="light_params", mask_key="light_mask")
         init_fn = _init_5d
         temporal_loss_fn = None
-    elif variant == "unified_1d":
-        train_loader, val_loader, test_loader = create_intensity_dataloaders(
-            data_root=args.data_root,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            train_ratio=args.train_ratio,
-            val_ratio=args.val_ratio,
-            random_seed=args.seed,
-        )
-
-        def to_descriptor(params: torch.Tensor) -> torch.Tensor:
-            return build_descriptor_1d(params)
-
-        model = GaussianPhysicsCompressionUnified(
-            num_gaussians=args.num_gaussians,
-            rank=args.rank,
-            sh_dim=27,
-            light_dim=args.light_dim,
-            embed_dim=args.embed_dim,
-            intensity_dim=args.intensity_dim,
-            intensity_offset=args.intensity_offset,
-            enable_film=not args.disable_film,
-        ).to(device)
-        adapter = BatchAdapter(params_key="intensity", params_transform=to_descriptor)
-        init_fn = _init_1d
-        temporal_loss_fn = lambda _model: torch.tensor(0.0, device=device)
     else:
         raise ValueError(f"Unknown variant: {variant}")
 
@@ -264,6 +199,7 @@ def build_variant(
 
 
 def run_training(args: argparse.Namespace) -> None:
+    _lazy_imports()
     device = _device_from_arg(args.device)
     output_dir = Path(args.output_dir) if args.output_dir else None
 
@@ -449,7 +385,7 @@ def run_training(args: argparse.Namespace) -> None:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Unified Gaussian-Physics trainer")
 
-    parser.add_argument("--variant", choices=["1d", "5d", "unified_1d", "unified_5d", "unified_set"], required=False)
+    parser.add_argument("--variant", choices=["unified_set"], required=False)
     parser.add_argument("--config", default=None, help="YAML config for training")
     parser.add_argument(
         "--schema",
@@ -543,50 +479,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def apply_variant_defaults(args: argparse.Namespace) -> None:
     defaults = {
-        "1d": {
-            "num_gaussians": 30,
-            "rank": 8,
-            "epochs": 2000,
-            "batch_size": 256,
-            "lr": 1e-3,
-            "lambda_temporal": 0.001,
-            "recon_loss": "charbonnier",
-        },
-        "5d": {
-            "num_gaussians": 20,
-            "rank": 5,
-            "epochs": 2000,
-            "batch_size": 512,
-            "lr": 1e-3,
-            "lambda_temporal": 0.001,
-            "recon_loss": "charbonnier",
-        },
-        "unified_1d": {
-            "num_gaussians": 30,
-            "rank": 8,
-            "epochs": 2000,
-            "batch_size": 256,
-            "lr": 1e-3,
-            "lambda_temporal": 0.001,
-            "recon_loss": "charbonnier",
-            "light_dim": 12,
-            "embed_dim": 32,
-            "intensity_dim": 3,
-            "intensity_offset": 1,
-        },
-        "unified_5d": {
-            "num_gaussians": 20,
-            "rank": 5,
-            "epochs": 2000,
-            "batch_size": 512,
-            "lr": 1e-3,
-            "lambda_temporal": 0.001,
-            "recon_loss": "charbonnier",
-            "light_dim": 12,
-            "embed_dim": 32,
-            "intensity_dim": 3,
-            "intensity_offset": 1,
-        },
         "unified_set": {
             "num_gaussians": 20,
             "rank": 5,
