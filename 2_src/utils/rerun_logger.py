@@ -17,6 +17,11 @@ def _lazy_imports():
 
     return np, torch, Dataset
 
+
+# Bind commonly used deps at module scope so helper functions (defined below)
+# can use them without NameError during training-time visualization.
+np, torch, Dataset = _lazy_imports()
+
 try:
     import rerun as rr
     RERUN_AVAILABLE = True

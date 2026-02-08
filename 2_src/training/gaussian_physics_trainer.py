@@ -504,6 +504,7 @@ class GaussianPhysicsTrainer:
             self.rerun_logger.log_gaussian_centers(epoch, centers)
 
         # 2. Compute and log probe errors
+        positions = None
         try:
             positions, errors = compute_per_probe_errors(
                 self.model, val_loader.dataset, self.device, self.adapter, max_samples=100
@@ -517,7 +518,8 @@ class GaussianPhysicsTrainer:
             centers = self.model.mu.detach().cpu().numpy()
             scales = torch.exp(self.model.log_scale).detach().cpu().numpy()
             try:
-                self.rerun_logger.log_gaussian_coverage(epoch, centers, scales, positions)
+                if positions is not None:
+                    self.rerun_logger.log_gaussian_coverage(epoch, centers, scales, positions)
             except Exception as e:
                 print(f"Warning: Could not log Gaussian coverage: {e}")
 
