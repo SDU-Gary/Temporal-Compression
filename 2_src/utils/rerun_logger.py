@@ -7,6 +7,7 @@ distributions, and SH coefficient reconstructions using Rerun.
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import threading
 from typing import Dict, Optional, Tuple
 
