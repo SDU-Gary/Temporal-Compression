@@ -450,6 +450,8 @@ def render_with_envmap_external(
     python_bin: Optional[str] = None,
     output_pass: str = "ToneMapper.dst",
     enable_tonemapper: bool = True,
+    quiet: bool = True,
+    log_path: Optional[str] = None,
 ) -> np.ndarray:
     """Render using Falcor in a separate Python 3.10 process."""
     import subprocess
@@ -498,7 +500,22 @@ def render_with_envmap_external(
         env["VK_ICD_FILENAMES"] = vk_icd
     env["PYTHONNOUSERSITE"] = "1"
 
-    subprocess.run(cmd, check=True, env=env)
+    stdout = None
+    stderr = None
+    log_fh = None
+    if quiet:
+        stdout = subprocess.DEVNULL
+        stderr = subprocess.DEVNULL
+    elif log_path is not None:
+        log_fh = open(log_path, "a", encoding="utf-8")
+        stdout = log_fh
+        stderr = log_fh
+
+    try:
+        subprocess.run(cmd, check=True, env=env, stdout=stdout, stderr=stderr)
+    finally:
+        if log_fh is not None:
+            log_fh.close()
 
     image = np.load(out_path)
     try:

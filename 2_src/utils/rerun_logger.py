@@ -7,6 +7,7 @@ distributions, and SH coefficient reconstructions using Rerun.
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 from typing import Dict, Optional, Tuple
 
 
@@ -60,6 +61,13 @@ class RerunLogger:
         self.log_frequency = log_frequency
         self.save_path = save_path
 
+        # Rerun uses a global recording; guard rr.* calls since we may log from
+        # both the training loop and an optional background rendering thread.
+        self._rr_lock = threading.Lock()
+
+        # Handle for expensive rendered comparisons (Falcor subprocess).
+        self._render_thread: Optional[threading.Thread] = None
+
         # Initialize Rerun
         rr.init(app_id, spawn=spawn)
 
@@ -99,7 +107,8 @@ class RerunLogger:
             timeline: Timeline name (e.g., "epoch", "step")
             value: Timeline value (sequence number)
         """
-        rr.set_time(timeline, sequence=value)
+        with self._rr_lock:
+            rr.set_time(timeline, sequence=value)
 
     def log_scalars(self, epoch: int, metrics: Dict[str, float], prefix: str):
         """Log scalar metrics (losses, MAE, RMSE).
@@ -111,10 +120,10 @@ class RerunLogger:
         """
         self.set_time("epoch", epoch)
 
-        for name, value in metrics.items():
-            entity_path = f"{prefix}/{name}"
-            # Log single scalar value
-            rr.log(entity_path, rr.Scalars(float(value)))
+        with self._rr_lock:
+            for name, value in metrics.items():
+                entity_path = f"{prefix}/{name}"
+                rr.log(entity_path, rr.Scalars(float(value)))
 
     def log_model_metadata(
         self,
@@ -139,7 +148,8 @@ class RerunLogger:
         if compression_ratio is not None:
             metadata_text += f"- Compression Ratio: {compression_ratio:.2f}×\n"
 
-        rr.log("model/metadata", rr.TextDocument(metadata_text))
+        with self._rr_lock:
+            rr.log("model/metadata", rr.TextDocument(metadata_text))
 
     def log_gaussian_centers(self, epoch: int, centers: np.ndarray):
         """Log 3D Gaussian center positions.
@@ -151,12 +161,13 @@ class RerunLogger:
         self.set_time("epoch", epoch)
 
         K = centers.shape[0]
-        rr.log("model/gaussian_centers", rr.Points3D(
-            positions=centers,
-            colors=[[255, 200, 0]] * K,  # Gold color
-            radii=0.05,
-            labels=[f"G{i}" for i in range(K)]
-        ))
+        with self._rr_lock:
+            rr.log("model/gaussian_centers", rr.Points3D(
+                positions=centers,
+                colors=[[255, 200, 0]] * K,  # Gold color
+                radii=0.05,
+                labels=[f"G{i}" for i in range(K)]
+            ))
 
     def log_probe_errors(
         self,
@@ -178,11 +189,12 @@ class RerunLogger:
         # Convert errors to colors (blue=low, red=high)
         colors = error_to_colormap(errors)
 
-        rr.log(f"{split}/probe_errors", rr.Points3D(
-            positions=positions,
-            colors=colors,
-            radii=0.03
-        ))
+        with self._rr_lock:
+            rr.log(f"{split}/probe_errors", rr.Points3D(
+                positions=positions,
+                colors=colors,
+                radii=0.03
+            ))
 
         # Log error statistics
         stats_text = f"""Error Statistics (Epoch {epoch}):
@@ -192,7 +204,8 @@ class RerunLogger:
 - Max: {errors.max():.6f}
 - Median: {np.median(errors):.6f}
 """
-        rr.log(f"{split}/error_stats", rr.TextDocument(stats_text))
+        with self._rr_lock:
+            rr.log(f"{split}/error_stats", rr.TextDocument(stats_text))
 
     def log_gaussian_coverage(
         self,
@@ -215,20 +228,22 @@ class RerunLogger:
         nearest_distances = compute_nearest_gaussian_distances(centers, probe_positions)
 
         # Log coverage spheres (3-sigma range)
-        for i, (center, scale) in enumerate(zip(centers, scales)):
-            rr.log(f"analysis/gaussian_coverage/sphere_{i}", rr.Ellipsoids3D(
-                centers=[center],
-                half_sizes=[scale * 3],  # 3-sigma range
-                colors=[[255, 255, 0, 64]]  # Semi-transparent yellow
-            ))
+        with self._rr_lock:
+            for i, (center, scale) in enumerate(zip(centers, scales)):
+                rr.log(f"analysis/gaussian_coverage/sphere_{i}", rr.Ellipsoids3D(
+                    centers=[center],
+                    half_sizes=[scale * 3],  # 3-sigma range
+                    colors=[[255, 255, 0, 64]]  # Semi-transparent yellow
+                ))
 
         # Log probes colored by distance to nearest Gaussian
         colors = distance_to_colormap(nearest_distances)
-        rr.log("analysis/gaussian_coverage/probes", rr.Points3D(
-            positions=probe_positions,
-            colors=colors,
-            radii=0.02
-        ))
+        with self._rr_lock:
+            rr.log("analysis/gaussian_coverage/probes", rr.Points3D(
+                positions=probe_positions,
+                colors=colors,
+                radii=0.02
+            ))
 
         # Compute and log coverage statistics
         stats = compute_gaussian_coverage_stats(centers, scales, probe_positions)
@@ -239,7 +254,8 @@ class RerunLogger:
 - Probes within 1σ: {stats['probes_within_1sigma']:.1f}%
 - Probes within 3σ: {stats['probes_within_3sigma']:.1f}%
 """
-        rr.log("analysis/gaussian_coverage/stats", rr.TextDocument(stats_text))
+        with self._rr_lock:
+            rr.log("analysis/gaussian_coverage/stats", rr.TextDocument(stats_text))
 
     def log_sh_comparison(
         self,
@@ -269,7 +285,8 @@ class RerunLogger:
         # Convert to RGB image with colormap
         comparison_rgb = colormap_tensor(comparison)
 
-        rr.log(f"validation/sh_comparison/{sample_name}", rr.Image(comparison_rgb))
+        with self._rr_lock:
+            rr.log(f"validation/sh_comparison/{sample_name}", rr.Image(comparison_rgb))
 
         # Log numerical comparison
         mae = np.abs(sh_gt - sh_pred).mean()
@@ -279,7 +296,8 @@ class RerunLogger:
 - RMSE: {rmse:.6f}
 - Max Error: {np.abs(sh_gt - sh_pred).max():.6f}
 """
-        rr.log(f"validation/sh_comparison/{sample_name}_stats", rr.TextDocument(stats_text))
+        with self._rr_lock:
+            rr.log(f"validation/sh_comparison/{sample_name}_stats", rr.TextDocument(stats_text))
 
     def log_rendered_comparison(
         self,
@@ -300,28 +318,72 @@ class RerunLogger:
             scene_path: Optional Falcor scene (.pyscene) path
             temp_dir: Temporary directory for environment maps
         """
+        # Avoid blocking the training loop: run the expensive Falcor rendering in
+        # a background thread. If a previous render is still running, skip.
+        # Set RERUN_RENDER_SYNC=1 for synchronous behavior (debugging).
+        if self._render_thread is not None and self._render_thread.is_alive():
+            return
+
+        if os.environ.get("RERUN_RENDER_SYNC", "0") == "1":
+            self._render_and_log_comparison(
+                epoch,
+                sh_gt,
+                sh_pred,
+                sample_name,
+                scene_path=scene_path,
+                temp_dir=temp_dir,
+            )
+            return
+
+        args = (
+            int(epoch),
+            np.asarray(sh_gt, dtype=np.float32).copy(),
+            np.asarray(sh_pred, dtype=np.float32).copy(),
+            str(sample_name),
+            scene_path,
+            str(temp_dir),
+        )
+        self._render_thread = threading.Thread(
+            target=self._render_and_log_comparison,
+            args=args,
+            daemon=True,
+            name="rerun_rendered_comparison",
+        )
+        self._render_thread.start()
+
+    def _render_and_log_comparison(
+        self,
+        epoch: int,
+        sh_gt: np.ndarray,
+        sh_pred: np.ndarray,
+        sample_name: str,
+        scene_path: Optional[str],
+        temp_dir: str,
+    ) -> None:
         from utils.rendering_utils import (
-            sh_to_envmap, render_with_envmap, render_with_envmap_external,
-            compute_image_metrics, create_error_heatmap, save_exr, save_hdr,
-            cleanup_temp_files, falcor_available, openexr_available,
-            compute_auto_exposure, tone_map_reinhard, srgb_encode
+            sh_to_envmap,
+            render_with_envmap_external,
+            compute_image_metrics,
+            create_error_heatmap,
+            save_exr,
+            save_hdr,
+            cleanup_temp_files,
+            openexr_available,
+            compute_auto_exposure,
+            tone_map_reinhard,
+            srgb_encode,
         )
         import os
-
-        self.set_time("epoch", epoch)
 
         try:
             spp = int(os.environ.get("RERUN_RENDER_SPP", "32"))
             use_exr = openexr_available()
-            if not use_exr and not hasattr(self, "_warned_no_openexr"):
-                print("Warning: OpenEXR not available; saving envmaps as .hdr")
+            if not use_exr:
                 self._warned_no_openexr = True
 
-            # 1. Generate environment maps
             envmap_gt = sh_to_envmap(sh_gt, H=128, W=256)
             envmap_pred = sh_to_envmap(sh_pred, H=128, W=256)
 
-            # 1.5 Auto exposure (scale envmaps before rendering)
             if os.environ.get("RERUN_AUTO_EXPOSURE", "1") != "0":
                 pct = float(os.environ.get("RERUN_EXPOSURE_PERCENTILE", "95"))
                 target = float(os.environ.get("RERUN_EXPOSURE_TARGET", "0.6"))
@@ -337,7 +399,6 @@ class RerunLogger:
                 envmap_gt = envmap_gt * exposure
                 envmap_pred = envmap_pred * exposure
 
-            # 2. Save temporary .exr files
             os.makedirs(temp_dir, exist_ok=True)
             ext = "exr" if use_exr else "hdr"
             envmap_gt_path = f"{temp_dir}/gt_{epoch}_{sample_name}.{ext}"
@@ -349,47 +410,25 @@ class RerunLogger:
                 save_hdr(envmap_gt_path, envmap_gt)
                 save_hdr(envmap_pred_path, envmap_pred)
 
-            # 3. Render scenes using Falcor
-            # 3. Render scenes using Falcor (HDR output from AccumulatePass)
-            if falcor_available():
-                render_gt = render_with_envmap(
-                    envmap_gt_path,
-                    scene_path=scene_path,
-                    spp=spp,
-                    resolution=(256, 256),
-                    clamp_output=False,
-                    output_pass="AccumulatePass.output",
-                    enable_tonemapper=False,
-                )
-                render_pred = render_with_envmap(
-                    envmap_pred_path,
-                    scene_path=scene_path,
-                    spp=spp,
-                    resolution=(256, 256),
-                    clamp_output=False,
-                    output_pass="AccumulatePass.output",
-                    enable_tonemapper=False,
-                )
-            else:
-                os.environ["RERUN_KEEP_HDR"] = "1"
-                render_gt = render_with_envmap_external(
-                    envmap_gt_path,
-                    scene_path=scene_path,
-                    spp=spp,
-                    resolution=(256, 256),
-                    output_pass="AccumulatePass.output",
-                    enable_tonemapper=False,
-                )
-                render_pred = render_with_envmap_external(
-                    envmap_pred_path,
-                    scene_path=scene_path,
-                    spp=spp,
-                    resolution=(256, 256),
-                    output_pass="AccumulatePass.output",
-                    enable_tonemapper=False,
-                )
+            render_gt = render_with_envmap_external(
+                envmap_gt_path,
+                scene_path=scene_path,
+                spp=spp,
+                resolution=(256, 256),
+                output_pass="AccumulatePass.output",
+                enable_tonemapper=False,
+                quiet=True,
+            )
+            render_pred = render_with_envmap_external(
+                envmap_pred_path,
+                scene_path=scene_path,
+                spp=spp,
+                resolution=(256, 256),
+                output_pass="AccumulatePass.output",
+                enable_tonemapper=False,
+                quiet=True,
+            )
 
-            # 3.5 Post-process for display (tone map + sRGB)
             if os.environ.get("RERUN_TONEMAP", "1") != "0":
                 render_gt = tone_map_reinhard(render_gt)
                 render_pred = tone_map_reinhard(render_pred)
@@ -397,50 +436,56 @@ class RerunLogger:
                 render_gt = srgb_encode(render_gt)
                 render_pred = srgb_encode(render_pred)
 
-            # 4. Compute metrics
             metrics = compute_image_metrics(render_gt, render_pred)
             error_heatmap = create_error_heatmap(render_gt, render_pred)
 
-            # 5. Log to Rerun
-            rr.log(f"rendering/{sample_name}/gt", rr.Image(render_gt))
-            rr.log(f"rendering/{sample_name}/pred", rr.Image(render_pred))
-            rr.log(f"rendering/{sample_name}/error", rr.Image(error_heatmap))
-            rr.log(f"rendering/{sample_name}/psnr", rr.Scalars(float(metrics['psnr'])))
-            rr.log(f"rendering/{sample_name}/ssim", rr.Scalars(float(metrics['ssim'])))
-            rr.log(f"rendering_metrics/{sample_name}/psnr", rr.Scalars(float(metrics['psnr'])))
-            rr.log(f"rendering_metrics/{sample_name}/ssim", rr.Scalars(float(metrics['ssim'])))
+            with self._rr_lock:
+                rr.set_time("epoch", sequence=epoch)
+                rr.log(f"rendering/{sample_name}/gt", rr.Image(render_gt))
+                rr.log(f"rendering/{sample_name}/pred", rr.Image(render_pred))
+                rr.log(f"rendering/{sample_name}/error", rr.Image(error_heatmap))
+                rr.log(
+                    f"rendering_metrics/{sample_name}/psnr",
+                    rr.Scalars(float(metrics["psnr"])),
+                )
+                rr.log(
+                    f"rendering_metrics/{sample_name}/ssim",
+                    rr.Scalars(float(metrics["ssim"])),
+                )
 
-            # Log statistics
-            stats_text = f"""Rendering Quality ({sample_name}, Epoch {epoch}):
-- PSNR: {metrics['psnr']:.2f} dB
-- SSIM: {metrics['ssim']:.4f}
-"""
-            rr.log(f"rendering/{sample_name}/stats", rr.TextDocument(stats_text))
+                stats_text = (
+                    f"Rendering Quality ({sample_name}, Epoch {epoch}):\n"
+                    f"- PSNR: {metrics['psnr']:.2f} dB\n"
+                    f"- SSIM: {metrics['ssim']:.4f}\n"
+                )
+                rr.log(f"rendering/{sample_name}/stats", rr.TextDocument(stats_text))
 
-            # 6. Cleanup temporary files
             cleanup_temp_files(temp_dir)
 
-        except Exception as e:
-            # Fallback: log environment map center crop if rendering fails
-            print(f"Warning: Rendering failed for {sample_name} ({e}), using envmap fallback")
+        except Exception:
             try:
                 envmap_gt = sh_to_envmap(sh_gt, H=128, W=256)
                 envmap_pred = sh_to_envmap(sh_pred, H=128, W=256)
 
-                # Crop center region [64x64]
                 H, W = envmap_gt.shape[:2]
-                center_gt = envmap_gt[H//4:3*H//4, W//4:3*W//4]
-                center_pred = envmap_pred[H//4:3*H//4, W//4:3*W//4]
+                center_gt = envmap_gt[H // 4 : 3 * H // 4, W // 4 : 3 * W // 4]
+                center_pred = envmap_pred[H // 4 : 3 * H // 4, W // 4 : 3 * W // 4]
 
-                # Normalize for display
                 center_gt_norm = np.clip(center_gt / (center_gt.max() + 1e-8), 0, 1)
                 center_pred_norm = np.clip(center_pred / (center_pred.max() + 1e-8), 0, 1)
 
-                rr.log(f"rendering/{sample_name}/envmap_gt_fallback", rr.Image(center_gt_norm))
-                rr.log(f"rendering/{sample_name}/envmap_pred_fallback", rr.Image(center_pred_norm))
-
-            except Exception as fallback_error:
-                print(f"Error: Envmap fallback also failed: {fallback_error}")
+                with self._rr_lock:
+                    rr.set_time("epoch", sequence=epoch)
+                    rr.log(
+                        f"rendering/{sample_name}/envmap_gt_fallback",
+                        rr.Image(center_gt_norm),
+                    )
+                    rr.log(
+                        f"rendering/{sample_name}/envmap_pred_fallback",
+                        rr.Image(center_pred_norm),
+                    )
+            except Exception:
+                pass
 
 
 # ============================================================================
