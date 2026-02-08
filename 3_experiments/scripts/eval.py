@@ -29,7 +29,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--split", choices=["train", "val", "test"], default="test")
     parser.add_argument("--device", default=None)
     parser.add_argument("--batch-size", type=int, default=1024)
-    parser.add_argument("--num-workers", type=int, default=4)
+    # Default to 0 for portability (some environments disallow multiprocessing semaphores).
+    parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--top-k", type=int, default=3)
     parser.add_argument("--output", default=None, help="Output JSON path (default: <checkpoint_dir>/eval.json)")
     return parser
@@ -87,14 +88,33 @@ def main() -> None:
     sum_abs = 0.0
     sum_sq = 0.0
     count = 0
-    with torch.no_grad():
-        for batch in loader:
-            positions, params, targets, mask = adapter.unpack(batch, device)
-            preds = model(positions, params, top_k=args.top_k, light_mask=mask)
-            diff = preds - targets
-            sum_abs += torch.sum(torch.abs(diff)).item()
-            sum_sq += torch.sum(diff * diff).item()
-            count += int(diff.numel())
+    def run_eval(active_loader) -> None:
+        nonlocal sum_abs, sum_sq, count
+        with torch.no_grad():
+            for batch in active_loader:
+                positions, params, targets, mask = adapter.unpack(batch, device)
+                preds = model(positions, params, top_k=args.top_k, light_mask=mask)
+                diff = preds - targets
+                sum_abs += torch.sum(torch.abs(diff)).item()
+                sum_sq += torch.sum(diff * diff).item()
+                count += int(diff.numel())
+
+    try:
+        run_eval(loader)
+    except PermissionError:
+        if args.num_workers == 0:
+            raise
+        print("Warning: DataLoader multiprocessing failed; retrying with --num-workers 0")
+        train_loader, val_loader, test_loader = create_dataloaders_lightset(
+            data_root=args.data_root,
+            batch_size=args.batch_size,
+            train_ratio=0.7,
+            val_ratio=0.15,
+            num_workers=0,
+            normalize_probes=True,
+        )
+        loader = {"train": train_loader, "val": val_loader, "test": test_loader}[args.split]
+        run_eval(loader)
 
     mae = sum_abs / max(1, count)
     rmse = (sum_sq / max(1, count)) ** 0.5
@@ -121,4 +141,3 @@ def main() -> None:
 
 if __name__ == "__main__":  # pragma: no cover
     main()
-
