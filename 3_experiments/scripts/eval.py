@@ -52,6 +52,7 @@ def main() -> None:
         raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
     ckpt = torch.load(str(ckpt_path), map_location=device, weights_only=False)
     state = ckpt.get("model_state_dict", ckpt)
+    meta = ckpt.get("meta") if isinstance(ckpt, dict) else None
 
     # Infer model dims from checkpoint tensors.
     # Expected keys: mu [K,3], U [K,27,rank], coeffs [K,rank,embed]
@@ -60,30 +61,75 @@ def main() -> None:
     embed_dim = int(state["coeffs"].shape[-1])
     sh_dim = int(state["U"].shape[1])
 
+    # Prefer training metadata stored in checkpoint for exact reproducibility.
+    train_ratio = 0.7
+    val_ratio = 0.15
+    top_k = args.top_k
+    light_dim = 12
+    intensity_dim = 3
+    intensity_offset = 1
+    enable_film = True
+    scaler = None
+
+    if isinstance(meta, dict):
+        split_meta = meta.get("split")
+        if isinstance(split_meta, dict):
+            train_ratio = float(split_meta.get("train_ratio", train_ratio))
+            val_ratio = float(split_meta.get("val_ratio", val_ratio))
+        model_meta = meta.get("model")
+        if isinstance(model_meta, dict):
+            top_k = int(model_meta.get("top_k", top_k))
+            light_dim = int(model_meta.get("light_dim", light_dim))
+            intensity_dim = int(model_meta.get("intensity_dim", intensity_dim))
+            intensity_offset = int(model_meta.get("intensity_offset", intensity_offset))
+            enable_film = bool(model_meta.get("enable_film", enable_film))
+
+        scaler_meta = meta.get("sh_scaler")
+        if isinstance(scaler_meta, dict):
+            try:
+                from data.sh_scaler import AdaptiveSHScaler
+                import numpy as np
+
+                scaler = AdaptiveSHScaler(
+                    l0_mean=np.array(scaler_meta.get("l0_mean", [0.0, 0.0, 0.0]), dtype=np.float32),
+                    l0_std=np.array(scaler_meta.get("l0_std", [1.0, 1.0, 1.0]), dtype=np.float32),
+                    ho_rms=np.array(scaler_meta.get("ho_rms", [1.0, 1.0, 1.0]), dtype=np.float32),
+                    eps=float(scaler_meta.get("eps", 1e-6)),
+                )
+            except Exception as e:
+                print(f"Warning: failed to build SH scaler from checkpoint meta: {e}")
+
     model = GaussianPhysicsCompressionUnified(
         num_gaussians=K,
         rank=rank,
         sh_dim=sh_dim,
-        light_dim=12,
+        light_dim=light_dim,
         embed_dim=embed_dim,
-        intensity_dim=3,
-        intensity_offset=1,
-        enable_film=True,
+        intensity_dim=intensity_dim,
+        intensity_offset=intensity_offset,
+        enable_film=enable_film,
     ).to(device)
-    model.load_state_dict(state, strict=False)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing or unexpected:
+        raise RuntimeError(
+            f"Checkpoint state_dict mismatch. missing={missing}, unexpected={unexpected}"
+        )
     model.eval()
 
     train_loader, val_loader, test_loader = create_dataloaders_lightset(
         data_root=args.data_root,
         batch_size=args.batch_size,
-        train_ratio=0.7,
-        val_ratio=0.15,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
         num_workers=args.num_workers,
         normalize_probes=True,
     )
     loader = {"train": train_loader, "val": val_loader, "test": test_loader}[args.split]
 
     adapter = BatchAdapter(params_key="light_params", mask_key="light_mask")
+    if scaler is not None:
+        adapter.target_transform = scaler.transform
+        adapter.target_inverse = scaler.inverse
 
     sum_abs = 0.0
     sum_sq = 0.0
@@ -93,8 +139,9 @@ def main() -> None:
         with torch.no_grad():
             for batch in active_loader:
                 positions, params, targets, mask = adapter.unpack(batch, device)
-                preds = model(positions, params, top_k=args.top_k, light_mask=mask)
-                diff = preds - targets
+                preds = model(positions, params, top_k=top_k, light_mask=mask)
+                preds_eval, targets_eval = adapter.inverse_targets(preds, targets)
+                diff = preds_eval - targets_eval
                 sum_abs += torch.sum(torch.abs(diff)).item()
                 sum_sq += torch.sum(diff * diff).item()
                 count += int(diff.numel())
@@ -132,7 +179,15 @@ def main() -> None:
         "K": K,
         "rank": rank,
         "embed_dim": embed_dim,
-        "top_k": args.top_k,
+        "top_k": top_k,
+        "train_ratio": train_ratio,
+        "val_ratio": val_ratio,
+        "light_dim": light_dim,
+        "intensity_dim": intensity_dim,
+        "intensity_offset": intensity_offset,
+        "enable_film": enable_film,
+        "has_meta": bool(isinstance(meta, dict)),
+        "has_sh_scaler": bool(scaler is not None),
     }
     out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(f"Wrote: {out_path}")

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import os
 import numpy as np
 from pathlib import Path
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -603,6 +603,7 @@ class GaussianPhysicsTrainer:
         val_loader: Optional[torch.utils.data.DataLoader],
         num_epochs: int,
         output_dir: Optional[Path] = None,
+        checkpoint_meta: Optional[Dict[str, Any]] = None,
         save_best: bool = True,
         best_metric: str = "mae",
         log_every: int = 0,
@@ -669,6 +670,7 @@ class GaussianPhysicsTrainer:
                                 "model_state_dict": self.model.state_dict(),
                                 "optimizer_state_dict": self.optimizer.state_dict(),
                                 "best_metric": best_value,
+                                "meta": checkpoint_meta,
                             },
                             output_dir / "best_model.pt",
                         )
@@ -706,6 +708,7 @@ class GaussianPhysicsTrainer:
                     "epoch": num_epochs,
                     "model_state_dict": self.model.state_dict(),
                     "optimizer_state_dict": self.optimizer.state_dict(),
+                    "meta": checkpoint_meta,
                 },
                 output_dir / "last_model.pt",
             )

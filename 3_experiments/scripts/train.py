@@ -223,6 +223,7 @@ def run_training(args: argparse.Namespace) -> None:
             print("[init] initialization done.")
 
     # Optional SH scaling
+    scaler_meta = None
     if args.enable_sh_scaler:
         from data.sh_scaler import AdaptiveSHScaler
 
@@ -244,6 +245,13 @@ def run_training(args: argparse.Namespace) -> None:
 
         adapter.target_transform = scaler.transform
         adapter.target_inverse = scaler.inverse
+        scaler_meta = {
+            "path": str(scaler_path) if scaler_path is not None else None,
+            "l0_mean": [float(x) for x in scaler.l0_mean],
+            "l0_std": [float(x) for x in scaler.l0_std],
+            "ho_rms": [float(x) for x in scaler.ho_rms],
+            "eps": float(getattr(scaler, "eps", 1e-6)),
+        }
         l0_mean = [float(x) for x in scaler.l0_mean]
         l0_std = [float(x) for x in scaler.l0_std]
         ho_rms = [float(x) for x in scaler.ho_rms]
@@ -302,11 +310,39 @@ def run_training(args: argparse.Namespace) -> None:
         show_progress=args.show_progress,
     )
 
+    checkpoint_meta = {
+        "variant": args.variant,
+        "data_root": str(Path(args.data_root)),
+        "manifest": args.manifest,
+        "seed": int(args.seed),
+        "split": {
+            "train_ratio": float(args.train_ratio),
+            "val_ratio": float(args.val_ratio),
+        },
+        "model": {
+            "num_gaussians": int(args.num_gaussians),
+            "rank": int(args.rank),
+            "sh_dim": 27,
+            "top_k": int(args.top_k),
+            "light_dim": int(args.light_dim),
+            "embed_dim": int(args.embed_dim),
+            "intensity_dim": int(args.intensity_dim),
+            "intensity_offset": int(args.intensity_offset),
+            "enable_film": bool(not args.disable_film),
+        },
+        "training": {
+            "batch_size": int(args.batch_size),
+            "epochs": int(args.epochs),
+        },
+        "sh_scaler": scaler_meta,
+    }
+
     history = trainer.fit(
         train_loader=train_loader,
         val_loader=val_loader,
         num_epochs=args.epochs,
         output_dir=output_dir,
+        checkpoint_meta=checkpoint_meta,
         save_best=output_dir is not None,
         best_metric="mae",
     )
