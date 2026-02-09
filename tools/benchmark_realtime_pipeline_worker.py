@@ -525,7 +525,15 @@ def main() -> None:
         }
         r["fps_route_only"] = _fps_from_ms(r["total_ms"]["mean"])
         r["fps_with_gbuffer"] = _fps_from_ms(r["with_gbuffer_ms"]["mean"])
+        sync_count = len(phase_times[route]["shade_sync"])
+        total_count = max(1, len(phase_times[route]["total"]))
+        r["sync_ratio"] = float(sync_count / total_count)
         summary["results"][route] = r
+
+    summary["measurement_mode"] = (
+        "force_every_frame" if bool(args.sync_gpu)
+        else ("sampled_every_n" if int(max(0, int(args.sync_every))) > 0 else "async_no_sync")
+    )
 
     sum_path = out_dir / "falcor_summary.json"
     csv_path = out_dir / "falcor_frames.csv"

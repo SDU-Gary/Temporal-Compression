@@ -523,6 +523,10 @@ def _run_split_runtime(
     summary["execution_mode"] = "split_runtime"
     summary["field_builder"] = str(args.field_builder)
     summary["gbuffer_mode"] = str(args.gbuffer_mode)
+    summary["measurement_mode"] = (
+        "force_every_frame" if bool(args.sync_gpu)
+        else ("sampled_every_n" if int(max(0, int(args.sync_every))) > 0 else "async_no_sync")
+    )
     summary["split_runtime"] = {
         "falcor_python_bin": str(args.falcor_python_bin),
         "worker_script": str(worker_script),
@@ -533,6 +537,19 @@ def _run_split_runtime(
         "sync_gpu_forced": bool(args.sync_gpu),
         "sync_every": int(max(0, int(args.sync_every))),
     }
+
+    if rows:
+        for route in routes:
+            key = f"{route}_sync"
+            if key in rows[0]:
+                vals = []
+                for row in rows:
+                    try:
+                        vals.append(float(row.get(key, 0.0)))
+                    except Exception:
+                        vals.append(0.0)
+                ratio = float(np.mean(np.asarray(vals, dtype=np.float64))) if vals else float("nan")
+                summary.setdefault("results", {}).setdefault(route, {})["sync_ratio"] = ratio
 
     if "model" in routes and infer_ms_full is not None:
         infer_map = {int(fr): float(ms) for fr, ms in zip(all_frames, infer_ms_full)}
