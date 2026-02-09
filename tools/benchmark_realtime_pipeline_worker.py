@@ -195,6 +195,8 @@ def main() -> None:
             probes = probes[valid_idx]
             tensor = tensor[valid_idx]
 
+    num_probes = int(tensor.shape[0])
+
     with open(args.frames_json, "r", encoding="utf-8") as f:
         fs = json.load(f)
     all_frames = [int(x) for x in fs["all_frames"]]
@@ -276,15 +278,57 @@ def main() -> None:
     compute.globals.gExposure = 1.0
     compute.globals.gAOStrength = 0.0
 
+    field_builder = str(args.field_builder)
+    if field_builder not in {"cpu", "gpu"}:
+        raise ValueError(f"Unsupported field builder: {field_builder}")
+
+    num_cells = int(args.field_res) ** 3
+    k_field = int(field_knn.shape[-1])
+    probe_sh_buf = None
+    field_build = None
+    if field_builder == "gpu":
+        probe_sh_buf = device.create_structured_buffer(
+            struct_size=4,
+            element_count=num_probes * 27,
+            bind_flags=fc.ResourceBindFlags.ShaderResource,
+        )
+        knn_idx_buf = device.create_structured_buffer(
+            struct_size=4,
+            element_count=num_cells * k_field,
+            bind_flags=fc.ResourceBindFlags.ShaderResource,
+        )
+        knn_w_buf = device.create_structured_buffer(
+            struct_size=4,
+            element_count=num_cells * k_field,
+            bind_flags=fc.ResourceBindFlags.ShaderResource,
+        )
+
+        knn_idx_flat = field_knn.reshape(-1).astype(np.uint32, copy=False)
+        knn_w_flat = field_w.reshape(-1).astype(np.float32, copy=False)
+        knn_idx_buf.from_numpy(knn_idx_flat)
+        knn_w_buf.from_numpy(knn_w_flat)
+
+        field_build_path = Path(__file__).parent / "sh_probe_field_build.cs.slang"
+        field_build = fc.ComputePass(device, file=field_build_path, cs_entry="main")
+        field_build.globals.gProbeSH = probe_sh_buf
+        field_build.globals.gKnnIdx = knn_idx_buf
+        field_build.globals.gKnnW = knn_w_buf
+        field_build.globals.gFieldSH = field_buf
+        field_build.globals.gFieldRes = fc.uint3(int(args.field_res), int(args.field_res), int(args.field_res))
+        field_build.globals.gNumProbes = int(num_probes)
+        field_build.globals.gK = int(k_field)
+
     phase_times: Dict[str, Dict[str, List[float]]] = {
         "gbuffer": {"ms": []},
         "gt": {
             "source": [], "field": [], "pack": [], "upload": [],
+            "field_build_submit": [], "field_build_sync": [],
             "shade": [], "shade_submit": [], "shade_sync": [],
             "total": [], "with_gbuffer": []
         },
         "model": {
             "source": [], "field": [], "pack": [], "upload": [],
+            "field_build_submit": [], "field_build_sync": [],
             "shade": [], "shade_submit": [], "shade_sync": [],
             "total": [], "with_gbuffer": []
         },
@@ -362,17 +406,37 @@ def main() -> None:
                 raise RuntimeError(f"Unknown route: {route}")
             t_src1 = time.perf_counter()
 
-            t_field0 = time.perf_counter()
-            field = (field_w[..., None] * sh_probe[field_knn]).sum(axis=-2)
-            t_field1 = time.perf_counter()
+            field_build_submit_ms = 0.0
+            field_build_sync_ms = 0.0
 
-            t_pack0 = time.perf_counter()
-            packed = _pack_field(field)
-            t_pack1 = time.perf_counter()
+            if field_builder == "cpu":
+                t_field0 = time.perf_counter()
+                field = (field_w[..., None] * sh_probe[field_knn]).sum(axis=-2)
+                t_field1 = time.perf_counter()
 
-            t_upload0 = time.perf_counter()
-            field_buf.from_numpy(packed)
-            t_upload1 = time.perf_counter()
+                t_pack0 = time.perf_counter()
+                packed = _pack_field(field)
+                t_pack1 = time.perf_counter()
+
+                t_upload0 = time.perf_counter()
+                field_buf.from_numpy(packed)
+                t_upload1 = time.perf_counter()
+            else:
+                assert probe_sh_buf is not None and field_build is not None
+                t_field0 = time.perf_counter()
+                t_field1 = t_field0
+
+                t_pack0 = time.perf_counter()
+                t_pack1 = t_pack0
+
+                t_upload0 = time.perf_counter()
+                probe_sh_buf.from_numpy(sh_probe.reshape(-1).astype(np.float32, copy=False))
+                t_upload1 = time.perf_counter()
+
+                t_fb0 = time.perf_counter()
+                field_build.execute(threads_x=num_cells, threads_y=1, threads_z=1)
+                t_fb1 = time.perf_counter()
+                field_build_submit_ms = (t_fb1 - t_fb0) * 1000.0
 
             t_shade_submit0 = time.perf_counter()
             compute.execute(threads_x=out_w, threads_y=out_h)
@@ -401,6 +465,8 @@ def main() -> None:
             row[f"{route}_field_ms"] = field_ms
             row[f"{route}_pack_ms"] = pack_ms
             row[f"{route}_upload_ms"] = upload_ms
+            row[f"{route}_field_build_submit_ms"] = field_build_submit_ms
+            row[f"{route}_field_build_sync_ms"] = field_build_sync_ms
             row[f"{route}_shade_submit_ms"] = shade_submit_ms
             row[f"{route}_shade_sync_ms"] = shade_sync_ms
             row[f"{route}_shade_ms"] = shade_ms
@@ -413,6 +479,8 @@ def main() -> None:
                 phase_times[route]["field"].append(field_ms)
                 phase_times[route]["pack"].append(pack_ms)
                 phase_times[route]["upload"].append(upload_ms)
+                phase_times[route]["field_build_submit"].append(field_build_submit_ms)
+                phase_times[route]["field_build_sync"].append(field_build_sync_ms)
                 phase_times[route]["shade_submit"].append(shade_submit_ms)
                 phase_times[route]["shade"].append(shade_ms)
                 if should_sync:
@@ -447,6 +515,8 @@ def main() -> None:
             "field_ms": _summarize_ms(phase_times[route]["field"]),
             "pack_ms": _summarize_ms(phase_times[route]["pack"]),
             "upload_ms": _summarize_ms(phase_times[route]["upload"]),
+            "field_build_submit_ms": _summarize_ms(phase_times[route]["field_build_submit"]),
+            "field_build_sync_ms": _summarize_ms(phase_times[route]["field_build_sync"]),
             "shade_submit_ms": _summarize_ms(phase_times[route]["shade_submit"]),
             "shade_sync_ms": _summarize_ms(phase_times[route]["shade_sync"]),
             "shade_ms": _summarize_ms(phase_times[route]["shade"]),

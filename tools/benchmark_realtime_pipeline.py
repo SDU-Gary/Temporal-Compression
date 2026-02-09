@@ -734,6 +734,11 @@ def main() -> None:
         _run_split_runtime(args, out_dir=out_dir, npz_path=npz_path, scene_path=scene_path, routes=routes)
         return
 
+    if str(args.field_builder) != "cpu":
+        raise NotImplementedError("--field-builder gpu is currently supported only with --split-runtime")
+    if str(args.gbuffer_mode) != "realtime":
+        raise NotImplementedError("--gbuffer-mode reuse_first is currently supported only with --split-runtime")
+
     if args.falcor_python_path and args.falcor_python_path not in sys.path:
         sys.path.insert(0, args.falcor_python_path)
 
