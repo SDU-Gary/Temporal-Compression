@@ -292,28 +292,44 @@ def main() -> None:
     frame_rows: List[Dict[str, Any]] = []
     bench_counter = 0
 
+    gbuffer_mode = str(args.gbuffer_mode)
+    if gbuffer_mode not in {"realtime", "reuse_first"}:
+        raise ValueError(f"Unsupported gbuffer mode: {gbuffer_mode}")
+    gbuffer_cache: Tuple[Any, Any, Any, Any, Any, Any] | None = None
+    gbuffer_frames_rendered = 0
+
     for i, frame in enumerate(all_frames):
-        t_frame = float(frame) / float(args.fps)
-        try:
-            testbed.clock.time = t_frame
-        except Exception:
+        rendered_gbuffer_this_frame = False
+        if gbuffer_mode == "reuse_first" and gbuffer_cache is not None:
+            gbuffer_ms = 0.0
+            pos_tex, norm_tex, alb_tex, emi_tex, dep_tex, lin_tex = gbuffer_cache
+        else:
+            t_frame = float(frame) / float(args.fps)
             try:
-                testbed.clock.setTime(t_frame)
+                testbed.clock.time = t_frame
             except Exception:
-                pass
+                try:
+                    testbed.clock.setTime(t_frame)
+                except Exception:
+                    pass
 
-        t0 = time.perf_counter()
-        testbed.resize_frame_buffer(out_w, out_h)
-        testbed.frame()
-        t1 = time.perf_counter()
-        gbuffer_ms = (t1 - t0) * 1000.0
+            t0 = time.perf_counter()
+            testbed.resize_frame_buffer(out_w, out_h)
+            testbed.frame()
+            t1 = time.perf_counter()
+            gbuffer_ms = (t1 - t0) * 1000.0
+            rendered_gbuffer_this_frame = True
+            gbuffer_frames_rendered += 1
 
-        pos_tex = graph.get_output("GBufferRT.posW")
-        norm_tex = graph.get_output("GBufferRT.normW")
-        alb_tex = graph.get_output("GBufferRT.diffuseOpacity")
-        emi_tex = graph.get_output("GBufferRT.emissive")
-        dep_tex = graph.get_output("GBufferRT.depth")
-        lin_tex = graph.get_output("GBufferRT.linearZ")
+            pos_tex = graph.get_output("GBufferRT.posW")
+            norm_tex = graph.get_output("GBufferRT.normW")
+            alb_tex = graph.get_output("GBufferRT.diffuseOpacity")
+            emi_tex = graph.get_output("GBufferRT.emissive")
+            dep_tex = graph.get_output("GBufferRT.depth")
+            lin_tex = graph.get_output("GBufferRT.linearZ")
+
+            if gbuffer_mode == "reuse_first" and gbuffer_cache is None:
+                gbuffer_cache = (pos_tex, norm_tex, alb_tex, emi_tex, dep_tex, lin_tex)
 
         compute.globals.gPosW = pos_tex
         compute.globals.gNormW = norm_tex
@@ -330,6 +346,7 @@ def main() -> None:
             "frame": int(frame),
             "is_warmup": not is_bench,
             "gbuffer_ms": gbuffer_ms,
+            "gbuffer_rendered": int(rendered_gbuffer_this_frame),
         }
 
         for route in routes:
@@ -408,7 +425,7 @@ def main() -> None:
             frame_rows.append(row)
 
         if i % max(1, len(all_frames) // 20) == 0:
-            tag = "warmup" if frame in warmup_frames else "bench"
+            tag = "warmup" if not is_bench else "bench"
             print(f"[{i+1}/{len(all_frames)}] frame={frame} ({tag})")
 
     summary: Dict[str, Any] = {
@@ -417,6 +434,7 @@ def main() -> None:
         "benchmark_frames": int(len(frame_rows)),
         "field_builder": str(args.field_builder),
         "gbuffer_mode": str(args.gbuffer_mode),
+        "gbuffer_frames_rendered": int(gbuffer_frames_rendered),
         "sync_gpu_forced": bool(args.sync_gpu),
         "sync_every": int(max(0, int(args.sync_every))),
         "gbuffer": _summarize_ms(phase_times["gbuffer"]["ms"]),
