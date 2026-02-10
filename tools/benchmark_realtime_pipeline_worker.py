@@ -104,6 +104,77 @@ def _fps_from_ms(ms_mean: float) -> float:
     return float(1000.0 / ms_mean)
 
 
+def _tone_map_reinhard(image: np.ndarray) -> np.ndarray:
+    x = np.maximum(image, 0.0)
+    return x / (1.0 + x)
+
+
+def _srgb_encode(image: np.ndarray) -> np.ndarray:
+    img = np.maximum(image, 0.0)
+    threshold = 0.0031308
+    low = 12.92 * img
+    high = 1.055 * np.power(img, 1.0 / 2.4) - 0.055
+    return np.where(img <= threshold, low, high)
+
+
+def _gaussian_kernel(size: int = 11, sigma: float = 1.5) -> np.ndarray:
+    ax = np.arange(-(size // 2), size // 2 + 1, dtype=np.float64)
+    k = np.exp(-0.5 * (ax / max(sigma, 1e-8)) ** 2)
+    k /= np.sum(k)
+    return k
+
+
+def _conv1d_reflect(arr: np.ndarray, kernel: np.ndarray, axis: int) -> np.ndarray:
+    pad = len(kernel) // 2
+    pad_width = [(0, 0)] * arr.ndim
+    pad_width[axis] = (pad, pad)
+    arr_pad = np.pad(arr, pad_width, mode="reflect")
+    return np.apply_along_axis(lambda m: np.convolve(m, kernel, mode="valid"), axis, arr_pad)
+
+
+def _gaussian_blur_2d_or_3d(arr: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+    out = _conv1d_reflect(arr, kernel, axis=0)
+    out = _conv1d_reflect(out, kernel, axis=1)
+    return out
+
+
+def _compute_psnr(img_gt: np.ndarray, img_pred: np.ndarray) -> float:
+    gt = np.clip(img_gt.astype(np.float64), 0.0, 1.0)
+    pr = np.clip(img_pred.astype(np.float64), 0.0, 1.0)
+    mse = float(np.mean((gt - pr) ** 2))
+    if mse <= 1e-16:
+        return float("inf")
+    return float(10.0 * np.log10(1.0 / mse))
+
+
+def _compute_ssim(img_gt: np.ndarray, img_pred: np.ndarray) -> float:
+    x = np.clip(img_gt.astype(np.float64), 0.0, 1.0)
+    y = np.clip(img_pred.astype(np.float64), 0.0, 1.0)
+
+    kernel = _gaussian_kernel(size=11, sigma=1.5)
+    c1 = (0.01 ** 2)
+    c2 = (0.03 ** 2)
+
+    mu_x = _gaussian_blur_2d_or_3d(x, kernel)
+    mu_y = _gaussian_blur_2d_or_3d(y, kernel)
+
+    sigma_x2 = _gaussian_blur_2d_or_3d(x * x, kernel) - mu_x * mu_x
+    sigma_y2 = _gaussian_blur_2d_or_3d(y * y, kernel) - mu_y * mu_y
+    sigma_xy = _gaussian_blur_2d_or_3d(x * y, kernel) - mu_x * mu_y
+
+    num = (2.0 * mu_x * mu_y + c1) * (2.0 * sigma_xy + c2)
+    den = (mu_x * mu_x + mu_y * mu_y + c1) * (sigma_x2 + sigma_y2 + c2)
+    ssim_map = num / np.maximum(den, 1e-12)
+    return float(np.mean(ssim_map))
+
+
+def compute_image_metrics(img_gt: np.ndarray, img_pred: np.ndarray) -> Dict[str, float]:
+    return {
+        "psnr": _compute_psnr(img_gt, img_pred),
+        "ssim": _compute_ssim(img_gt, img_pred),
+    }
+
+
 def _prepare_falcor_runtime(falcor_python_path: str | None) -> None:
     """Ensure libFalcor and its companion libs are discoverable before import."""
     if not falcor_python_path:
@@ -161,6 +232,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-sync-gpu", action="store_false", dest="sync_gpu")
     p.add_argument("--sync-every", type=int, default=0,
                    help="If >0, synchronize/readback every N benchmark frames")
+    p.add_argument("--compute-image-metrics", action="store_true", default=False,
+                   help="Compute PSNR/SSIM for GT vs Model on sampled benchmark frames")
+    p.add_argument("--save-frame-metrics-every", type=int, default=30,
+                   help="Compute image metrics every N benchmark frames")
     return p
 
 
@@ -336,6 +411,10 @@ def main() -> None:
     frame_rows: List[Dict[str, Any]] = []
     bench_counter = 0
 
+    do_image_metrics = bool(args.compute_image_metrics and set(routes) == {"gt", "model"})
+    metric_every = max(1, int(args.save_frame_metrics_every))
+    image_metrics: List[Dict[str, float]] = []
+
     gbuffer_mode = str(args.gbuffer_mode)
     if gbuffer_mode not in {"realtime", "reuse_first"}:
         raise ValueError(f"Unsupported gbuffer mode: {gbuffer_mode}")
@@ -386,12 +465,17 @@ def main() -> None:
         if is_bench:
             bench_counter += 1
 
+        need_image_metrics_this_frame = bool(do_image_metrics and is_bench and (bench_counter % metric_every == 0))
+
         row: Dict[str, Any] = {
             "frame": int(frame),
             "is_warmup": not is_bench,
             "gbuffer_ms": gbuffer_ms,
             "gbuffer_rendered": int(rendered_gbuffer_this_frame),
+            "metric_sampled": int(need_image_metrics_this_frame),
         }
+
+        rendered_images: Dict[str, np.ndarray] = {}
 
         for route in routes:
             t_src0 = time.perf_counter()
@@ -445,13 +529,19 @@ def main() -> None:
             should_sync = bool(args.sync_gpu)
             if (not should_sync) and int(args.sync_every) > 0 and is_bench and (bench_counter % int(args.sync_every) == 0):
                 should_sync = True
+            if need_image_metrics_this_frame:
+                should_sync = True
 
             shade_sync_ms = 0.0
             if should_sync:
                 t_sync0 = time.perf_counter()
-                _ = output_tex.to_numpy()
+                img = np.asarray(output_tex.to_numpy(), dtype=np.float32)
                 t_sync1 = time.perf_counter()
                 shade_sync_ms = (t_sync1 - t_sync0) * 1000.0
+                if img.shape[-1] > 3:
+                    img = img[..., :3]
+                if need_image_metrics_this_frame:
+                    rendered_images[route] = img
 
             source_ms = (t_src1 - t_src0) * 1000.0
             field_ms = (t_field1 - t_field0) * 1000.0
@@ -491,6 +581,16 @@ def main() -> None:
         if is_bench:
             phase_times["gbuffer"]["ms"].append(gbuffer_ms)
             frame_rows.append(row)
+
+            if need_image_metrics_this_frame and set(routes) == {"gt", "model"} and "gt" in rendered_images and "model" in rendered_images:
+                gt_img = _srgb_encode(_tone_map_reinhard(rendered_images["gt"]))
+                model_img = _srgb_encode(_tone_map_reinhard(rendered_images["model"]))
+                metric = compute_image_metrics(gt_img, model_img)
+                image_metrics.append({
+                    "frame": int(frame),
+                    "psnr": float(metric["psnr"]),
+                    "ssim": float(metric["ssim"]),
+                })
 
         if i % max(1, len(all_frames) // 20) == 0:
             tag = "warmup" if not is_bench else "bench"
@@ -534,6 +634,14 @@ def main() -> None:
         "force_every_frame" if bool(args.sync_gpu)
         else ("sampled_every_n" if int(max(0, int(args.sync_every))) > 0 else "async_no_sync")
     )
+
+    if image_metrics:
+        summary["image_metrics"] = {
+            "samples": int(len(image_metrics)),
+            "mean_psnr": float(np.mean([m["psnr"] for m in image_metrics])),
+            "mean_ssim": float(np.mean([m["ssim"] for m in image_metrics])),
+            "per_sample": image_metrics,
+        }
 
     sum_path = out_dir / "falcor_summary.json"
     csv_path = out_dir / "falcor_frames.csv"
