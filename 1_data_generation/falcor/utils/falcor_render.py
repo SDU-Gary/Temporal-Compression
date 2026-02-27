@@ -458,6 +458,9 @@ def _get_cubemap_cache(cube_res: int):
     v = 1.0 - 2.0 * coords  # top -> +1
     uu, vv = np.meshgrid(u, v)
     weight = (4.0 / (cube_res * cube_res)) / np.power(1.0 + uu * uu + vv * vv, 1.5)
+    weight_sum = float(6.0 * np.sum(weight))
+    if weight_sum > 1e-12:
+        weight = weight * ((4.0 * np.pi) / weight_sum)
 
     faces = []
     for forward, up in _cubemap_face_bases():
@@ -601,11 +604,12 @@ def render_sh_cubemap(
         for f in range(frames):
             if seed_base is not None:
                 _set_fixed_seed(seed_base + f + face_idx * 7)
-        if _has_reset:
-            try:
-                path_tracer.reset()
-            except Exception:
-                pass
+            if _has_reset:
+                try:
+                    path_tracer.reset()
+                except Exception:
+                    pass
+
             rendered = False
             if hasattr(testbed, "frame"):
                 try:

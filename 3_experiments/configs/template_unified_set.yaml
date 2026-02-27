@@ -30,7 +30,15 @@ training:
   lambda_temporal: 0.001
   lambda_linearity: 0.1
   linearity_aug_pairs: 2
-  enable_sh_scaler: false
+  enable_sh_scaler: true
+  enable_weighted_sh_loss: true
+  sh_loss_weights: [3.0, 1.0, 1.0, 1.0, 0.5, 0.5, 0.5, 0.5, 0.5]
+  sh_weight_mode: basis
+  lambda_image: 0.1
+  image_loss_type: mse
+  image_samples: 64
+  image_sample_seed: 42
+  image_loss_space: linear
 
 evaluation:
   output_dir: 3_experiments/results/unified_set/example_run/eval

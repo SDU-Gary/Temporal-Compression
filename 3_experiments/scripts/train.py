@@ -111,6 +111,14 @@ def _apply_config(args: argparse.Namespace, defaults: argparse.Namespace, cfg: D
         "linearity_aug_pairs": training.get("linearity_aug_pairs"),
         "lambda_spatial": training.get("lambda_spatial"),
         "spatial_k": training.get("spatial_k"),
+        "lambda_image": training.get("lambda_image"),
+        "image_loss_type": training.get("image_loss_type"),
+        "image_samples": training.get("image_samples"),
+        "image_sample_seed": training.get("image_sample_seed"),
+        "image_loss_space": training.get("image_loss_space"),
+        "enable_weighted_sh_loss": training.get("enable_weighted_sh_loss"),
+        "sh_loss_weights": training.get("sh_loss_weights"),
+        "sh_weight_mode": training.get("sh_weight_mode"),
         "enable_sh_scaler": training.get("enable_sh_scaler"),
         "sh_scaler_path": training.get("sh_scaler_path"),
         "sh_scaler_max_samples": training.get("sh_scaler_max_samples"),
@@ -306,6 +314,14 @@ def run_training(args: argparse.Namespace) -> None:
         linearity_aug_pairs=args.linearity_aug_pairs,
         spatial_weight=args.lambda_spatial,
         spatial_k=args.spatial_k,
+        image_loss_weight=args.lambda_image,
+        image_loss_type=args.image_loss_type,
+        image_samples=args.image_samples,
+        image_sample_seed=args.image_sample_seed,
+        image_loss_space=args.image_loss_space,
+        enable_weighted_sh_loss=args.enable_weighted_sh_loss,
+        sh_loss_weights=args.sh_loss_weights,
+        sh_weight_mode=args.sh_weight_mode,
         rerun_logger=rerun_logger,  # Pass logger to trainer
         show_progress=args.show_progress,
     )
@@ -333,6 +349,20 @@ def run_training(args: argparse.Namespace) -> None:
         "training": {
             "batch_size": int(args.batch_size),
             "epochs": int(args.epochs),
+            "recon_loss": args.recon_loss,
+            "lambda_temporal": float(args.lambda_temporal),
+            "lambda_linearity": float(args.lambda_linearity),
+            "linearity_aug_pairs": int(args.linearity_aug_pairs),
+            "lambda_spatial": float(args.lambda_spatial),
+            "spatial_k": int(args.spatial_k),
+            "lambda_image": float(args.lambda_image),
+            "image_loss_type": args.image_loss_type,
+            "image_samples": int(args.image_samples),
+            "image_sample_seed": int(args.image_sample_seed),
+            "image_loss_space": args.image_loss_space,
+            "enable_weighted_sh_loss": bool(args.enable_weighted_sh_loss),
+            "sh_loss_weights": list(args.sh_loss_weights) if args.sh_loss_weights is not None else None,
+            "sh_weight_mode": args.sh_weight_mode,
         },
         "sh_scaler": scaler_meta,
     }
@@ -396,6 +426,14 @@ def run_training(args: argparse.Namespace) -> None:
             "linearity_aug_pairs": args.linearity_aug_pairs,
             "lambda_spatial": args.lambda_spatial,
             "spatial_k": args.spatial_k,
+            "lambda_image": args.lambda_image,
+            "image_loss_type": args.image_loss_type,
+            "image_samples": args.image_samples,
+            "image_sample_seed": args.image_sample_seed,
+            "image_loss_space": args.image_loss_space,
+            "enable_weighted_sh_loss": args.enable_weighted_sh_loss,
+            "sh_loss_weights": args.sh_loss_weights,
+            "sh_weight_mode": args.sh_weight_mode,
             "light_dim": args.light_dim,
             "embed_dim": args.embed_dim,
             "intensity_dim": args.intensity_dim,
@@ -462,6 +500,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Weight for spatial smoothness (KNN-TV) loss.")
     parser.add_argument("--spatial-k", type=int, default=1,
                         help="Number of nearest neighbors for spatial loss.")
+    parser.add_argument("--lambda-image", type=float, default=0.0,
+                        help="Weight for differentiable SH image-space loss.")
+    parser.add_argument("--image-loss-type", choices=["mse", "charbonnier"], default="mse",
+                        help="Loss type for image-space supervision.")
+    parser.add_argument("--image-samples", type=int, default=64,
+                        help="Number of spherical directions sampled per batch for image loss.")
+    parser.add_argument("--image-sample-seed", type=int, default=42,
+                        help="Random seed for image-loss direction sampling.")
+    parser.add_argument("--image-loss-space", choices=["linear", "srgb"], default="linear",
+                        help="Image space used for image loss/metrics.")
+    parser.add_argument("--enable-weighted-sh-loss", action="store_true",
+                        help="Enable basis-weighted SH reconstruction loss.")
+    parser.add_argument("--no-weighted-sh-loss", action="store_false", dest="enable_weighted_sh_loss")
+    parser.set_defaults(enable_weighted_sh_loss=False)
+    parser.add_argument("--sh-loss-weights", type=float, nargs=9, default=None,
+                        help="Nine basis weights for weighted SH loss.")
+    parser.add_argument("--sh-weight-mode", choices=["basis"], default="basis",
+                        help="Weight broadcast mode for SH coefficients.")
 
     parser.add_argument("--light-dim", type=int, default=None,
                         help="Light descriptor dimension for unified model.")

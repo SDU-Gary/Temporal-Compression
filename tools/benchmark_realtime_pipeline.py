@@ -328,6 +328,41 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Compute PSNR/SSIM between GT route and Model route rendered images")
     parser.add_argument("--save-frame-metrics-every", type=int, default=30,
                         help="Only compute image metrics every N benchmark frames")
+    parser.add_argument("--normal-transform",
+                        choices=["identity", "swap_yz", "swap_xz", "swap_xy", "flip_x", "flip_y", "flip_z"],
+                        default="identity",
+                        help="Debug SH normal orientation mismatch")
+    parser.add_argument("--cosine-mode", choices=["irradiance", "radiance"], default="irradiance",
+                        help="Irradiance applies cosine convolution A_l; radiance disables A_l")
+    parser.add_argument("--sh-debug-coeff", type=int, default=-1,
+                        help="If in [0,8], keep only one SH coefficient per RGB")
+    parser.add_argument("--single-probe-index", type=int, default=-1,
+                        help="If >=0, broadcast one probe SH to all probes")
+    parser.add_argument("--axis-test", choices=["off", "x", "y", "z"], default="off",
+                        help="Override SH with a single strong first-order axis component")
+    parser.add_argument("--axis-test-sign", choices=["pos", "neg"], default="pos",
+                        help="Sign for axis-test component")
+    parser.add_argument("--axis-test-strength", type=float, default=1.0,
+                        help="Strength for axis-test SH coefficient")
+    parser.add_argument("--save-sampled-images-dir", default=None,
+                        help="Optional dir to dump sampled metric frames (npz)")
+    parser.add_argument("--roi", default=None,
+                        help="Optional normalized ROI x0,y0,x1,y1 for extra image metrics")
+    parser.add_argument("--output-scale", type=float, default=1.0,
+                        help="Scale applied to SH shading output before metrics/output")
+    parser.add_argument("--metric-align-scale-gt", type=float, default=1.0,
+                        help="Scale GT route linear image before metric computation (metrics-only)")
+    parser.add_argument("--metric-align-scale-model", type=float, default=1.0,
+                        help="Scale Model route linear image before metric computation (metrics-only)")
+    parser.add_argument("--pt-reference", action="store_true", default=False,
+                        help="Also render PathTracer reference and report route-vs-PT metrics")
+    parser.add_argument("--pt-spp", type=int, default=8,
+                        help="PathTracer spp per frame for PT reference")
+    parser.add_argument("--pt-bounces", type=int, default=4,
+                        help="PathTracer max surface bounces for PT reference")
+    parser.add_argument("--pt-use-nee", action="store_true", default=True,
+                        help="Enable next-event estimation for PT reference")
+    parser.add_argument("--pt-no-nee", action="store_false", dest="pt_use_nee")
     return parser
 
 
@@ -461,6 +496,16 @@ def _run_split_runtime(
         "--grid-chunk", str(args.grid_chunk),
         "--field-builder", str(args.field_builder),
         "--gbuffer-mode", str(args.gbuffer_mode),
+        "--normal-transform", str(args.normal_transform),
+        "--cosine-mode", str(args.cosine_mode),
+        "--sh-debug-coeff", str(int(args.sh_debug_coeff)),
+        "--single-probe-index", str(int(args.single_probe_index)),
+        "--axis-test", str(args.axis_test),
+        "--axis-test-sign", str(args.axis_test_sign),
+        "--axis-test-strength", str(float(args.axis_test_strength)),
+        "--output-scale", str(float(args.output_scale)),
+        "--metric-align-scale-gt", str(float(args.metric_align_scale_gt)),
+        "--metric-align-scale-model", str(float(args.metric_align_scale_model)),
         "--falcor-python-path", str(args.falcor_python_path),
     ]
     if model_sh_npz is not None:
@@ -469,7 +514,19 @@ def _run_split_runtime(
     cmd.extend(["--sync-every", str(max(0, int(args.sync_every)))])
     if args.compute_image_metrics:
         cmd.append("--compute-image-metrics")
+    if args.compute_image_metrics or args.pt_reference:
         cmd.extend(["--save-frame-metrics-every", str(max(1, int(args.save_frame_metrics_every)))])
+    if args.save_sampled_images_dir:
+        cmd.extend(["--save-sampled-images-dir", str(args.save_sampled_images_dir)])
+    if args.roi:
+        cmd.extend(["--roi", str(args.roi)])
+    if args.pt_reference:
+        cmd.append("--pt-reference")
+        cmd.extend([
+            "--pt-spp", str(max(1, int(args.pt_spp))),
+            "--pt-bounces", str(max(0, int(args.pt_bounces))),
+        ])
+        cmd.append("--pt-use-nee" if bool(args.pt_use_nee) else "--pt-no-nee")
 
     print("[split-runtime] launching Falcor worker:")
     print(" ".join(cmd))
@@ -520,6 +577,21 @@ def _run_split_runtime(
         "falcor_python_path": str(args.falcor_python_path),
         "field_builder": str(args.field_builder),
         "gbuffer_mode": str(args.gbuffer_mode),
+        "normal_transform": str(args.normal_transform),
+        "cosine_mode": str(args.cosine_mode),
+        "sh_debug_coeff": int(args.sh_debug_coeff),
+        "single_probe_index": int(args.single_probe_index),
+        "axis_test": str(args.axis_test),
+        "axis_test_sign": str(args.axis_test_sign),
+        "axis_test_strength": float(args.axis_test_strength),
+        "output_scale": float(args.output_scale),
+        "metric_align_scale_gt": float(args.metric_align_scale_gt),
+        "metric_align_scale_model": float(args.metric_align_scale_model),
+        "roi": str(args.roi) if args.roi else None,
+        "pt_reference": bool(args.pt_reference),
+        "pt_spp": int(max(1, int(args.pt_spp))),
+        "pt_bounces": int(max(0, int(args.pt_bounces))),
+        "pt_use_nee": bool(args.pt_use_nee),
         "sync_gpu_forced": bool(args.sync_gpu),
         "sync_every": int(max(0, int(args.sync_every))),
     }

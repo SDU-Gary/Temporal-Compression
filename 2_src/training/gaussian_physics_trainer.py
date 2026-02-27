@@ -86,6 +86,14 @@ class GaussianPhysicsTrainer:
         linearity_aug_pairs: int = 0,
         spatial_weight: float = 0.0,
         spatial_k: int = 1,
+        image_loss_weight: float = 0.0,
+        image_loss_type: str = "mse",
+        image_samples: int = 64,
+        image_sample_seed: int = 42,
+        image_loss_space: str = "linear",
+        enable_weighted_sh_loss: bool = False,
+        sh_loss_weights: Optional[list[float]] = None,
+        sh_weight_mode: str = "basis",
         rerun_logger=None,  # Optional RerunLogger instance
         show_progress: bool = True,
     ):
@@ -104,11 +112,33 @@ class GaussianPhysicsTrainer:
         self.linearity_aug_pairs = linearity_aug_pairs
         self.spatial_weight = spatial_weight
         self.spatial_k = spatial_k
+        self.image_loss_weight = max(0.0, float(image_loss_weight))
+        self.image_loss_type = str(image_loss_type)
+        self.image_samples = max(1, int(image_samples))
+        self.image_sample_seed = int(image_sample_seed)
+        self.image_loss_space = str(image_loss_space)
+        self.enable_weighted_sh_loss = bool(enable_weighted_sh_loss)
+        self.sh_weight_mode = str(sh_weight_mode)
         self.rerun_logger = rerun_logger
         self.show_progress = show_progress
         self._progress_prefix = ""
         self._probe_positions = None
         self._probe_neighbors = None
+
+        if self.image_loss_type not in {"mse", "charbonnier"}:
+            raise ValueError(f"Unsupported image_loss_type: {self.image_loss_type}")
+        if self.image_loss_space not in {"linear", "srgb"}:
+            raise ValueError(f"Unsupported image_loss_space: {self.image_loss_space}")
+        if self.sh_weight_mode != "basis":
+            raise ValueError(f"Unsupported sh_weight_mode: {self.sh_weight_mode}")
+
+        if sh_loss_weights is None:
+            sh_loss_weights = [3.0, 1.0, 1.0, 1.0, 0.5, 0.5, 0.5, 0.5, 0.5]
+        if len(sh_loss_weights) != 9:
+            raise ValueError("sh_loss_weights must contain exactly 9 values")
+        sh_w9 = torch.tensor(sh_loss_weights, dtype=torch.float32)
+        self._sh_loss_weights_27 = torch.cat([sh_w9, sh_w9, sh_w9], dim=0)
+        self._image_basis_cache: Dict[tuple[str, str], torch.Tensor] = {}
 
         self.optimizer = torch.optim.Adam(
             self.model.parameters(),
@@ -198,7 +228,103 @@ class GaussianPhysicsTrainer:
             # Fallback for models without mask support
             return self.model(positions, params, top_k=self.top_k)
 
+    def _get_sh_loss_weights(self, ref: torch.Tensor) -> torch.Tensor:
+        w = self._sh_loss_weights_27.to(device=ref.device, dtype=ref.dtype)
+        view_shape = [1] * (ref.dim() - 1) + [27]
+        return w.view(*view_shape)
+
+    def _tone_map_reinhard(self, image: torch.Tensor) -> torch.Tensor:
+        image = torch.clamp(image, min=0.0)
+        return image / (1.0 + image)
+
+    def _srgb_encode(self, image: torch.Tensor) -> torch.Tensor:
+        image = torch.clamp(image, min=0.0)
+        threshold = 0.0031308
+        low = 12.92 * image
+        high = 1.055 * torch.pow(image, 1.0 / 2.4) - 0.055
+        return torch.where(image <= threshold, low, high)
+
+    def _build_image_basis(self, ref: torch.Tensor) -> torch.Tensor:
+        key = (str(ref.device), str(ref.dtype))
+        cached = self._image_basis_cache.get(key)
+        if cached is not None:
+            return cached
+
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(self.image_sample_seed)
+        u = torch.rand((self.image_samples,), generator=gen, dtype=torch.float32)
+        v = torch.rand((self.image_samples,), generator=gen, dtype=torch.float32)
+        z = 2.0 * u - 1.0
+        phi = 2.0 * np.pi * v
+        r = torch.sqrt(torch.clamp(1.0 - z * z, min=0.0))
+        x = r * torch.cos(phi)
+        y = r * torch.sin(phi)
+
+        dirs = torch.stack([x, y, z], dim=-1).to(device=ref.device, dtype=ref.dtype)
+        xb, yb, zb = dirs[:, 0], dirs[:, 1], dirs[:, 2]
+        basis = torch.stack(
+            [
+                torch.full_like(xb, 0.282095),
+                0.488603 * yb,
+                0.488603 * zb,
+                0.488603 * xb,
+                1.092548 * xb * yb,
+                1.092548 * yb * zb,
+                0.315392 * (3.0 * zb * zb - 1.0),
+                1.092548 * xb * zb,
+                0.546274 * (xb * xb - yb * yb),
+            ],
+            dim=-1,
+        )
+        self._image_basis_cache[key] = basis
+        return basis
+
+    def _render_sh_to_samples(self, sh: torch.Tensor) -> torch.Tensor:
+        basis = self._build_image_basis(sh)
+        sh_rgb = torch.stack([sh[..., 0:9], sh[..., 9:18], sh[..., 18:27]], dim=-2)
+        image = torch.einsum("...cn,sn->...sc", sh_rgb, basis)
+        if self.image_loss_space == "srgb":
+            image = self._srgb_encode(self._tone_map_reinhard(image))
+        else:
+            image = torch.clamp(image, 0.0, 1.0)
+        return image
+
+    def _compute_image_loss(self, pred_sh: torch.Tensor, target_sh: torch.Tensor) -> torch.Tensor:
+        if self.image_loss_weight <= 0:
+            return torch.tensor(0.0, device=pred_sh.device)
+        pred_img = self._render_sh_to_samples(pred_sh)
+        target_img = self._render_sh_to_samples(target_sh)
+        if self.image_loss_type == "charbonnier":
+            return charbonnier_loss(pred_img, target_img, epsilon=self.charbonnier_eps)
+        return torch.mean((pred_img - target_img) ** 2)
+
+    def _compute_image_metrics(self, pred_sh: torch.Tensor, target_sh: torch.Tensor) -> Dict[str, float]:
+        pred_img = self._render_sh_to_samples(pred_sh)
+        target_img = self._render_sh_to_samples(target_sh)
+        diff = pred_img - target_img
+        mae = torch.mean(torch.abs(diff)).item()
+        mse = torch.mean(diff * diff)
+        rmse = torch.sqrt(mse).item()
+        mse_val = mse.item()
+        if mse_val <= 1e-12:
+            psnr = float("inf")
+        else:
+            psnr = float(10.0 * np.log10(1.0 / mse_val))
+        return {"img_mae": mae, "img_rmse": rmse, "img_psnr": psnr}
+
     def _recon_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred_eval, target_eval = pred, target
+        if self.enable_weighted_sh_loss and self.adapter.target_inverse is not None:
+            pred_eval, target_eval = self.adapter.inverse_targets(pred, target)
+
+        if self.enable_weighted_sh_loss:
+            diff = (pred_eval - target_eval) * self._get_sh_loss_weights(pred_eval)
+            if self.recon_loss == "charbonnier":
+                return torch.mean(torch.sqrt(diff * diff + self.charbonnier_eps * self.charbonnier_eps))
+            if self.recon_loss == "l1":
+                return torch.mean(torch.abs(diff))
+            return torch.mean(diff * diff)
+
         if self.recon_loss == "charbonnier":
             return charbonnier_loss(pred, target, epsilon=self.charbonnier_eps)
         return self.criterion(pred, target)
@@ -376,7 +502,7 @@ class GaussianPhysicsTrainer:
     def train_epoch(self, train_loader: torch.utils.data.DataLoader) -> Dict[str, float]:
         self.model.train()
 
-        totals = {"total": 0.0, "recon": 0.0, "coeff_l1": 0.0, "linearity": 0.0, "spatial": 0.0}
+        totals = {"total": 0.0, "recon": 0.0, "image": 0.0, "coeff_l1": 0.0, "linearity": 0.0, "spatial": 0.0}
         pre_clip_norms_list = []
         post_clip_norms_list = []
         num_batches = 0
@@ -398,6 +524,8 @@ class GaussianPhysicsTrainer:
             preds = self._forward(positions, params, mask)
 
             loss_recon = self._recon_loss(preds, targets)
+            preds_eval, targets_eval = self.adapter.inverse_targets(preds, targets)
+            loss_image = self._compute_image_loss(preds_eval, targets_eval)
             loss_temporal = self._compute_temporal_loss()
             loss_linearity = self._compute_linearity_loss(positions, params, mask, preds)
             loss_linearity_aug = self._compute_linearity_aug_loss(positions, params, mask)
@@ -406,6 +534,7 @@ class GaussianPhysicsTrainer:
 
             loss_total = (
                 loss_recon
+                + self.image_loss_weight * loss_image
                 + self.temporal_weight * loss_temporal
                 + self.linearity_weight * (loss_linearity + loss_linearity_aug)
                 + self.spatial_weight * loss_spatial
@@ -428,6 +557,7 @@ class GaussianPhysicsTrainer:
 
             totals["total"] += loss_total.item()
             totals["recon"] += loss_recon.item()
+            totals["image"] += loss_image.item()
             totals["coeff_l1"] += loss_temporal.item()
             totals["linearity"] += (loss_linearity.item() + loss_linearity_aug.item())
             totals["spatial"] += loss_spatial.item()
@@ -448,7 +578,7 @@ class GaussianPhysicsTrainer:
     def validate_epoch(self, val_loader: torch.utils.data.DataLoader) -> Dict[str, float]:
         self.model.eval()
 
-        sums = {"mae": 0.0, "rmse": 0.0, "charbonnier": 0.0, "superposition": 0.0}
+        sums = {"mae": 0.0, "rmse": 0.0, "charbonnier": 0.0, "superposition": 0.0, "img_mae": 0.0, "img_rmse": 0.0, "img_psnr": 0.0}
         num_batches = 0
 
         loader = val_loader
@@ -478,6 +608,12 @@ class GaussianPhysicsTrainer:
             sums["mae"] += mae
             sums["rmse"] += rmse
             sums["charbonnier"] += charbonnier
+
+            img_metrics = self._compute_image_metrics(preds_eval, targets_eval)
+            sums["img_mae"] += img_metrics["img_mae"]
+            sums["img_rmse"] += img_metrics["img_rmse"]
+            sums["img_psnr"] += img_metrics["img_psnr"]
+
             if self.linearity_weight > 0:
                 sup_err = self._compute_linearity_loss(positions, params, mask, preds).item()
                 sums["superposition"] += sup_err
@@ -611,8 +747,8 @@ class GaussianPhysicsTrainer:
         log_every: int = 0,
     ) -> Dict[str, Dict[str, list]]:
         history = {
-            "train": {"total": [], "recon": [], "coeff_l1": [], "linearity": [], "spatial": []},
-            "val": {"mae": [], "rmse": [], "charbonnier": [], "superposition": []},
+            "train": {"total": [], "recon": [], "image": [], "coeff_l1": [], "linearity": [], "spatial": []},
+            "val": {"mae": [], "rmse": [], "charbonnier": [], "superposition": [], "img_mae": [], "img_rmse": [], "img_psnr": []},
         }
 
         best_value = float("inf")
@@ -640,6 +776,7 @@ class GaussianPhysicsTrainer:
             train_metrics = self.train_epoch(train_loader)
             history["train"]["total"].append(train_metrics["total"])
             history["train"]["recon"].append(train_metrics["recon"])
+            history["train"]["image"].append(train_metrics["image"])
             history["train"]["coeff_l1"].append(train_metrics["coeff_l1"])
             history["train"]["linearity"].append(train_metrics["linearity"])
             history["train"]["spatial"].append(train_metrics["spatial"])
@@ -699,6 +836,7 @@ class GaussianPhysicsTrainer:
                     msg += (
                         f" | Val mae={history['val']['mae'][-1]:.6f}, "
                         f"rmse={history['val']['rmse'][-1]:.6f}, "
+                        f"img_psnr={history['val']['img_psnr'][-1]:.3f}, "
                         f"superposition={history['val']['superposition'][-1]:.6f}"
                     )
                 print(msg)

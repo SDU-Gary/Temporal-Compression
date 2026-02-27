@@ -1,6 +1,6 @@
 experiment:
   variant: unified_set
-  output_dir: 3_experiments/results/bistro_clean_v2/unified_set_K30_r8
+  output_dir: 3_experiments/results/bistro_clean_v2/unified_set_K50_r16_plain
   device: cuda
   seed: 42
 
@@ -12,8 +12,8 @@ data:
   num_workers: 4
 
 model:
-  num_gaussians: 30
-  rank: 8
+  num_gaussians: 50
+  rank: 16
   top_k: 3
   light_dim: 12
   embed_dim: 32
@@ -28,20 +28,14 @@ training:
   lambda_temporal: 0.001
   lambda_linearity: 0.1
   linearity_aug_pairs: 2
-  enable_sh_scaler: true
-  enable_weighted_sh_loss: true
-  sh_loss_weights: [3.0, 1.0, 1.0, 1.0, 0.5, 0.5, 0.5, 0.5, 0.5]
-  sh_weight_mode: basis
-  lambda_image: 0.1
-  image_loss_type: mse
-  image_samples: 64
-  image_sample_seed: 42
-  image_loss_space: linear
+  enable_sh_scaler: false
+  enable_weighted_sh_loss: false
+  lambda_image: 0.0
 
 evaluation:
-  output_dir: 3_experiments/results/bistro_clean_v2/unified_set_K30_r8/eval
-  checkpoint: 3_experiments/results/bistro_clean_v2/unified_set_K30_r8/best_model.pt
+  output_dir: 3_experiments/results/bistro_clean_v2/unified_set_K50_r16_plain/eval
+  checkpoint: 3_experiments/results/bistro_clean_v2/unified_set_K50_r16_plain/best_model.pt
   data_root: 1_data_generation/output/bistro_clean_v2
-  rank: 8
+  rank: 16
   n_samples: 20
   probe_idx: 0

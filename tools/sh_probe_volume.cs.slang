@@ -16,8 +16,22 @@ uint3 gFieldRes;
 uint2 gFrameDim;
 float gExposure;
 float gAOStrength;
+int gNormalTransform; // 0 identity, 1 swap_yz, 2 swap_xz, 3 swap_xy, 4 flip_x, 5 flip_y, 6 flip_z
+int gCosineMode;      // 0 irradiance(A_l on), 1 radiance(A_l off)
 
 static const float PI = 3.14159265359f;
+static const float INV_PI = 0.31830988618f;
+
+float3 apply_normal_transform(float3 n)
+{
+    if (gNormalTransform == 1) return float3(n.x, n.z, n.y); // swap_yz
+    if (gNormalTransform == 2) return float3(n.z, n.y, n.x); // swap_xz
+    if (gNormalTransform == 3) return float3(n.y, n.x, n.z); // swap_xy
+    if (gNormalTransform == 4) return float3(-n.x, n.y, n.z); // flip_x
+    if (gNormalTransform == 5) return float3(n.x, -n.y, n.z); // flip_y
+    if (gNormalTransform == 6) return float3(n.x, n.y, -n.z); // flip_z
+    return n;
+}
 
 float3 eval_irradiance(float3 n, float3 sh[9])
 {
@@ -35,9 +49,9 @@ float3 eval_irradiance(float3 n, float3 sh[9])
     float Y7 = 1.092548f * x * z;
     float Y8 = 0.546274f * (x * x - y * y);
 
-    float A0 = PI;
-    float A1 = 2.0f * PI / 3.0f;
-    float A2 = PI / 4.0f;
+    float A0 = (gCosineMode == 0) ? PI : 1.0f;
+    float A1 = (gCosineMode == 0) ? (2.0f * PI / 3.0f) : 1.0f;
+    float A2 = (gCosineMode == 0) ? (PI / 4.0f) : 1.0f;
 
     float b0 = Y0 * A0;
     float b1 = Y1 * A1;
@@ -88,6 +102,14 @@ void main(uint3 tid : SV_DispatchThreadID)
         return;
     }
     n /= nlen;
+    n = apply_normal_transform(n);
+    float nlen2 = length(n);
+    if (nlen2 < 1e-6f)
+    {
+        gOutput[tid.xy] = float4(0, 0, 0, 1);
+        return;
+    }
+    n /= nlen2;
 
     float3 albedo = gAlbedo[tid.xy].xyz;
     float3 emissive = gEmissive[tid.xy].xyz;
@@ -154,6 +176,6 @@ void main(uint3 tid : SV_DispatchThreadID)
         float slope = abs(linZ.y) * 4.0f;
         ao = saturate(1.0f - gAOStrength * slope / z);
     }
-    float3 color = (albedo * irradiance * ao + emissive) * gExposure;
+    float3 color = (((albedo * INV_PI) * irradiance) * ao + emissive) * gExposure;
     gOutput[tid.xy] = float4(color, 1.0f);
 }
