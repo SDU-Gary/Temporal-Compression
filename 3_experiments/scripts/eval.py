@@ -30,6 +30,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default=None)
     parser.add_argument("--batch-size", type=int, default=1024)
     # Default to 0 for portability (some environments disallow multiprocessing semaphores).
+    # TODO(perf): 在可用环境中增大 num_workers 通常可显著提升评估吞吐。
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--top-k", type=int, default=3)
     parser.add_argument("--output", default=None, help="Output JSON path (default: <checkpoint_dir>/eval.json)")
@@ -41,9 +42,10 @@ def main() -> None:
 
     import torch
 
-    from data.lightset_dataset import create_dataloaders_lightset
+    from data.lightset_dataset import LightSetDataset
     from models.gaussian_physics_unified import GaussianPhysicsCompressionUnified
     from training.gaussian_physics_trainer import BatchAdapter
+    from torch.utils.data import DataLoader
 
     device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -116,34 +118,43 @@ def main() -> None:
         )
     model.eval()
 
-    train_loader, val_loader, test_loader = create_dataloaders_lightset(
-        data_root=args.data_root,
-        batch_size=args.batch_size,
-        train_ratio=train_ratio,
-        val_ratio=val_ratio,
-        num_workers=args.num_workers,
-        normalize_probes=True,
-    )
-    loader = {"train": train_loader, "val": val_loader, "test": test_loader}[args.split]
+    def _build_loader(num_workers: int):
+        dataset = LightSetDataset(
+            data_root=args.data_root,
+            split=args.split,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            normalize_probes=True,
+        )
+        return DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+        )
+
+    loader = _build_loader(args.num_workers)
 
     adapter = BatchAdapter(params_key="light_params", mask_key="light_mask")
     if scaler is not None:
         adapter.target_transform = scaler.transform
         adapter.target_inverse = scaler.inverse
 
-    sum_abs = 0.0
-    sum_sq = 0.0
+    sum_abs = torch.zeros((), device=device, dtype=torch.float64)
+    sum_sq = torch.zeros((), device=device, dtype=torch.float64)
     count = 0
     def run_eval(active_loader) -> None:
         nonlocal sum_abs, sum_sq, count
-        with torch.no_grad():
+        # TODO(perf): 评估阶段可考虑 torch.inference_mode()，相较 no_grad 有更低的 autograd 开销。
+        with torch.inference_mode():
             for batch in active_loader:
                 positions, params, targets, mask = adapter.unpack(batch, device)
                 preds = model(positions, params, top_k=top_k, light_mask=mask)
                 preds_eval, targets_eval = adapter.inverse_targets(preds, targets)
                 diff = preds_eval - targets_eval
-                sum_abs += torch.sum(torch.abs(diff)).item()
-                sum_sq += torch.sum(diff * diff).item()
+                sum_abs += torch.sum(torch.abs(diff), dtype=torch.float64)
+                sum_sq += torch.sum(diff * diff, dtype=torch.float64)
                 count += int(diff.numel())
 
     try:
@@ -152,19 +163,12 @@ def main() -> None:
         if args.num_workers == 0:
             raise
         print("Warning: DataLoader multiprocessing failed; retrying with --num-workers 0")
-        train_loader, val_loader, test_loader = create_dataloaders_lightset(
-            data_root=args.data_root,
-            batch_size=args.batch_size,
-            train_ratio=0.7,
-            val_ratio=0.15,
-            num_workers=0,
-            normalize_probes=True,
-        )
-        loader = {"train": train_loader, "val": val_loader, "test": test_loader}[args.split]
+        loader = _build_loader(0)
         run_eval(loader)
 
-    mae = sum_abs / max(1, count)
-    rmse = (sum_sq / max(1, count)) ** 0.5
+    denom = float(max(1, count))
+    mae = float((sum_abs / denom).item())
+    rmse = float(torch.sqrt(sum_sq / denom).item())
 
     out_path = Path(args.output) if args.output else ckpt_path.parent / "eval.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)

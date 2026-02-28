@@ -39,6 +39,8 @@ class LightSetDataset(Dataset):
         if not data_path.exists():
             raise FileNotFoundError(f"Data file not found: {data_path}")
 
+        # TODO(perf): train/val/test 会各自实例化并重复 np.load 同一大文件。
+        # 可考虑共享内存映射（mmap_mode）或上层复用已加载数组，降低启动与内存压力。
         data = np.load(data_path, allow_pickle=True)
         self.tensor = data["tensor"]  # [P, M, 27]
         self.probe_positions = data["probe_positions"]  # [P, 3]
@@ -116,6 +118,8 @@ class LightSetDataset(Dataset):
         light_mask = self.light_mask_subset[config_idx]
         sh_coeffs = self.tensor_subset[probe_idx, config_idx, :]
 
+        # TODO(perf): 每个样本都执行 from_numpy(...).float()，会产生大量小对象转换开销。
+        # 可考虑在初始化阶段预构建 torch tensor（或使用自定义 collate 批量转换）。
         sample = {
             "probe_position": torch.from_numpy(probe_pos).float(),
             "light_params": torch.from_numpy(light_params).float(),
@@ -164,6 +168,8 @@ def create_dataloaders_lightset(
         normalize_probes=normalize_probes,
     )
 
+    # TODO(perf): 可按平台/任务调优 persistent_workers、prefetch_factor、pin_memory_device。
+    # 当前仅 pin_memory=True，仍有进一步提升输入管线吞吐空间。
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)

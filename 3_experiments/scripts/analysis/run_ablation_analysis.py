@@ -155,6 +155,8 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, float]:
                 mask = None
             preds = model(positions, params, top_k=args.top_k, light_mask=mask)
             preds_eval, targets_eval = adapter.inverse_targets(preds, targets)
+            # TODO(perf): 这里每 batch 都做 GPU->CPU->NumPy 回拷并散写，
+            # 在大数据集分析时同步与内存写入开销明显，可考虑纯 torch 聚合后再一次性搬运。
             pred_np = preds_eval.detach().cpu().numpy()
             gt_np = targets_eval.detach().cpu().numpy()
             probe_idx = batch["probe_idx"].cpu().numpy().astype(int)
@@ -173,6 +175,8 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, float]:
 
     # Near/Open groups
     probe_positions = dataset.probe_positions
+    # TODO(perf): 逐 probe Python 循环计算距离，probe 数量上来会变慢；
+    # 可向量化 AABB 距离计算（NumPy 广播或 torch）以提升分析脚本速度。
     dist = np.array([_nearest_aabb_distance(p, obstacles) for p in probe_positions], dtype=np.float32)
     near_mask = dist < args.near_threshold
     near_err = err[near_mask]
@@ -197,6 +201,7 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, float]:
     l0_gt = _compute_l0_luma(gt_tensor)
     neighbors, dist_k = _pairwise_knn(probe_positions, args.k_neighbors)
     grad_errors = []
+    # TODO(perf): 按配置循环计算梯度误差可进一步向量化，减少 Python 循环开销。
     for m in range(M):
         g_pred = _gradient_magnitude(l0_pred[:, m], neighbors, dist_k)
         g_gt = _gradient_magnitude(l0_gt[:, m], neighbors, dist_k)

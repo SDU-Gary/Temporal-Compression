@@ -15,6 +15,8 @@ This model is schema-agnostic: it only depends on descriptor dimension and mask.
 
 from __future__ import annotations
 
+from typing import Tuple
+
 import torch
 import torch.nn as nn
 
@@ -181,11 +183,13 @@ class GaussianPhysicsCompressionUnified(nn.Module):
             nn.init.zeros_(layer.weight)
             nn.init.zeros_(layer.bias)
 
-    def compute_gaussian_weights(self, positions: torch.Tensor, top_k: int = 3):
+    def compute_gaussian_routing(self, positions: torch.Tensor, top_k: int = 3) -> Tuple[torch.Tensor, torch.Tensor]:
         B = positions.shape[0]
         mu_expanded = self.mu.unsqueeze(0)
         pos_expanded = positions.unsqueeze(1)
-        distances = torch.norm(mu_expanded - pos_expanded, dim=-1)
+        # NOTE: 计算平方距离避免开根号，保持数值稳定性和效率。
+        diff_all = mu_expanded - pos_expanded
+        distances = torch.sum(diff_all * diff_all, dim=-1)
 
         topk_values, topk_indices = torch.topk(
             distances, k=min(top_k, self.K), largest=False, dim=-1
@@ -202,38 +206,40 @@ class GaussianPhysicsCompressionUnified(nn.Module):
 
         return weights, topk_indices
 
-    def forward(
+    def compute_gaussian_weights(self, positions: torch.Tensor, top_k: int = 3):
+        return self.compute_gaussian_routing(positions, top_k)
+
+    def forward_with_routing(
         self,
-        positions: torch.Tensor,
+        routing: Tuple[torch.Tensor, torch.Tensor],
         light_params: torch.Tensor,
-        top_k: int = 3,
         light_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        gaussian_weights, topk_indices = routing
+
         # 1) Encode light set
         z = self.light_encoder(light_params, light_mask)  # [B, embed_dim]
 
-        # 2) Compute Gaussian weights
-        gaussian_weights, topk_indices = self.compute_gaussian_weights(positions, top_k)
-
-        # 3) Select parameters
+        # 2) Select parameters
         selected_U = self.U[topk_indices]  # [B, K', sh_dim, rank]
         selected_coeffs = self.coeffs[topk_indices]  # [B, K', rank, embed_dim]
         selected_U_l0 = self.U_l0[topk_indices]  # [B, K', 3, rank]
         selected_coeffs_l0 = self.coeffs_l0[topk_indices]  # [B, K', rank, embed_dim]
 
-        # 4) Compute rank weights
+        # 3) Compute rank weights
         # time_weights: [B, K', rank]
+        # TODO(perf): 这里与后续多次 einsum 是主要算子热点，适合优先尝试 torch.compile。
         time_weights = torch.einsum('bkrl,bl->bkr', selected_coeffs, z)
         time_weights_l0 = torch.einsum('bkrl,bl->bkr', selected_coeffs_l0, z)
 
-        # 5) Dynamic basis modulation (FiLM)
+        # 4) Dynamic basis modulation (FiLM)
         if self.enable_film:
             gamma = self.gamma(z).view(-1, 1, 1, self.rank)
             beta = self.beta(z).view(-1, 1, 1, self.rank)
             selected_U = selected_U * (1.0 + gamma) + beta
             selected_U_l0 = selected_U_l0 * (1.0 + gamma) + beta
 
-        # 6) SH contributions and sum
+        # 5) SH contributions and sum
         sh_contrib = torch.einsum('bkdr,bkr->bkd', selected_U, time_weights)
         sh_pred = torch.einsum('bk,bkd->bd', gaussian_weights, sh_contrib)
 
@@ -243,12 +249,23 @@ class GaussianPhysicsCompressionUnified(nn.Module):
         l0_pred = torch.nn.functional.softplus(l0_pred)
 
         if self.sh_dim >= 27:
+            # TODO(perf): clone + 三次列写回会产生额外内存流量；可考虑拼接式构造避免 copy。
             sh_pred = sh_pred.clone()
             sh_pred[:, 0] = l0_pred[:, 0]
             sh_pred[:, 9] = l0_pred[:, 1]
             sh_pred[:, 18] = l0_pred[:, 2]
 
         return sh_pred
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        light_params: torch.Tensor,
+        top_k: int = 3,
+        light_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        routing = self.compute_gaussian_routing(positions, top_k)
+        return self.forward_with_routing(routing, light_params, light_mask)
 
     def set_film_enabled(self, enabled: bool) -> None:
         self.enable_film = enabled

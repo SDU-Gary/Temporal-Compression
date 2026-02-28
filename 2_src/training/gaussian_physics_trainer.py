@@ -34,6 +34,8 @@ class BatchAdapter:
     def unpack(
         self, batch: Dict[str, torch.Tensor], device: torch.device
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # TODO(perf): 这里的 .to(device) 当前未使用 non_blocking=True。
+        # 在 DataLoader(pin_memory=True) 配合下可考虑 non_blocking 传输，降低 H2D 拷贝等待。
         positions = batch[self.positions_key].to(device)
         params = batch[self.params_key].to(device)
         targets = batch[self.target_key].to(device)
@@ -94,6 +96,8 @@ class GaussianPhysicsTrainer:
         enable_weighted_sh_loss: bool = False,
         sh_loss_weights: Optional[list[float]] = None,
         sh_weight_mode: str = "basis",
+        compute_img_metrics_in_val: bool = False,
+        compute_superposition_in_val: bool = False,
         rerun_logger=None,  # Optional RerunLogger instance
         show_progress: bool = True,
     ):
@@ -119,6 +123,8 @@ class GaussianPhysicsTrainer:
         self.image_loss_space = str(image_loss_space)
         self.enable_weighted_sh_loss = bool(enable_weighted_sh_loss)
         self.sh_weight_mode = str(sh_weight_mode)
+        self.compute_img_metrics_in_val = bool(compute_img_metrics_in_val)
+        self.compute_superposition_in_val = bool(compute_superposition_in_val)
         self.rerun_logger = rerun_logger
         self.show_progress = show_progress
         self._progress_prefix = ""
@@ -207,6 +213,8 @@ class GaussianPhysicsTrainer:
             return torch.tensor(0.0, device=self.device)
 
         neighbor_pos_flat = neighbor_pos.reshape(B * K, -1)
+        # TODO(perf): 这里会将 params/mask 扩展为 [B*K, ...]，邻居数大时显存与带宽开销明显。
+        # 可考虑低频计算、采样邻居或重用同一 probe 的局部结果，减少重复前向。
         params_flat = params[:, None, ...].expand(B, K, *params.shape[1:]).reshape(B * K, *params.shape[1:])
         if mask is not None:
             mask_flat = mask[:, None, ...].expand(B, K, *mask.shape[1:]).reshape(B * K, *mask.shape[1:])
@@ -218,8 +226,38 @@ class GaussianPhysicsTrainer:
         preds_self = preds[:, None, :].expand(B, K, -1)
         return torch.mean(torch.abs(preds_self - preds_neighbor))
 
-    def _forward(self, positions: torch.Tensor, params: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def _compute_routing(
+        self,
+        positions: torch.Tensor,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        if hasattr(self.model, "compute_gaussian_routing"):
+            return self.model.compute_gaussian_routing(positions, top_k=self.top_k)
+        return None
+
+    def _select_routing(
+        self,
+        routing: Optional[tuple[torch.Tensor, torch.Tensor]],
+        index: torch.Tensor,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        if routing is None:
+            return None
+        weights, topk_indices = routing
+        return weights[index], topk_indices[index]
+
+    def _forward(
+        self,
+        positions: torch.Tensor,
+        params: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        routing: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
         """Forward wrapper that handles optional light masks."""
+        if routing is not None and hasattr(self.model, "forward_with_routing"):
+            try:
+                return self.model.forward_with_routing(routing, params, light_mask=mask)
+            except TypeError:
+                return self.model.forward_with_routing(routing, params)
+
         if mask is None:
             return self.model(positions, params, top_k=self.top_k)
         try:
@@ -335,6 +373,7 @@ class GaussianPhysicsTrainer:
         params: torch.Tensor,
         mask: Optional[torch.Tensor],
         preds_full: torch.Tensor,
+        routing_full: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Compute superposition linearity loss by splitting light sets.
 
@@ -365,9 +404,19 @@ class GaussianPhysicsTrainer:
         mask_a_v = mask_a[valid]
         mask_b_v = mask_b[valid]
         preds_full_v = preds_full[valid]
+        routing_v = self._select_routing(routing_full, valid) if routing_full is not None else None
 
-        preds_a = self._forward(positions_v, params_v, mask_a_v)
-        preds_b = self._forward(positions_v, params_v, mask_b_v)
+        # 将 A/B 两路前向合并为一次批量前向，减少重复调度开销。
+        positions_cat = torch.cat([positions_v, positions_v], dim=0)
+        params_cat = torch.cat([params_v, params_v], dim=0)
+        mask_cat = torch.cat([mask_a_v, mask_b_v], dim=0)
+        routing_cat = None
+        if routing_v is not None:
+            rw, ri = routing_v
+            routing_cat = (torch.cat([rw, rw], dim=0), torch.cat([ri, ri], dim=0))
+
+        preds_cat = self._forward(positions_cat, params_cat, mask_cat, routing=routing_cat)
+        preds_a, preds_b = torch.chunk(preds_cat, 2, dim=0)
 
         if self.adapter.target_inverse is not None:
             preds_full_v = self.adapter.target_inverse(preds_full_v)
@@ -381,6 +430,7 @@ class GaussianPhysicsTrainer:
         positions: torch.Tensor,
         params: torch.Tensor,
         mask: Optional[torch.Tensor],
+        routing_full: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """On-the-fly linearity augmentation using pairs of single-light samples."""
         if self.linearity_weight <= 0 or self.linearity_aug_pairs <= 0:
@@ -405,40 +455,56 @@ class GaussianPhysicsTrainer:
         pairs = perm[: 2 * num_pairs].view(num_pairs, 2)
 
         total = 0.0
-        for i, j in pairs:
-            pos = positions[i : i + 1]
-            params_a = params[i : i + 1]
-            params_b = params[j : j + 1]
-            mask_a = mask[i : i + 1]
-            mask_b = mask[j : j + 1]
+        # 按 pair 批量化构造并一次性前向，避免 Python 逐 pair 循环。
+        idx_i = pairs[:, 0]
+        idx_j = pairs[:, 1]
 
-            # Extract single light descriptors
-            idx_a = torch.argmax(mask_a, dim=-1)
-            idx_b = torch.argmax(mask_b, dim=-1)
-            light_a = params_a[0, idx_a]
-            light_b = params_b[0, idx_b]
+        pos = positions[idx_i]
+        params_a = params[idx_i]
+        params_b = params[idx_j]
+        mask_a = mask[idx_i]
+        mask_b = mask[idx_j]
 
-            # Build combined params (slots 0 and 1)
-            B, N, D = params_a.shape
-            combined = torch.zeros((B, N, D), device=params.device, dtype=params.dtype)
-            combined_mask = torch.zeros((B, N), device=params.device, dtype=mask.dtype)
-            combined[0, 0] = light_a
-            combined[0, 1] = light_b
-            combined_mask[0, 0] = 1.0
-            combined_mask[0, 1] = 1.0
+        # Extract single light descriptors
+        pair_ids = torch.arange(num_pairs, device=positions.device)
+        idx_a = torch.argmax(mask_a, dim=-1)
+        idx_b = torch.argmax(mask_b, dim=-1)
+        light_a = params_a[pair_ids, idx_a]
+        light_b = params_b[pair_ids, idx_b]
 
-            pred_a = self._forward(pos, params_a, mask_a)
-            pred_b = self._forward(pos, params_b, mask_b)
-            pred_ab = self._forward(pos, combined, combined_mask)
+        # Build combined params (slots 0 and 1)
+        _, N, D = params_a.shape
+        combined = torch.zeros((num_pairs, N, D), device=params.device, dtype=params.dtype)
+        combined_mask = torch.zeros((num_pairs, N), device=params.device, dtype=mask.dtype)
+        combined[:, 0] = light_a
+        combined[:, 1] = light_b
+        combined_mask[:, 0] = 1.0
+        combined_mask[:, 1] = 1.0
 
-            if self.adapter.target_inverse is not None:
-                pred_a = self.adapter.target_inverse(pred_a)
-                pred_b = self.adapter.target_inverse(pred_b)
-                pred_ab = self.adapter.target_inverse(pred_ab)
+        positions_cat = torch.cat([pos, pos, pos], dim=0)
+        params_cat = torch.cat([params_a, params_b, combined], dim=0)
+        mask_cat = torch.cat([mask_a, mask_b, combined_mask], dim=0)
 
-            total += torch.mean(torch.abs(pred_ab - (pred_a + pred_b)))
+        routing_cat = None
+        if routing_full is not None:
+            rw, ri = routing_full
+            rw_p = rw[idx_i]
+            ri_p = ri[idx_i]
+            routing_cat = (
+                torch.cat([rw_p, rw_p, rw_p], dim=0),
+                torch.cat([ri_p, ri_p, ri_p], dim=0),
+            )
 
-        return total / num_pairs
+        pred_cat = self._forward(positions_cat, params_cat, mask_cat, routing=routing_cat)
+        pred_a, pred_b, pred_ab = torch.chunk(pred_cat, 3, dim=0)
+
+        if self.adapter.target_inverse is not None:
+            pred_a = self.adapter.target_inverse(pred_a)
+            pred_b = self.adapter.target_inverse(pred_b)
+            pred_ab = self.adapter.target_inverse(pred_ab)
+
+        total = torch.mean(torch.abs(pred_ab - (pred_a + pred_b)))
+        return total
 
     def _compute_grad_norms(self, prefix: str = "") -> Dict[str, float]:
         """Compute gradient norms for all parameter groups.
@@ -451,6 +517,8 @@ class GaussianPhysicsTrainer:
         """
         grad_norms = {}
 
+        # TODO(perf): 该函数每 batch 调用两次（pre/post clip），且包含多次 .item()。
+        # .item() 会触发 CPU-GPU 同步；若追求吞吐，可降低记录频率或按 epoch 聚合。
         # Compute total gradient norm
         total_norm = 0.0
         for p in self.model.parameters():
@@ -521,14 +589,20 @@ class GaussianPhysicsTrainer:
                 mask = None
 
             self.optimizer.zero_grad()
-            preds = self._forward(positions, params, mask)
+            routing = self._compute_routing(positions)
+            # TODO(perf): 一个训练 step 里除主前向外，还可能触发 image/temporal/linearity/spatial 等额外前向。
+            # 当正则全部开启时，单 step 的有效前向次数显著增加，是当前主要计算热点。
+            preds = self._forward(positions, params, mask, routing=routing)
 
             loss_recon = self._recon_loss(preds, targets)
-            preds_eval, targets_eval = self.adapter.inverse_targets(preds, targets)
+            preds_eval, targets_eval = preds, targets
+            if self.adapter.target_inverse is not None:
+                preds_eval, targets_eval = self.adapter.inverse_targets(preds, targets)
+
             loss_image = self._compute_image_loss(preds_eval, targets_eval)
             loss_temporal = self._compute_temporal_loss()
-            loss_linearity = self._compute_linearity_loss(positions, params, mask, preds)
-            loss_linearity_aug = self._compute_linearity_aug_loss(positions, params, mask)
+            loss_linearity = self._compute_linearity_loss(positions, params, mask, preds, routing_full=routing)
+            loss_linearity_aug = self._compute_linearity_aug_loss(positions, params, mask, routing_full=routing)
             probe_idx = batch.get("probe_idx") if isinstance(batch, dict) else None
             loss_spatial = self._compute_spatial_loss(preds, params, mask, probe_idx)
 
@@ -609,12 +683,13 @@ class GaussianPhysicsTrainer:
             sums["rmse"] += rmse
             sums["charbonnier"] += charbonnier
 
-            img_metrics = self._compute_image_metrics(preds_eval, targets_eval)
-            sums["img_mae"] += img_metrics["img_mae"]
-            sums["img_rmse"] += img_metrics["img_rmse"]
-            sums["img_psnr"] += img_metrics["img_psnr"]
+            if self.compute_img_metrics_in_val:
+                img_metrics = self._compute_image_metrics(preds_eval, targets_eval)
+                sums["img_mae"] += img_metrics["img_mae"]
+                sums["img_rmse"] += img_metrics["img_rmse"]
+                sums["img_psnr"] += img_metrics["img_psnr"]
 
-            if self.linearity_weight > 0:
+            if self.compute_superposition_in_val and self.linearity_weight > 0:
                 sup_err = self._compute_linearity_loss(positions, params, mask, preds).item()
                 sums["superposition"] += sup_err
             num_batches += 1

@@ -119,6 +119,8 @@ def _apply_config(args: argparse.Namespace, defaults: argparse.Namespace, cfg: D
         "enable_weighted_sh_loss": training.get("enable_weighted_sh_loss"),
         "sh_loss_weights": training.get("sh_loss_weights"),
         "sh_weight_mode": training.get("sh_weight_mode"),
+        "val_image_metrics": training.get("val_image_metrics"),
+        "val_superposition": training.get("val_superposition"),
         "enable_sh_scaler": training.get("enable_sh_scaler"),
         "sh_scaler_path": training.get("sh_scaler_path"),
         "sh_scaler_max_samples": training.get("sh_scaler_max_samples"),
@@ -322,6 +324,8 @@ def run_training(args: argparse.Namespace) -> None:
         enable_weighted_sh_loss=args.enable_weighted_sh_loss,
         sh_loss_weights=args.sh_loss_weights,
         sh_weight_mode=args.sh_weight_mode,
+        compute_img_metrics_in_val=args.val_image_metrics,
+        compute_superposition_in_val=args.val_superposition,
         rerun_logger=rerun_logger,  # Pass logger to trainer
         show_progress=args.show_progress,
     )
@@ -518,6 +522,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Nine basis weights for weighted SH loss.")
     parser.add_argument("--sh-weight-mode", choices=["basis"], default="basis",
                         help="Weight broadcast mode for SH coefficients.")
+    parser.add_argument("--val-image-metrics", action="store_true",
+                        help="Compute image-space metrics in validation (slower).")
+    parser.add_argument("--no-val-image-metrics", action="store_false", dest="val_image_metrics")
+    parser.set_defaults(val_image_metrics=False)
+    parser.add_argument("--val-superposition", action="store_true",
+                        help="Compute superposition metric in validation (extra forwards).")
+    parser.add_argument("--no-val-superposition", action="store_false", dest="val_superposition")
+    parser.set_defaults(val_superposition=False)
 
     parser.add_argument("--light-dim", type=int, default=None,
                         help="Light descriptor dimension for unified model.")
