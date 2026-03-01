@@ -103,6 +103,7 @@ def _apply_config(args: argparse.Namespace, defaults: argparse.Namespace, cfg: D
         "weight_decay": training.get("weight_decay"),
         "lr_scheduler": training.get("lr_scheduler"),
         "lr_min": training.get("lr_min"),
+        "warmup_epochs": training.get("warmup_epochs"),
         "recon_loss": training.get("recon_loss"),
         "charbonnier_eps": training.get("charbonnier_eps"),
         "lambda_temporal": training.get("lambda_temporal"),
@@ -211,6 +212,7 @@ def build_variant(
 def run_training(args: argparse.Namespace) -> None:
     _lazy_imports()
     device = _device_from_arg(args.device)
+    warmup_epochs = int(getattr(args, "warmup_epochs", 0))
     output_dir = Path(args.output_dir) if args.output_dir else None
 
     if output_dir is None:
@@ -306,6 +308,7 @@ def run_training(args: argparse.Namespace) -> None:
         weight_decay=args.weight_decay,
         lr_scheduler=args.lr_scheduler,
         lr_min=args.lr_min,
+        warmup_epochs=warmup_epochs,
         recon_loss=args.recon_loss,
         charbonnier_eps=args.charbonnier_eps,
         temporal_weight=args.lambda_temporal,
@@ -353,6 +356,7 @@ def run_training(args: argparse.Namespace) -> None:
         "training": {
             "batch_size": int(args.batch_size),
             "epochs": int(args.epochs),
+            "warmup_epochs": warmup_epochs,
             "recon_loss": args.recon_loss,
             "lambda_temporal": float(args.lambda_temporal),
             "lambda_linearity": float(args.lambda_linearity),
@@ -423,6 +427,7 @@ def run_training(args: argparse.Namespace) -> None:
             "weight_decay": args.weight_decay,
             "lr_scheduler": args.lr_scheduler,
             "lr_min": args.lr_min,
+            "warmup_epochs": warmup_epochs,
             "recon_loss": args.recon_loss,
             "charbonnier_eps": args.charbonnier_eps,
             "lambda_temporal": args.lambda_temporal,
@@ -492,6 +497,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--lr-scheduler", choices=["none", "cosine", "plateau"], default="none")
     parser.add_argument("--lr-min", type=float, default=1e-4)
+    parser.add_argument("--warmup-epochs", type=int, default=0,
+                        help="Linear warmup epochs before scheduler stepping.")
     parser.add_argument("--recon-loss", choices=["mse", "l1", "charbonnier"], default=None)
     parser.add_argument("--charbonnier-eps", type=float, default=1e-3)
     parser.add_argument("--lambda-temporal", type=float, default=None)

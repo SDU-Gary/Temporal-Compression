@@ -46,6 +46,7 @@ def main() -> None:
     from models.gaussian_physics_unified import GaussianPhysicsCompressionUnified
     from training.gaussian_physics_trainer import BatchAdapter
     from torch.utils.data import DataLoader
+    from utils.unified_metrics import compute_sh_metrics
 
     device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -144,8 +145,12 @@ def main() -> None:
     sum_abs = torch.zeros((), device=device, dtype=torch.float64)
     sum_sq = torch.zeros((), device=device, dtype=torch.float64)
     count = 0
+    sh_psnr_sum = 0.0
+    sh_ssim_sum = 0.0
+    sh_batches = 0
+
     def run_eval(active_loader) -> None:
-        nonlocal sum_abs, sum_sq, count
+        nonlocal sum_abs, sum_sq, count, sh_psnr_sum, sh_ssim_sum, sh_batches
         # TODO(perf): 评估阶段可考虑 torch.inference_mode()，相较 no_grad 有更低的 autograd 开销。
         with torch.inference_mode():
             for batch in active_loader:
@@ -156,6 +161,11 @@ def main() -> None:
                 sum_abs += torch.sum(torch.abs(diff), dtype=torch.float64)
                 sum_sq += torch.sum(diff * diff, dtype=torch.float64)
                 count += int(diff.numel())
+
+                sh_metrics = compute_sh_metrics(targets_eval, preds_eval, max_i=1.0)
+                sh_psnr_sum += float(sh_metrics["sh_psnr"])
+                sh_ssim_sum += float(sh_metrics["sh_ssim"])
+                sh_batches += 1
 
     try:
         run_eval(loader)
@@ -169,6 +179,8 @@ def main() -> None:
     denom = float(max(1, count))
     mae = float((sum_abs / denom).item())
     rmse = float(torch.sqrt(sum_sq / denom).item())
+    sh_psnr = sh_psnr_sum / max(1, sh_batches)
+    sh_ssim = sh_ssim_sum / max(1, sh_batches)
 
     out_path = Path(args.output) if args.output else ckpt_path.parent / "eval.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -179,6 +191,8 @@ def main() -> None:
         "device": str(device),
         "mae": mae,
         "rmse": rmse,
+        "sh_psnr": sh_psnr,
+        "sh_ssim": sh_ssim,
         "numel": count,
         "K": K,
         "rank": rank,
@@ -195,7 +209,7 @@ def main() -> None:
     }
     out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(f"Wrote: {out_path}")
-    print(f"MAE={mae:.6f} RMSE={rmse:.6f} (numel={count})")
+    print(f"MAE={mae:.6f} RMSE={rmse:.6f} SH-PSNR={sh_psnr:.4f} SH-SSIM={sh_ssim:.6f} (numel={count})")
 
 
 if __name__ == "__main__":  # pragma: no cover

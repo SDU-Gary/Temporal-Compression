@@ -16,6 +16,25 @@ from typing import Any, Dict, List, Sequence, Tuple
 import numpy as np
 
 
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "2_src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from utils.unified_metrics import (
+    compute_benchmark_metrics,
+    compute_benchmark_srgb_metrics,
+    compute_fixed_tm_metrics,
+    compute_hdr_radiance_metrics,
+    compute_linear_joint_metrics,
+    compute_pair_metrics,
+    compute_real_render_hdr_scene_metrics,
+    compute_sh_metrics,
+    srgb_encode,
+    tone_map_reinhard,
+)
+
+
 def _compute_bounds(metadata: Any, probes: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     if isinstance(metadata, dict) and "bounds" in metadata:
         b = metadata["bounds"]
@@ -104,78 +123,12 @@ def _fps_from_ms(ms_mean: float) -> float:
     return float(1000.0 / ms_mean)
 
 
-def _tone_map_reinhard(image: np.ndarray) -> np.ndarray:
-    x = np.maximum(image, 0.0)
-    return x / (1.0 + x)
-
-
-def _srgb_encode(image: np.ndarray) -> np.ndarray:
-    img = np.maximum(image, 0.0)
-    threshold = 0.0031308
-    low = 12.92 * img
-    high = 1.055 * np.power(img, 1.0 / 2.4) - 0.055
-    return np.where(img <= threshold, low, high)
-
-
-def _gaussian_kernel(size: int = 11, sigma: float = 1.5) -> np.ndarray:
-    ax = np.arange(-(size // 2), size // 2 + 1, dtype=np.float64)
-    k = np.exp(-0.5 * (ax / max(sigma, 1e-8)) ** 2)
-    k /= np.sum(k)
-    return k
-
-
-def _conv1d_reflect(arr: np.ndarray, kernel: np.ndarray, axis: int) -> np.ndarray:
-    pad = len(kernel) // 2
-    pad_width = [(0, 0)] * arr.ndim
-    pad_width[axis] = (pad, pad)
-    arr_pad = np.pad(arr, pad_width, mode="reflect")
-    return np.apply_along_axis(lambda m: np.convolve(m, kernel, mode="valid"), axis, arr_pad)
-
-
-def _gaussian_blur_2d_or_3d(arr: np.ndarray, kernel: np.ndarray) -> np.ndarray:
-    out = _conv1d_reflect(arr, kernel, axis=0)
-    out = _conv1d_reflect(out, kernel, axis=1)
-    return out
-
-
-def _compute_psnr(img_gt: np.ndarray, img_pred: np.ndarray) -> float:
-    gt = np.clip(img_gt.astype(np.float64), 0.0, 1.0)
-    pr = np.clip(img_pred.astype(np.float64), 0.0, 1.0)
-    mse = float(np.mean((gt - pr) ** 2))
-    if mse <= 1e-16:
-        return float("inf")
-    return float(10.0 * np.log10(1.0 / mse))
-
-
-def _compute_ssim(img_gt: np.ndarray, img_pred: np.ndarray) -> float:
-    x = np.clip(img_gt.astype(np.float64), 0.0, 1.0)
-    y = np.clip(img_pred.astype(np.float64), 0.0, 1.0)
-
-    kernel = _gaussian_kernel(size=11, sigma=1.5)
-    c1 = (0.01 ** 2)
-    c2 = (0.03 ** 2)
-
-    mu_x = _gaussian_blur_2d_or_3d(x, kernel)
-    mu_y = _gaussian_blur_2d_or_3d(y, kernel)
-
-    sigma_x2 = _gaussian_blur_2d_or_3d(x * x, kernel) - mu_x * mu_x
-    sigma_y2 = _gaussian_blur_2d_or_3d(y * y, kernel) - mu_y * mu_y
-    sigma_xy = _gaussian_blur_2d_or_3d(x * y, kernel) - mu_x * mu_y
-
-    num = (2.0 * mu_x * mu_y + c1) * (2.0 * sigma_xy + c2)
-    den = (mu_x * mu_x + mu_y * mu_y + c1) * (sigma_x2 + sigma_y2 + c2)
-    ssim_map = num / np.maximum(den, 1e-12)
-    return float(np.mean(ssim_map))
-
-
 def compute_image_metrics(img_gt: np.ndarray, img_pred: np.ndarray) -> Dict[str, float]:
-    gt = np.clip(img_gt.astype(np.float64), 0.0, 1.0)
-    pr = np.clip(img_pred.astype(np.float64), 0.0, 1.0)
-    mae = float(np.mean(np.abs(gt - pr)))
+    metrics = compute_pair_metrics(img_gt, img_pred, max_i=1.0, clip_unit=True, ssim_mode="image")
     return {
-        "psnr": _compute_psnr(gt, pr),
-        "ssim": _compute_ssim(gt, pr),
-        "mae": mae,
+        "psnr": float(metrics["psnr"]),
+        "ssim": float(metrics["ssim"]),
+        "mae": float(metrics["mae"]),
     }
 
 
@@ -619,6 +572,7 @@ def main() -> None:
         }
 
         rendered_images: Dict[str, np.ndarray] = {}
+        route_probe_sh: Dict[str, np.ndarray] = {}
 
         for route in routes:
             t_src0 = time.perf_counter()
@@ -654,6 +608,9 @@ def main() -> None:
                 axis_probe[:, 9 + c] = strength
                 axis_probe[:, 18 + c] = strength
                 sh_probe = axis_probe
+
+            if need_image_metrics_this_frame:
+                route_probe_sh[route] = np.asarray(sh_probe, dtype=np.float32)
 
             t_src1 = time.perf_counter()
 
@@ -775,24 +732,44 @@ def main() -> None:
                 if set(routes) == {"gt", "model"} and "gt" in rendered_images and "model" in rendered_images and need_image_metrics_this_frame:
                     gt_linear_raw = rendered_images["gt"]
                     model_linear_raw = rendered_images["model"]
-                    gt_linear = gt_linear_raw * metric_align_scale["gt"]
-                    model_linear = model_linear_raw * metric_align_scale["model"]
+                    bench_metric = compute_benchmark_metrics(
+                        gt_linear_raw,
+                        model_linear_raw,
+                        metric_align_scale_gt=float(metric_align_scale["gt"]),
+                        metric_align_scale_pred=float(metric_align_scale["model"]),
+                        max_i=1.0,
+                    )
 
-                    gt_img = _srgb_encode(_tone_map_reinhard(gt_linear))
-                    model_img = _srgb_encode(_tone_map_reinhard(model_linear))
-                    metric_srgb = compute_image_metrics(gt_img, model_img)
+                    gt_linear = gt_linear_raw * float(metric_align_scale["gt"])
+                    model_linear = model_linear_raw * float(metric_align_scale["model"])
+                    gt_img = srgb_encode(tone_map_reinhard(gt_linear))
+                    model_img = srgb_encode(tone_map_reinhard(model_linear))
 
-                    linear_scale = float(max(1e-6, float(np.max(gt_linear)), float(np.max(model_linear))))
-                    gt_linear_n = np.clip(gt_linear / linear_scale, 0.0, 1.0)
-                    model_linear_n = np.clip(model_linear / linear_scale, 0.0, 1.0)
-                    metric_linear = compute_image_metrics(gt_linear_n, model_linear_n)
+                    sh_metric = compute_sh_metrics(route_probe_sh["gt"], route_probe_sh["model"], max_i=1.0)
+                    hdr_metric = compute_hdr_radiance_metrics(gt_linear_raw, model_linear_raw, max_i=1.0)
+                    fixedtm_metric = compute_fixed_tm_metrics(gt_linear_raw, model_linear_raw, exposure=1.0, max_i=1.0)
+                    real_hdr_metric = compute_real_render_hdr_scene_metrics(gt_linear_raw, model_linear_raw, max_i=1.0)
 
                     rec.update({
-                        "psnr": float(metric_srgb["psnr"]),
-                        "ssim": float(metric_srgb["ssim"]),
-                        "linear_psnr": float(metric_linear["psnr"]),
-                        "linear_ssim": float(metric_linear["ssim"]),
-                        "linear_scale": linear_scale,
+                        "sh_psnr": float(sh_metric["sh_psnr"]),
+                        "sh_ssim": float(sh_metric["sh_ssim"]),
+                        "sh_mae": float(sh_metric["sh_mae"]),
+                        "sh_rmse": float(sh_metric["sh_rmse"]),
+                        "hdr_psnr": float(hdr_metric["hdr_psnr"]),
+                        "hdr_ssim": float(hdr_metric["hdr_ssim"]),
+                        "fixedtm_psnr": float(fixedtm_metric["fixedtm_psnr"]),
+                        "fixedtm_ssim": float(fixedtm_metric["fixedtm_ssim"]),
+                        "real_render_hdr_psnr": float(real_hdr_metric["real_render_hdr_psnr"]),
+                        "real_render_hdr_ssim": float(real_hdr_metric["real_render_hdr_ssim"]),
+                        "benchmark_psnr": float(bench_metric["benchmark_psnr"]),
+                        "benchmark_ssim": float(bench_metric["benchmark_ssim"]),
+                        "benchmark_linear_psnr": float(bench_metric["benchmark_linear_psnr"]),
+                        "benchmark_linear_ssim": float(bench_metric["benchmark_linear_ssim"]),
+                        "psnr": float(bench_metric["benchmark_psnr"]),
+                        "ssim": float(bench_metric["benchmark_ssim"]),
+                        "linear_psnr": float(bench_metric["benchmark_linear_psnr"]),
+                        "linear_ssim": float(bench_metric["benchmark_linear_ssim"]),
+                        "linear_scale": float(bench_metric["benchmark_linear_scale"]),
                         "metric_align_scale_gt": float(metric_align_scale["gt"]),
                         "metric_align_scale_model": float(metric_align_scale["model"]),
                         "gt_neg_ratio": float(np.mean(gt_linear_raw < 0.0)),
@@ -806,29 +783,26 @@ def main() -> None:
                         gt_roi = _crop_roi(gt_img, roi)
                         model_roi = _crop_roi(model_img, roi)
                         roi_metric = compute_image_metrics(gt_roi, model_roi)
-                        gt_linear_roi = _crop_roi(gt_linear_n, roi)
-                        model_linear_roi = _crop_roi(model_linear_n, roi)
-                        roi_metric_linear = compute_image_metrics(gt_linear_roi, model_linear_roi)
+                        gt_linear_roi_raw = _crop_roi(gt_linear, roi)
+                        model_linear_roi_raw = _crop_roi(model_linear, roi)
+                        roi_linear = compute_linear_joint_metrics(gt_linear_roi_raw, model_linear_roi_raw, max_i=1.0)
                         rec["roi_psnr"] = float(roi_metric["psnr"])
                         rec["roi_ssim"] = float(roi_metric["ssim"])
-                        rec["roi_linear_psnr"] = float(roi_metric_linear["psnr"])
-                        rec["roi_linear_ssim"] = float(roi_metric_linear["ssim"])
+                        rec["roi_linear_psnr"] = float(roi_linear["linear_psnr"])
+                        rec["roi_linear_ssim"] = float(roi_linear["linear_ssim"])
 
                 if need_pt_metrics_this_frame and "pt" in rendered_images:
                     pt_linear = rendered_images["pt"]
-                    pt_srgb = _srgb_encode(_tone_map_reinhard(pt_linear))
+                    pt_srgb = srgb_encode(tone_map_reinhard(pt_linear))
                     pt_metric_count = 0
                     for route_name in routes:
                         if route_name not in rendered_images:
                             continue
                         route_linear_raw = rendered_images[route_name]
                         route_linear = route_linear_raw * float(metric_align_scale.get(route_name, 1.0))
-                        route_srgb = _srgb_encode(_tone_map_reinhard(route_linear))
-                        m_pt_srgb = compute_image_metrics(pt_srgb, route_srgb)
-                        pt_scale = float(max(1e-6, float(np.max(pt_linear)), float(np.max(route_linear))))
-                        pt_linear_n = np.clip(pt_linear / pt_scale, 0.0, 1.0)
-                        route_linear_n = np.clip(route_linear / pt_scale, 0.0, 1.0)
-                        m_pt_linear = compute_image_metrics(pt_linear_n, route_linear_n)
+                        route_srgb = srgb_encode(tone_map_reinhard(route_linear))
+                        m_pt_srgb = compute_benchmark_srgb_metrics(pt_srgb, route_srgb, max_i=1.0)
+                        m_pt_linear = compute_linear_joint_metrics(pt_linear, route_linear, max_i=1.0)
 
                         taskh_num = float(np.sum(pt_linear * route_linear))
                         taskh_den_route = float(np.sum(route_linear * route_linear))
@@ -839,9 +813,9 @@ def main() -> None:
                         rec[f"pt_psnr_{route_name}"] = float(m_pt_srgb["psnr"])
                         rec[f"pt_ssim_{route_name}"] = float(m_pt_srgb["ssim"])
                         rec[f"pt_mae_{route_name}"] = float(m_pt_srgb["mae"])
-                        rec[f"pt_linear_psnr_{route_name}"] = float(m_pt_linear["psnr"])
-                        rec[f"pt_linear_ssim_{route_name}"] = float(m_pt_linear["ssim"])
-                        rec[f"pt_linear_mae_{route_name}"] = float(m_pt_linear["mae"])
+                        rec[f"pt_linear_psnr_{route_name}"] = float(m_pt_linear["linear_psnr"])
+                        rec[f"pt_linear_ssim_{route_name}"] = float(m_pt_linear["linear_ssim"])
+                        rec[f"pt_linear_mae_{route_name}"] = float(m_pt_linear["linear_mae"])
                         rec[f"taskh_scale_{route_name}_to_pt"] = float(taskh_scale_route_to_pt)
                         rec[f"taskh_scale_pt_to_{route_name}"] = float(taskh_scale_pt_to_route)
                         rec[f"metric_align_scale_{route_name}"] = float(metric_align_scale.get(route_name, 1.0))
@@ -869,8 +843,8 @@ def main() -> None:
                     if "pt" in rendered_images:
                         payload["pt_linear"] = rendered_images["pt"].astype(np.float32)
                     if "gt" in rendered_images and "model" in rendered_images:
-                        gt_img = _srgb_encode(_tone_map_reinhard(rendered_images["gt"]))
-                        model_img = _srgb_encode(_tone_map_reinhard(rendered_images["model"]))
+                        gt_img = srgb_encode(tone_map_reinhard(rendered_images["gt"]))
+                        model_img = srgb_encode(tone_map_reinhard(rendered_images["model"]))
                         payload["gt_srgb"] = gt_img.astype(np.float32)
                         payload["model_srgb"] = model_img.astype(np.float32)
                         payload["err_srgb"] = np.abs(gt_img - model_img).astype(np.float32)

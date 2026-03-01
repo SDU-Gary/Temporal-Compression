@@ -11,6 +11,8 @@ import torch
 import numpy as np
 from typing import Union, Tuple
 
+from utils.unified_metrics import compute_psnr as _compute_psnr_unified
+
 
 def mse(pred: torch.Tensor, target: torch.Tensor) -> float:
     """Compute Mean Squared Error.
@@ -52,13 +54,7 @@ def psnr(pred: torch.Tensor, target: torch.Tensor, max_val: float = 1.0) -> floa
     Returns:
         psnr: PSNR in dB
     """
-    mse_value = torch.mean((pred - target) ** 2).item()
-
-    if mse_value == 0:
-        return float('inf')
-
-    psnr_value = 10 * np.log10(max_val ** 2 / mse_value)
-    return psnr_value
+    return float(_compute_psnr_unified(target, pred, max_i=max_val, clip_unit=False))
 
 
 def relative_error(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> float:

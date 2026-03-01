@@ -78,6 +78,7 @@ class GaussianPhysicsTrainer:
         weight_decay: float = 0.0,
         lr_scheduler: str = "none",
         lr_min: float = 1e-4,
+        warmup_epochs: int = 0,
         recon_loss: str = "mse",
         charbonnier_eps: float = 1e-3,
         temporal_weight: float = 0.0,
@@ -108,6 +109,8 @@ class GaussianPhysicsTrainer:
         self.charbonnier_eps = charbonnier_eps
         self.lr_scheduler = lr_scheduler
         self.lr_min = lr_min
+        self.warmup_epochs = warmup_epochs
+        self.base_lr = lr
         self.temporal_weight = temporal_weight
         self.temporal_loss_fn = temporal_loss_fn
         self.top_k = top_k
@@ -337,18 +340,22 @@ class GaussianPhysicsTrainer:
         return torch.mean((pred_img - target_img) ** 2)
 
     def _compute_image_metrics(self, pred_sh: torch.Tensor, target_sh: torch.Tensor) -> Dict[str, float]:
+        from utils.unified_metrics import compute_pair_metrics
+
         pred_img = self._render_sh_to_samples(pred_sh)
         target_img = self._render_sh_to_samples(target_sh)
-        diff = pred_img - target_img
-        mae = torch.mean(torch.abs(diff)).item()
-        mse = torch.mean(diff * diff)
-        rmse = torch.sqrt(mse).item()
-        mse_val = mse.item()
-        if mse_val <= 1e-12:
-            psnr = float("inf")
-        else:
-            psnr = float(10.0 * np.log10(1.0 / mse_val))
-        return {"img_mae": mae, "img_rmse": rmse, "img_psnr": psnr}
+        metrics = compute_pair_metrics(
+            target_img,
+            pred_img,
+            max_i=1.0,
+            clip_unit=True,
+            ssim_mode="image",
+        )
+        return {
+            "img_mae": float(metrics["mae"]),
+            "img_rmse": float(metrics["rmse"]),
+            "img_psnr": float(metrics["psnr"]),
+        }
 
     def _recon_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         pred_eval, target_eval = pred, target
@@ -892,9 +899,21 @@ class GaussianPhysicsTrainer:
                     if isinstance(scheduler, ReduceLROnPlateau):
                         scheduler.step(val_metrics.get(best_metric, val_metrics["mae"]))
                     else:
-                        scheduler.step()
+                        # Apply warmup if in warmup phase
+                        if self.warmup_epochs > 0 and epoch < self.warmup_epochs:
+                            warmup_lr = self.base_lr * (epoch + 1) / self.warmup_epochs
+                            for param_group in self.optimizer.param_groups:
+                                param_group['lr'] = warmup_lr
+                        else:
+                            scheduler.step()
             elif scheduler is not None:
-                scheduler.step()
+                # Apply warmup if in warmup phase
+                if self.warmup_epochs > 0 and epoch < self.warmup_epochs:
+                    warmup_lr = self.base_lr * (epoch + 1) / self.warmup_epochs
+                    for param_group in self.optimizer.param_groups:
+                        param_group['lr'] = warmup_lr
+                else:
+                    scheduler.step()
 
             if self.show_progress:
                 self._progress_prefix = ""

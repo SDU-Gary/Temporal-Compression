@@ -536,23 +536,16 @@ def compute_image_metrics(img_gt: np.ndarray, img_pred: np.ndarray) -> dict[str,
     Returns:
         Dictionary with 'psnr' and 'ssim' keys
     """
-    from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+    from .unified_metrics import compute_pair_metrics
 
-    # Ensure images are in correct range
-    img_gt = np.clip(img_gt, 0.0, 1.0)
-    img_pred = np.clip(img_pred, 0.0, 1.0)
-
-    # Compute PSNR
-    psnr = peak_signal_noise_ratio(img_gt, img_pred, data_range=1.0)
-
-    # Compute SSIM
-    ssim = structural_similarity(
-        img_gt, img_pred,
-        channel_axis=2,
-        data_range=1.0
+    metrics = compute_pair_metrics(
+        img_gt,
+        img_pred,
+        max_i=1.0,
+        clip_unit=True,
+        ssim_mode="image",
     )
-
-    return {'psnr': float(psnr), 'ssim': float(ssim)}
+    return {'psnr': float(metrics['psnr']), 'ssim': float(metrics['ssim'])}
 
 
 def create_error_heatmap(img_gt: np.ndarray, img_pred: np.ndarray) -> np.ndarray:
