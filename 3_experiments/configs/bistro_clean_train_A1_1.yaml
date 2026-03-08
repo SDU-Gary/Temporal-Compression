@@ -1,0 +1,155 @@
+experiment:
+  variant: unified_set
+  output_dir: 3_experiments/results/bistro_clean_v2/exp_A1_1_joint_lrs_ema
+  device: cuda
+  seed: 42
+
+data:
+  data_root: 1_data_generation/output/bistro_clean_v2
+  train_ratio: 0.7
+  val_ratio: 0.15
+  batch_size: 512
+  num_workers: 0
+
+model:
+  num_gaussians: 30
+  rank: 8
+  top_k: 3
+  light_dim: 12
+  embed_dim: 32
+  intensity_dim: 3
+  intensity_offset: 1
+  disable_film: false
+
+training:
+  epochs: 2000
+  lr: 1.0e-3
+  weight_decay: 0.0
+  lr_scheduler: cosine
+  lr_min: 1.0e-6
+  warmup_epochs: 50
+  dataloader_timeout_seconds: 120
+  dataloader_prefetch_factor: 2
+  dataloader_persistent_workers: false
+  dataloader_multiprocessing_context: none
+  heartbeat_enabled: true
+  heartbeat_history: true
+
+  recon_loss: charbonnier
+  lambda_temporal: 0.001
+  lambda_linearity: 0.1
+  linearity_aug_pairs: 2
+  enable_sh_scaler: false
+  enable_weighted_sh_loss: false
+  lambda_image: 0.0
+  lambda_routing_balance: 0.02
+  routing_soft_train: true
+  routing_soft_topk: 8
+  routing_temp_start: 1.0
+  routing_temp_end: 0.2
+  routing_temp_anneal_epochs: 320
+
+  ema:
+    enabled: true
+    decay: 0.999
+    eval_on_ema: true
+    save_best_with_ema: true
+
+  oracle_monitor:
+    enabled: true
+    split: test
+    period_epochs: 20
+    lightweight_max_samples: 2048
+    lightweight_sample_seed: 42
+    stage_end_full: true
+    full_max_samples: 0
+    batch_size: 512
+    num_workers: 0
+    timeout_seconds: 240
+    fail_on_timeout: false
+
+  coeff_suite:
+    enabled: true
+    run_after_training: true
+    split: test
+    device: cpu
+    max_samples: 8192
+    sample_seed: 42
+    batch_size: 512
+    num_workers: 0
+    probe_train_ratio: 0.8
+    ridge_alpha: 1.0e-4
+    mlp_hidden: 128
+    mlp_epochs: 30
+    mlp_lr: 1.0e-3
+    mlp_batch_size: 256
+    timeout_seconds: 1800
+    fail_on_timeout: false
+
+  val_profiles:
+    enabled: true
+    best_metric: mae
+    profiles:
+      - name: hard3
+        top_k: 3
+        training_soft_routing: false
+      - name: soft8_t018
+        top_k: 3
+        training_soft_routing: true
+        routing_soft_topk: 8
+        routing_temperature: 0.18
+      - name: soft8_t020
+        top_k: 3
+        training_soft_routing: true
+        routing_soft_topk: 8
+        routing_temperature: 0.20
+      - name: soft8_t022
+        top_k: 3
+        training_soft_routing: true
+        routing_soft_topk: 8
+        routing_temperature: 0.22
+
+  test_compare_profiles:
+    enabled: true
+
+  staged:
+    enabled: true
+    stages:
+      - name: warmup_joint_fast
+        epochs: 800
+        lr: 8.0e-4
+        lr_scheduler: cosine
+        lr_min: 1.0e-6
+        warmup_epochs: 40
+        trainable_groups: [coeff, encoder, film, routing]
+        group_lrs:
+          all: 1.0e-4
+          coeff: 8.0e-4
+          encoder: 8.0e-4
+          film: 8.0e-4
+          routing: 2.0e-4
+        best_metric: mae
+
+      - name: joint_refine
+        epochs: 1200
+        lr: 4.0e-4
+        lr_scheduler: cosine
+        lr_min: 1.0e-6
+        warmup_epochs: 20
+        trainable_groups: [all]
+        group_lrs:
+          all: 1.0e-5
+          coeff: 4.0e-4
+          encoder: 4.0e-4
+          film: 4.0e-4
+          basis: 5.0e-5
+          routing: 1.0e-5
+        best_metric: mae
+
+evaluation:
+  output_dir: 3_experiments/results/bistro_clean_v2/exp_A1_1_joint_lrs_ema/eval
+  checkpoint: 3_experiments/results/bistro_clean_v2/exp_A1_1_joint_lrs_ema/best_model.pt
+  data_root: 1_data_generation/output/bistro_clean_v2
+  rank: 8
+  n_samples: 20
+  probe_idx: 0

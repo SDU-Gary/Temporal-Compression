@@ -202,6 +202,32 @@ def test_train_helpers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         train_script.resolve_data_root(None, str(bad_manifest))
 
 
+def test_resolve_val_profiles_config() -> None:
+    args = SimpleNamespace(
+        top_k=3,
+        _config_obj={
+            "training": {
+                "val_profiles": {
+                    "enabled": True,
+                    "best_metric": "mae",
+                    "profiles": [
+                        {"name": "hard3", "top_k": 3, "training_soft_routing": False},
+                        {"name": "soft8_t020", "top_k": 3, "training_soft_routing": True, "routing_soft_topk": 8, "routing_temperature": 0.2},
+                    ],
+                },
+                "test_compare_profiles": {"enabled": True},
+            }
+        },
+    )
+    cfg = train_script._resolve_val_profiles_config(args)
+    assert cfg["enabled"] is True
+    assert cfg["best_metric"] == "mae"
+    assert cfg["run_test_compare"] is True
+    assert len(cfg["profiles"]) == 2
+    assert cfg["profiles"][0]["name"] == "hard3"
+    assert cfg["profiles"][1]["routing_temperature"] == 0.2
+
+
 def test_build_variant_and_init(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_train_deps(monkeypatch)
     args = _build_args(Path("/tmp"))
@@ -285,6 +311,14 @@ def test_train_parser_defaults_and_apply_variant(monkeypatch: pytest.MonkeyPatch
     args = parser.parse_args(["--variant", "unified_set"])
     train_script.apply_variant_defaults(args)
     assert args.num_gaussians is not None
+
+
+def test_normalize_train_args_fills_missing_fields() -> None:
+    args = SimpleNamespace(variant="unified_set", data_root="/tmp/d")
+    train_script.normalize_train_args(args)
+    assert args.val_image_metrics is False
+    assert args.val_superposition is False
+    assert args.enable_rerun is True
 
 
 def test_train_sys_path_insert() -> None:
