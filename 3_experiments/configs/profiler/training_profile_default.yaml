@@ -1,0 +1,7 @@
+profile:
+  target: training
+  config: 3_experiments/configs/bistro_clean_train.yaml
+  steps: 200
+  warmup_steps: 30
+  stack: both
+  enable_extra_losses: false

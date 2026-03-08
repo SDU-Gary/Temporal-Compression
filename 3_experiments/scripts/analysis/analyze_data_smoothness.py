@@ -1,14 +1,19 @@
 """
 Analyze spatial smoothness of SH coefficients in the dataset
 """
-import torch
 import numpy as np
 import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 from pathlib import Path
-from data.dataset import MultiTimeLightingDataset
+
+_SCRIPTS_DIR = Path(__file__).resolve().parents[1]
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+from _path_setup import ensure_repo_paths
+
+_ROOT, _SRC = ensure_repo_paths(__file__, root_levels=3)
+
+from data.lightset_dataset import LightSetDataset
 from sklearn.neighbors import NearestNeighbors
 import matplotlib.pyplot as plt
 
@@ -21,23 +26,20 @@ def analyze_spatial_smoothness(dataset_path):
 
     # Load dataset
     print(f"\nLoading dataset from {dataset_path}...")
-    dataset = MultiTimeLightingDataset(
+    dataset = LightSetDataset(
         data_root=dataset_path,
         split='train',
         train_ratio=0.6,
         val_ratio=0.2
     )
 
-    print(f"Total samples: {len(dataset)}")
+    print(f"Total probe-config samples: {len(dataset)}")
+    print(f"Total probes: {dataset.num_probes}")
+    print(f"Total configs in split: {dataset.num_configs}")
 
     # Load all data
-    positions = torch.from_numpy(dataset.positions_normalized).float().numpy()  # [N, 3]
-
-    sh_list = []
-    for i in range(len(dataset)):
-        sample = dataset[i]
-        sh_list.append(sample['sh_gt'].numpy())  # [T, 27]
-    sh_coeffs = np.array(sh_list)  # [N, T, 27]
+    positions = np.asarray(dataset.get_full_probe_positions(normalized=True), dtype=np.float32)  # [P, 3]
+    sh_coeffs = np.asarray(dataset.tensor_subset, dtype=np.float32)  # [P, T, 27]
 
     print(f"Positions shape: {positions.shape}")
     print(f"SH coeffs shape: {sh_coeffs.shape}")
@@ -54,7 +56,7 @@ def analyze_spatial_smoothness(dataset_path):
     sh_diff_list = []
     sh_relative_diff_list = []
 
-    n_samples = min(len(dataset), 500)  # Sample for speed
+    n_samples = min(len(positions), 500)  # Sample for speed
 
     for i in range(n_samples):
         dists, indices = nbrs.kneighbors([positions[i]])
@@ -225,9 +227,11 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str,
-                       default='../data_generation/output/dataset_2k',
+                       default='1_data_generation/output/5D_parametric_validation',
                        help='Path to dataset')
     args = parser.parse_args()
 
-    dataset_path = Path(__file__).parent.parent / args.dataset
+    dataset_path = Path(args.dataset)
+    if not dataset_path.is_absolute():
+        dataset_path = _ROOT / dataset_path
     analyze_spatial_smoothness(dataset_path)

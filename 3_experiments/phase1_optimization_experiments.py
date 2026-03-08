@@ -12,12 +12,15 @@ Stage 4: 架构微调 (3 experiments, attention/residual/deeper FiLM)
 import os
 import sys
 import json
-import yaml
-import subprocess
-import time
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List, Optional
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from experiment_driver_common import modify_config, read_json_if_exists, run_command
 
 PROJECT_ROOT = Path(__file__).parent.parent
 os.chdir(PROJECT_ROOT)
@@ -180,55 +183,6 @@ FALCOR_CONFIG = {
 }
 
 
-def set_nested_value(d: Dict, key_path: str, value: Any):
-    """设置嵌套字典的值"""
-    keys = key_path.split('.')
-    for key in keys[:-1]:
-        d = d.setdefault(key, {})
-    d[keys[-1]] = value
-
-
-def modify_config(base_config: str, modifications: Dict[str, Any], output_file: str) -> Dict:
-    """修改配置文件并保存"""
-    with open(base_config, 'r') as f:
-        config = yaml.safe_load(f)
-
-    for key_path, value in modifications.items():
-        set_nested_value(config, key_path, value)
-
-    output_dir = config['experiment']['output_dir']
-    os.makedirs(output_dir, exist_ok=True)
-
-    with open(output_file, 'w') as f:
-        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
-
-    return config
-
-
-def run_command(cmd: List[str], description: str, log_file: Optional[str] = None) -> int:
-    """运行命令并记录输出"""
-    print(f"\n{'='*80}")
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {description}")
-    print(f"Command: {' '.join(cmd)}")
-    print(f"{'='*80}\n")
-
-    if log_file:
-        with open(log_file, 'w') as f:
-            f.write(f"Command: {' '.join(cmd)}\n")
-            f.write(f"Started: {datetime.now()}\n\n")
-
-        with open(log_file, 'a') as f:
-            result = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT)
-
-        with open(log_file, 'a') as f:
-            f.write(f"\nFinished: {datetime.now()}\n")
-            f.write(f"Exit code: {result.returncode}\n")
-    else:
-        result = subprocess.run(cmd)
-
-    return result.returncode
-
-
 def run_training(exp_id: str, config_file: str, output_dir: str) -> bool:
     """运行训练"""
     log_file = f"{output_dir}/training.log"
@@ -266,11 +220,7 @@ def run_evaluation(exp_id: str, output_dir: str) -> Dict[str, Any]:
         return {}
 
     eval_json = f"{output_dir}/eval.json"
-    if os.path.exists(eval_json):
-        with open(eval_json, 'r') as f:
-            return json.load(f)
-
-    return {}
+    return read_json_if_exists(eval_json, default={})
 
 
 def run_benchmark(exp_id: str, output_dir: str) -> Dict[str, Any]:
@@ -311,12 +261,8 @@ def run_benchmark(exp_id: str, output_dir: str) -> Dict[str, Any]:
         return {}
 
     summary_json = f"{benchmark_dir}/benchmark_summary.json"
-    if os.path.exists(summary_json):
-        with open(summary_json, 'r') as f:
-            data = json.load(f)
-            return data.get("image_metrics", {})
-
-    return {}
+    data = read_json_if_exists(summary_json, default={})
+    return data.get("image_metrics", {}) if isinstance(data, dict) else {}
 
 
 def run_single_experiment(exp_id: str, exp_config: Dict[str, Any]) -> Dict[str, Any]:

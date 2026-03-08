@@ -2,7 +2,15 @@ from pathlib import Path
 import textwrap
 import pytest
 
-from tools.workflow_config import apply_preset, build_generator_command, ensure_python, load_yaml, select_python, validate_dataset_config
+from tools.workflow_config import (
+    apply_preset,
+    build_generator_command,
+    ensure_python,
+    extend_cli_args,
+    load_yaml,
+    select_python,
+    validate_dataset_config,
+)
 
 
 def test_load_yaml_missing(tmp_path: Path):
@@ -66,3 +74,23 @@ def test_select_python_falls_back_env(monkeypatch):
     config = {"generator": {}}
     monkeypatch.setenv("FALCOR_PYTHON", "/env/falcor/python")
     assert select_python(config) == "/env/falcor/python"
+
+
+def test_extend_cli_args_handles_bool_none_and_lists() -> None:
+    cmd = ["script.py"]
+    out = extend_cli_args(
+        cmd,
+        {
+            "enabled": True,
+            "skip": False,
+            "empty": None,
+            "items": [1, 2],
+            "name": "x",
+        },
+    )
+    assert out is cmd
+    assert "--enabled" in out
+    assert "--skip" not in out
+    assert "--empty" not in out
+    assert out.count("--items") == 2
+    assert "--name" in out

@@ -183,13 +183,39 @@ class GaussianPhysicsCompressionUnified(nn.Module):
             nn.init.zeros_(layer.weight)
             nn.init.zeros_(layer.bias)
 
-    def compute_gaussian_routing(self, positions: torch.Tensor, top_k: int = 3) -> Tuple[torch.Tensor, torch.Tensor]:
+    def compute_gaussian_routing(
+        self,
+        positions: torch.Tensor,
+        top_k: int = 3,
+        training_soft_routing: bool = False,
+        routing_temperature: float = 1.0,
+        routing_soft_topk: int | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         B = positions.shape[0]
         mu_expanded = self.mu.unsqueeze(0)
         pos_expanded = positions.unsqueeze(1)
         # NOTE: 计算平方距离避免开根号，保持数值稳定性和效率。
         diff_all = mu_expanded - pos_expanded
         distances = torch.sum(diff_all * diff_all, dim=-1)
+
+        if training_soft_routing:
+            if routing_soft_topk is None or int(routing_soft_topk) <= 0:
+                soft_k = self.K
+            else:
+                soft_k = min(self.K, max(int(routing_soft_topk), int(top_k)))
+
+            topk_values, topk_indices = torch.topk(
+                distances, k=soft_k, largest=False, dim=-1
+            )
+            selected_mu = self.mu[topk_indices]
+            selected_scale = torch.exp(self.log_scale[topk_indices])
+            diff = pos_expanded - selected_mu
+            weighted_diff = diff / selected_scale
+            exponent = -0.5 * torch.sum(weighted_diff ** 2, dim=-1)
+            temperature = max(1e-6, float(routing_temperature))
+            logits = exponent / temperature
+            weights = torch.softmax(logits, dim=-1)
+            return weights, topk_indices
 
         topk_values, topk_indices = torch.topk(
             distances, k=min(top_k, self.K), largest=False, dim=-1
@@ -206,8 +232,21 @@ class GaussianPhysicsCompressionUnified(nn.Module):
 
         return weights, topk_indices
 
-    def compute_gaussian_weights(self, positions: torch.Tensor, top_k: int = 3):
-        return self.compute_gaussian_routing(positions, top_k)
+    def compute_gaussian_weights(
+        self,
+        positions: torch.Tensor,
+        top_k: int = 3,
+        training_soft_routing: bool = False,
+        routing_temperature: float = 1.0,
+        routing_soft_topk: int | None = None,
+    ):
+        return self.compute_gaussian_routing(
+            positions,
+            top_k=top_k,
+            training_soft_routing=training_soft_routing,
+            routing_temperature=routing_temperature,
+            routing_soft_topk=routing_soft_topk,
+        )
 
     def forward_with_routing(
         self,
@@ -263,8 +302,17 @@ class GaussianPhysicsCompressionUnified(nn.Module):
         light_params: torch.Tensor,
         top_k: int = 3,
         light_mask: torch.Tensor | None = None,
+        training_soft_routing: bool = False,
+        routing_temperature: float = 1.0,
+        routing_soft_topk: int | None = None,
     ) -> torch.Tensor:
-        routing = self.compute_gaussian_routing(positions, top_k)
+        routing = self.compute_gaussian_routing(
+            positions,
+            top_k=top_k,
+            training_soft_routing=training_soft_routing,
+            routing_temperature=routing_temperature,
+            routing_soft_topk=routing_soft_topk,
+        )
         return self.forward_with_routing(routing, light_params, light_mask)
 
     def set_film_enabled(self, enabled: bool) -> None:

@@ -54,13 +54,7 @@ def validate_dataset_config(config: Dict[str, Any]) -> None:
         raise ValueError("output_dir is required")
 
 
-def build_generator_command(config: Dict[str, Any]) -> Tuple[Path, list[str]]:
-    generator = config["generator"]
-    script = Path(generator["script"]).resolve()
-    args = generator.get("args", {})
-    output_dir = Path(config["output_dir"]).resolve()
-
-    cmd = [str(script), "--output", str(output_dir)]
+def extend_cli_args(cmd: list[str], args: Dict[str, Any]) -> list[str]:
     for key, value in args.items():
         flag = "--" + key.replace("_", "-")
         if isinstance(value, bool):
@@ -74,6 +68,17 @@ def build_generator_command(config: Dict[str, Any]) -> Tuple[Path, list[str]]:
                 cmd.extend([flag, str(item)])
             continue
         cmd.extend([flag, str(value)])
+    return cmd
+
+
+def build_generator_command(config: Dict[str, Any]) -> Tuple[Path, list[str]]:
+    generator = config["generator"]
+    script = Path(generator["script"]).resolve()
+    args = generator.get("args", {})
+    output_dir = Path(config["output_dir"]).resolve()
+
+    cmd = [str(script), "--output", str(output_dir)]
+    extend_cli_args(cmd, args)
     return output_dir, cmd
 
 

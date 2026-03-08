@@ -14,6 +14,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torch.utils.data import Subset
 
 _ROOT = Path(__file__).resolve().parents[3]
 _SRC = _ROOT / "2_src"
@@ -245,8 +246,17 @@ def run_diagnostics(args: argparse.Namespace) -> Dict:
         random_seed=args.seed,
         normalize_probes=True,
     )
+
+    sampled_dataset = dataset
+    sample_indices: Optional[np.ndarray] = None
+    max_samples = int(getattr(args, "max_samples", 0) or 0)
+    if max_samples > 0 and max_samples < len(dataset):
+        rng = np.random.default_rng(int(getattr(args, "sample_seed", args.seed)))
+        sample_indices = np.sort(rng.choice(len(dataset), size=max_samples, replace=False).astype(np.int64))
+        sampled_dataset = Subset(dataset, sample_indices.tolist())
+
     loader = DataLoader(
-        dataset,
+        sampled_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
@@ -376,6 +386,9 @@ def run_diagnostics(args: argparse.Namespace) -> Dict:
             "num_samples": int(gt_all.shape[0]),
             "num_unique_probes": int(np.unique(probe_idx_all).size),
             "num_unique_configs": int(np.unique(config_idx_all).size),
+            "dataset_size_before_sampling": int(len(dataset)),
+            "dataset_size_after_sampling": int(len(sampled_dataset)),
+            "sampled": bool(sample_indices is not None),
         },
         "baseline": {
             "all27": base_all,
@@ -461,6 +474,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--val-ratio", type=float, default=None)
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument("--sh-scaler", default=None)
+    parser.add_argument("--max-samples", type=int, default=0, help="Randomly subsample up to N samples (0 means all).")
+    parser.add_argument("--sample-seed", type=int, default=42, help="Random seed for subsampling when --max-samples > 0.")
     return parser
 
 

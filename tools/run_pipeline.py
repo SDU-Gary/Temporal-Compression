@@ -24,7 +24,7 @@ except Exception:  # pragma: no cover
 
 from tools.run_dataset import build_plan
 from tools.run_summary import write_run_summary
-from tools.workflow_config import ensure_python, select_python
+from tools.workflow_config import ensure_python, extend_cli_args, select_python
 
 
 def _load_pipeline(path: str | Path) -> Dict[str, Any]:
@@ -95,13 +95,7 @@ def build_pipeline_steps(pipeline: Dict[str, Any]) -> List[Dict[str, Any]]:
 
         cmd = [train_cfg["entry"]]
         python_bin = train_cfg.get("python") or pipeline_python_train
-        for key, value in args.items():
-            flag = "--" + key.replace("_", "-")
-            if isinstance(value, bool):
-                if value:
-                    cmd.append(flag)
-                continue
-            cmd.extend([flag, str(value)])
+        extend_cli_args(cmd, args)
         steps.append({"name": "train", "cmd": cmd, "python": python_bin, "output_dir": train_output_dir})
     eval_cfg = pipeline.get("eval") or {}
     if eval_cfg:
@@ -122,13 +116,7 @@ def build_pipeline_steps(pipeline: Dict[str, Any]) -> List[Dict[str, Any]]:
 
         cmd = [eval_cfg["entry"]]
         python_bin = eval_cfg.get("python") or pipeline_python_eval
-        for key, value in args.items():
-            flag = "--" + key.replace("_", "-")
-            if isinstance(value, bool):
-                if value:
-                    cmd.append(flag)
-                continue
-            cmd.extend([flag, str(value)])
+        extend_cli_args(cmd, args)
         steps.append(
             {
                 "name": "eval",

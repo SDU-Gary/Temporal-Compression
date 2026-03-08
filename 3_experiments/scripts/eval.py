@@ -13,13 +13,14 @@ import json
 from pathlib import Path
 import sys
 
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
 
-_ROOT = Path(__file__).resolve().parents[2]
-_SRC = _ROOT / "2_src"
-if str(_SRC) not in sys.path:
-    sys.path.insert(0, str(_SRC))
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
+from _path_setup import ensure_repo_paths
+
+
+_ROOT, _SRC = ensure_repo_paths(__file__, root_levels=2)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

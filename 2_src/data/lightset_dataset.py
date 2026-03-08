@@ -10,11 +10,36 @@ Expected data format (npz):
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
+
+
+_NPZ_CACHE: Dict[Path, tuple[int, int, Dict[str, np.ndarray]]] = {}
+
+
+def clear_lightset_npz_cache() -> None:
+    _NPZ_CACHE.clear()
+
+
+def _load_lightset_npz(data_path: Path, use_cache: bool = True) -> Dict[str, np.ndarray]:
+    resolved = data_path.resolve()
+    stat = resolved.stat()
+    stamp = (int(stat.st_mtime_ns), int(stat.st_size))
+
+    if use_cache:
+        cached = _NPZ_CACHE.get(resolved)
+        if cached is not None and cached[0] == stamp[0] and cached[1] == stamp[1]:
+            return cached[2]
+
+    with np.load(resolved, allow_pickle=True) as data:
+        payload = {k: data[k] for k in data.files}
+
+    if use_cache:
+        _NPZ_CACHE[resolved] = (stamp[0], stamp[1], payload)
+    return payload
 
 
 class LightSetDataset(Dataset):
@@ -28,25 +53,26 @@ class LightSetDataset(Dataset):
         val_ratio: float = 0.15,
         random_seed: int = 42,
         normalize_probes: bool = True,
+        use_npz_cache: bool = True,
+        use_torch_views: bool = True,
     ) -> None:
         super().__init__()
 
         self.data_root = Path(data_root)
         self.split = split
         self.normalize_probes = normalize_probes
+        self.use_torch_views = bool(use_torch_views)
 
         data_path = self.data_root / "parametric_tensor.npz"
         if not data_path.exists():
             raise FileNotFoundError(f"Data file not found: {data_path}")
 
-        # TODO(perf): train/val/test 会各自实例化并重复 np.load 同一大文件。
-        # 可考虑共享内存映射（mmap_mode）或上层复用已加载数组，降低启动与内存压力。
-        data = np.load(data_path, allow_pickle=True)
-        self.tensor = data["tensor"]  # [P, M, 27]
-        self.probe_positions = data["probe_positions"]  # [P, 3]
-        self.light_configs = data["light_configs"]  # [M, N, 12]
+        data = _load_lightset_npz(data_path, use_cache=use_npz_cache)
+        self.tensor = np.asarray(data["tensor"], dtype=np.float32)  # [P, M, 27]
+        self.probe_positions = np.asarray(data["probe_positions"], dtype=np.float32)  # [P, 3]
+        self.light_configs = np.asarray(data["light_configs"], dtype=np.float32)  # [M, N, 12]
         if "light_mask" in data:
-            self.light_mask = data["light_mask"]
+            self.light_mask = np.asarray(data["light_mask"], dtype=np.float32)
         else:
             self.light_mask = np.ones(self.light_configs.shape[:2], dtype=np.float32)
         if "valid_mask" in data:
@@ -80,9 +106,9 @@ class LightSetDataset(Dataset):
             raise ValueError(f"Unknown split: {split}")
 
         # Subset by configs
-        self.tensor_subset = self.tensor[:, self.config_indices, :]
-        self.light_configs_subset = self.light_configs[self.config_indices]
-        self.light_mask_subset = self.light_mask[self.config_indices]
+        self.tensor_subset = np.ascontiguousarray(self.tensor[:, self.config_indices, :], dtype=np.float32)
+        self.light_configs_subset = np.ascontiguousarray(self.light_configs[self.config_indices], dtype=np.float32)
+        self.light_mask_subset = np.ascontiguousarray(self.light_mask[self.config_indices], dtype=np.float32)
 
         # Normalize probe positions
         if normalize_probes:
@@ -96,6 +122,18 @@ class LightSetDataset(Dataset):
 
         self.num_probes = P
         self.num_configs = len(self.config_indices)
+
+        self._probe_positions_tensor: Optional[torch.Tensor] = None
+        self._light_configs_tensor: Optional[torch.Tensor] = None
+        self._light_mask_tensor: Optional[torch.Tensor] = None
+        self._tensor_subset_tensor: Optional[torch.Tensor] = None
+        if self.use_torch_views:
+            self._probe_positions_tensor = torch.from_numpy(
+                np.ascontiguousarray(self.probe_positions_norm, dtype=np.float32)
+            )
+            self._light_configs_tensor = torch.from_numpy(self.light_configs_subset)
+            self._light_mask_tensor = torch.from_numpy(self.light_mask_subset)
+            self._tensor_subset_tensor = torch.from_numpy(self.tensor_subset)
 
         print(f"LightSetDataset ({split}):")
         print(f"  Probes: {self.num_probes}")
@@ -113,18 +151,22 @@ class LightSetDataset(Dataset):
         probe_idx = idx // self.num_configs
         config_idx = idx % self.num_configs
 
-        probe_pos = self.probe_positions_norm[probe_idx]
-        light_params = self.light_configs_subset[config_idx]
-        light_mask = self.light_mask_subset[config_idx]
-        sh_coeffs = self.tensor_subset[probe_idx, config_idx, :]
+        if self._probe_positions_tensor is not None:
+            probe_pos = self._probe_positions_tensor[probe_idx]
+            light_params = self._light_configs_tensor[config_idx]
+            light_mask = self._light_mask_tensor[config_idx]
+            sh_coeffs = self._tensor_subset_tensor[probe_idx, config_idx, :]
+        else:
+            probe_pos = torch.from_numpy(self.probe_positions_norm[probe_idx])
+            light_params = torch.from_numpy(self.light_configs_subset[config_idx])
+            light_mask = torch.from_numpy(self.light_mask_subset[config_idx])
+            sh_coeffs = torch.from_numpy(self.tensor_subset[probe_idx, config_idx, :])
 
-        # TODO(perf): 每个样本都执行 from_numpy(...).float()，会产生大量小对象转换开销。
-        # 可考虑在初始化阶段预构建 torch tensor（或使用自定义 collate 批量转换）。
         sample = {
-            "probe_position": torch.from_numpy(probe_pos).float(),
-            "light_params": torch.from_numpy(light_params).float(),
-            "light_mask": torch.from_numpy(light_mask).float(),
-            "sh_coeffs": torch.from_numpy(sh_coeffs).float(),
+            "probe_position": probe_pos,
+            "light_params": light_params,
+            "light_mask": light_mask,
+            "sh_coeffs": sh_coeffs,
             "probe_idx": torch.tensor(probe_idx, dtype=torch.long),
             "config_idx": torch.tensor(config_idx, dtype=torch.long),
         }
@@ -143,6 +185,12 @@ def create_dataloaders_lightset(
     val_ratio: float = 0.15,
     num_workers: int = 4,
     normalize_probes: bool = True,
+    dataloader_timeout_seconds: int = 0,
+    dataloader_prefetch_factor: Optional[int] = None,
+    dataloader_persistent_workers: Optional[bool] = None,
+    dataloader_multiprocessing_context: Optional[str] = None,
+    use_npz_cache: bool = True,
+    use_torch_views: bool = True,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     train_dataset = LightSetDataset(
         data_root=data_root,
@@ -150,6 +198,8 @@ def create_dataloaders_lightset(
         train_ratio=train_ratio,
         val_ratio=val_ratio,
         normalize_probes=normalize_probes,
+        use_npz_cache=use_npz_cache,
+        use_torch_views=use_torch_views,
     )
 
     val_dataset = LightSetDataset(
@@ -158,6 +208,8 @@ def create_dataloaders_lightset(
         train_ratio=train_ratio,
         val_ratio=val_ratio,
         normalize_probes=normalize_probes,
+        use_npz_cache=use_npz_cache,
+        use_torch_views=use_torch_views,
     )
 
     test_dataset = LightSetDataset(
@@ -166,12 +218,32 @@ def create_dataloaders_lightset(
         train_ratio=train_ratio,
         val_ratio=val_ratio,
         normalize_probes=normalize_probes,
+        use_npz_cache=use_npz_cache,
+        use_torch_views=use_torch_views,
     )
 
-    # TODO(perf): 可按平台/任务调优 persistent_workers、prefetch_factor、pin_memory_device。
-    # 当前仅 pin_memory=True，仍有进一步提升输入管线吞吐空间。
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    num_workers_i = int(num_workers)
+    timeout_i = max(0, int(dataloader_timeout_seconds)) if num_workers_i > 0 else 0
+
+    loader_kwargs = {
+        "num_workers": num_workers_i,
+        "pin_memory": True,
+        "timeout": timeout_i,
+    }
+
+    if num_workers_i > 0:
+        if dataloader_prefetch_factor is not None and int(dataloader_prefetch_factor) > 0:
+            loader_kwargs["prefetch_factor"] = int(dataloader_prefetch_factor)
+        if dataloader_persistent_workers is not None:
+            loader_kwargs["persistent_workers"] = bool(dataloader_persistent_workers)
+        context = None
+        if dataloader_multiprocessing_context is not None:
+            context = str(dataloader_multiprocessing_context).strip().lower()
+        if context and context != "none":
+            loader_kwargs["multiprocessing_context"] = context
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, **loader_kwargs)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, **loader_kwargs)
 
     return train_loader, val_loader, test_loader

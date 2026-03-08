@@ -1,0 +1,8 @@
+profile:
+  target: inference
+  checkpoint: path/to/best_model.pt
+  data_root: 1_data_generation/output/bistro_clean_v2
+  profile_level: both
+  stack: both
+  frames: 300
+  warmup_frames: 30
