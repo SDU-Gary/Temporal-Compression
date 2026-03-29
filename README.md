@@ -10,6 +10,7 @@
 
 - `docs/PGGCPL_AUDIT.md`：全仓库审计与主线定位
 - `docs/PGGCPL_TIME_MODELS.md`：时间建模路线对比与演进
+- `docs/dev_notes/DEVELOPMENT_TRUTH_2026-03-08.md`：当前代码真相（按日期维护）
 
 ## 📁 当前目录结构（以 numbered stages 为主）
 
@@ -33,7 +34,7 @@ Temporal-Compression/
 - `2_src/models/gaussian_physics_unified.py`：`GaussianPhysicsCompressionUnified` + `LightSetEncoder`
 - `2_src/utils/light_descriptor.py`：把 1D/5D 参数构建为统一 descriptor（默认 12D）
 - `2_src/training/gaussian_physics_trainer.py`：统一 trainer（recon/temporal/linearity/spatial 等 loss）
-- `3_experiments/scripts/train.py`：统一训练入口（`variant: unified_set/unified_5d/...`）
+- `3_experiments/scripts/train.py`：统一训练入口（当前主线 `variant: unified_set`）
 - `metadata/schemas/train.schema.json`：训练配置 schema（YAML 可做校验）
 
 ## 🗃️ 历史路线（已归档但保留参考价值）
@@ -62,4 +63,3 @@ python scripts/train.py --config configs/bistro_clean_train.yaml
 - Python 3.13
 - PyTorch 2.9.1
 - Mitsuba 3.7.3
-

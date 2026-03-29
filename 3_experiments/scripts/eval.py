@@ -73,6 +73,10 @@ def main() -> None:
     intensity_dim = 3
     intensity_offset = 1
     enable_film = True
+    light_encoder_mode = "normal"
+    bypass_feature_pairs = None
+    bypass_feature_norm_mean = None
+    bypass_feature_norm_std = None
     scaler = None
 
     if isinstance(meta, dict):
@@ -87,6 +91,10 @@ def main() -> None:
             intensity_dim = int(model_meta.get("intensity_dim", intensity_dim))
             intensity_offset = int(model_meta.get("intensity_offset", intensity_offset))
             enable_film = bool(model_meta.get("enable_film", enable_film))
+            light_encoder_mode = str(model_meta.get("light_encoder_mode", light_encoder_mode))
+            bypass_feature_pairs = model_meta.get("bypass_feature_pairs", bypass_feature_pairs)
+            bypass_feature_norm_mean = model_meta.get("bypass_feature_norm_mean", bypass_feature_norm_mean)
+            bypass_feature_norm_std = model_meta.get("bypass_feature_norm_std", bypass_feature_norm_std)
 
         scaler_meta = meta.get("sh_scaler")
         if isinstance(scaler_meta, dict):
@@ -112,6 +120,10 @@ def main() -> None:
         intensity_dim=intensity_dim,
         intensity_offset=intensity_offset,
         enable_film=enable_film,
+        light_encoder_mode=light_encoder_mode,
+        bypass_feature_pairs=bypass_feature_pairs,
+        bypass_feature_norm_mean=bypass_feature_norm_mean,
+        bypass_feature_norm_std=bypass_feature_norm_std,
     ).to(device)
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing or unexpected:

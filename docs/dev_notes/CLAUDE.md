@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> Note (2026-03-08): For the most up-to-date, code-verified snapshot, read `docs/dev_notes/DEVELOPMENT_TRUTH_2026-03-08.md` first.
+
 ## Project Overview
 
 This is a graduate thesis project on **hierarchical neural compression for multi-temporal lighting** using time-varying latent codes, Gaussian mixture representation, and spatiotemporal cascaded volumes. The goal is to extend Gaussian Compression (SIGGRAPH'25) from single-moment to multi-moment scenarios through four key innovations:
@@ -13,7 +15,7 @@ This is a graduate thesis project on **hierarchical neural compression for multi
 
 **Target Metrics**: 1:17 compression ratio (vs. naive 24× independent models), >38dB PSNR, <0.5ms decompression, 60 FPS @ 1080p
 
-**CRITICAL**: The thesis task specification in `docs/thesis/多时刻光照压缩任务书.md` describes the TARGET architecture. Current implementations include both the target architecture AND exploratory experimental methods. Always refer to the task specification to understand what needs to be built.
+**CRITICAL**: The thesis task specification in `4_thesis/report/多时刻光照压缩任务书.md` describes the TARGET architecture. Current implementations include both the target architecture AND exploratory experimental methods. Always refer to the task specification to understand what needs to be built.
 
 ## Repository Structure
 
@@ -198,7 +200,7 @@ All training parameters are in YAML files (`configs/`):
 - `validation`: Visualization and evaluation settings
 
 **To modify training**:
-1. Copy `configs/baseline.yaml` to a new file
+1. Copy `configs/template_unified_set.yaml` to a new file
 2. Edit parameters (e.g., num_gaussians, latent_dim_base, loss weights)
 3. Run: `python scripts/train.py --config configs/your_config.yaml`
 
@@ -325,11 +327,11 @@ Common issues and solutions:
 Use the diagnostic scripts:
 
 ```bash
-# Quick check: data loading + forward pass
-python scripts/quick_diagnose.py
+# Quick check: run 1-epoch smoke on mainline trainer
+python 3_experiments/scripts/train.py --config 3_experiments/configs/bistro_clean_train.yaml --epochs 1
 
-# Detailed: gradient flow, loss curves, data stats
-python scripts/diagnose_training.py --config configs/baseline.yaml --steps 100
+# Focused metric analysis
+python 3_experiments/scripts/analysis/analyze_data_smoothness.py --dataset 1_data_generation/output/bistro_clean_v2
 ```
 
 **Key metrics to check**:
@@ -424,10 +426,10 @@ sun_dirs, zeniths = compute_sun_directions(
 
 ## Tips for Working with this Codebase
 
-1. **Read the task specification first**: `docs/thesis/多时刻光照压缩任务书.md` is the authoritative source
-2. **Understand experimental vs. target**: `docs/experiment_reports/` documents exploratory methods, NOT the main deliverable
+1. **Read the task specification first**: `4_thesis/report/多时刻光照压缩任务书.md` is the authoritative target description
+2. **Understand experimental vs. target**: `docs/dev_notes/` contains historical exploratory notes; they are not all current mainline
 3. **Check configs first**: Most hyperparameters are in YAML, not hardcoded
-4. **Use the full model**: `models/full_model.py` implements the task specification architecture
+4. **Use the current mainline model**: `2_src/models/gaussian_physics_unified.py` + `3_experiments/scripts/train.py`
 5. **Verify sun directions**: Astronomical algorithm is critical for temporal compression
 6. **Test temporal interpolation**: Model should generalize to unseen time moments
 7. **Monitor Gaussian coverage**: Aim for >95% of probes within Gaussian influence
@@ -435,134 +437,55 @@ sun_dirs, zeniths = compute_sun_directions(
 
 ## Experiment Memory System
 
-This project uses an SQLite-based persistent memory system to maintain experiment history across Claude Code conversation compactions.
+This project uses SQLite for experiment/task memory.
 
-### Architecture
+### Current Source of Truth
 
-**Database**: `project.db` (SQLite)
-- `datasets` - Dataset metadata (11 datasets)
-- `scenes` - Scene definitions (cornell-box, house, staircase2)
-- `scripts` - Script registry with descriptions
-- `experiments` - Complete experiment history (17+ experiments)
-- `tasks` - Task management (7 pending tasks)
-- `env_config` - Environment configuration
+- Canonical DB path: `metadata/project.db`
+- Legacy DB path: `project.db` (deprecated; do not use for new logging)
+- Current code default (`tools/db_utils.py`) now points to `metadata/project.db`
+- Optional override: env var `PGCPL_DB_PATH`
 
-**State Summary**: `project_state.md` (auto-generated, <500 words)
-- Hot-start context after conversation compaction
-- Shows: Active tasks, milestones, recent experiments, dataset mappings
-- Regenerated via `python tools/summarize_state.py`
+### Operational Rules
 
-**Validation**: `DATABASE_VERIFICATION_REPORT.md`
-- Cross-validation report against source files
-- Documents 7 corrections made to historical data
-- Establishes four-source validation methodology (JSON > logs > reports > config)
+1. Never assume dataset paths from config names alone; query DB first.
+2. Log every completed run via `tools/logexp.py`.
+3. Treat `docs/dev_notes/project_state.md` as a historical snapshot, not an auto-generated real-time state file.
 
-### Automatic Context Loading
+### Commands
 
-**SessionStart Hook**: `.claude/hooks/SessionStart.sh`
-- Automatically runs on each new Claude Code session
-- Regenerates `project_state.md` from database
-- Displays critical context: tasks, milestones, recent experiments
-- Shows database tools and reminders
-
-### Workflow Protocol
-
-**After conversation compaction**:
-1. Hook auto-runs: regenerates state and displays context
-2. Read `project_state.md` sections: [TASKS], [MILESTONES], [RECENT]
-3. **NEVER guess dataset paths** - query database or check state file
-
-**After completing experiment**:
 ```bash
-# Log immediately with all results
-python tools/logexp.py log \
-    --phase Phase2_PGCPL \
-    --stage training \
-    --script train_pgcpl5d \
-    --dataset 5D_param_val \
-    --hyperparams '{"num_gaussians": 30, "rank": 8}' \
-    --results '{"psnr": 32.5, "ssim": 0.951, "compress_ratio": 16.59}'
+# Query recent experiments
+python tools/logexp.py query --limit 10
 
-# Set as baseline if applicable
-python tools/logexp.py set-baseline EXP-20260104-001
+# Query by phase
+python tools/logexp.py query --phase Phase2_PGCPL --limit 20
 
-# Regenerate state
-python tools/summarize_state.py
-```
-
-**Task management**:
-```bash
-# Add task
-python tools/logexp.py add-task "Implement energy conservation loss" --priority 3
-
-# List tasks
+# List active tasks
 python tools/logexp.py list-tasks --status todo
 
-# Complete task
-python tools/logexp.py complete-task 5
+# Log a new experiment
+python tools/logexp.py log --phase Phase2_PGCPL --stage training \
+  --script train --dataset bistro_clean_v2 \
+  --hyperparams '{"num_gaussians":30,"rank":8}' \
+  --results '{"mae":0.1455,"rmse":0.2574}'
 ```
 
-**Query experiments**:
-```bash
-# Query by phase
-python tools/logexp.py query --phase Phase2_PGCPL
+### Database Utilities
 
-# Query by dataset
-python tools/logexp.py query --dataset 5D_param_val
-
-# Find best PSNR
-python tools/logexp.py query --min-psnr 30 --limit 5
-```
-
-### Database Tools
-
-**CLI Tool**: `tools/logexp.py`
-- `log` - Log new experiment
-- `set-baseline` - Mark experiment as baseline
-- `add-task`, `complete-task`, `list-tasks` - Task management
-- `query` - Search experiments with filters
-
-**State Generator**: `tools/summarize_state.py`
-- Generates `project_state.md` from database
-- Deterministic output (<500 words)
-- Run after any database update
-
-**Database Utilities**: `tools/db_utils.py`
-- `get_db()` - Context manager for database connection
-- `init_db()` - Initialize from schema
-
-### Data Quality Assurance
-
-**Validation Priority**:
-1. JSON results (most reliable, program-generated)
-2. Training logs (real-time records)
-3. Experiment reports (human summaries, may have rounding)
-4. Config files (for verification only)
-
-**Critical Rules**:
-- All probe counts use actual `probes.npz` data, not `config.json` declarations
-- Training experiments (K30_r8) have MAE/RMSE, not PSNR/SSIM
-- Rendering experiments have PSNR/SSIM, not MAE/RMSE
-- All historical data verified via four-source cross-validation
-
-### Dataset-Scene Mapping
-
-**Most-Used Datasets** (from database):
-- **5D_PARAM** (5D_parametric_validation): 125 probes × 41 moments, SPP=128
-- **D2K** (dataset_2k): 1,728 probes × 6 moments, SPP=128
-- **MT1** (method_test_v1): 343 probes × 6 moments, SPP=256
-- **TPE_CB** (level2_tpe/cornell-box_test): 1 probe × 13 moments, SPP=256
-- **TPE_HS** (level2_tpe/house_p0): 1 probe × 13 moments, SPP=256
-
-**Note**: Config files may declare different probe counts (e.g., dataset_15k declares 15K but has 13,824). Always trust actual data.
+- `tools/db_utils.py`
+  - `get_db()` connection context manager
+  - `init_db()` initializes schema (default `metadata/schema.sql`)
+- `tools/logexp.py`
+  - `log`, `set-baseline`, `add-task`, `complete-task`, `list-tasks`, `query`
 
 ## References
 
-- **Task specification** (AUTHORITATIVE): `docs/thesis/多时刻光照压缩任务书.md`
+- **Task specification** (AUTHORITATIVE): `4_thesis/report/多时刻光照压缩任务书.md`
 - Experiment reports: `docs/dev_notes/experiment_reports/` (historical exploratory work)
 - Data generation guide: `1_data_generation/README.md`
 - Mitsuba 3 docs: `mitsuba-docs/` (local copy)
 - Gaussian Compression paper: SIGGRAPH 2025 (base architecture)
 - K-Planes: CVPR 2023 (temporal smoothness inspiration)
 - PBR-NeRF: 2024 (energy conservation inspiration)
-- **Memory system**: `DATABASE_VERIFICATION_REPORT.md`, `tools/logexp.py`, `project_state.md`
+- **Memory system**: `docs/dev_notes/DATABASE_VERIFICATION_REPORT.md`, `tools/logexp.py`, `docs/dev_notes/project_state.md`

@@ -124,6 +124,9 @@ def _build_args(tmp_path: Path) -> SimpleNamespace:
         sh_scaler_path=None,
         sh_scaler_max_samples=10,
         load_model=str(tmp_path / "ckpt.pt"),
+        resume=None,
+        resume_save_every=1,
+        resume_checkpoint_name="resume_latest.pt",
         enable_rerun=True,
         rerun_save_path=None,
         rerun_log_freq=1,
@@ -142,6 +145,7 @@ def _build_args(tmp_path: Path) -> SimpleNamespace:
         lambda_spatial=0.0,
         spatial_k=1,
         lambda_image=0.0,
+        image_loss_warmup_epochs=0,
         image_loss_type="mse",
         image_samples=64,
         image_sample_seed=42,
@@ -209,7 +213,7 @@ def test_resolve_val_profiles_config() -> None:
             "training": {
                 "val_profiles": {
                     "enabled": True,
-                    "best_metric": "mae",
+                    "best_metric": "img_psnr",
                     "profiles": [
                         {"name": "hard3", "top_k": 3, "training_soft_routing": False},
                         {"name": "soft8_t020", "top_k": 3, "training_soft_routing": True, "routing_soft_topk": 8, "routing_temperature": 0.2},
@@ -221,11 +225,209 @@ def test_resolve_val_profiles_config() -> None:
     )
     cfg = train_script._resolve_val_profiles_config(args)
     assert cfg["enabled"] is True
-    assert cfg["best_metric"] == "mae"
+    assert cfg["best_metric"] == "img_psnr"
     assert cfg["run_test_compare"] is True
     assert len(cfg["profiles"]) == 2
     assert cfg["profiles"][0]["name"] == "hard3"
     assert cfg["profiles"][1]["routing_temperature"] == 0.2
+
+
+def test_resolve_proxy_and_falcor_periodic_config() -> None:
+    args = SimpleNamespace(
+        top_k=3,
+        seed=42,
+        batch_size=512,
+        lambda_image=0.0,
+        image_loss_warmup_epochs=0,
+        device="cuda",
+        _config_obj={
+            "training": {
+                "proxy_image_loss": {
+                    "enabled": True,
+                    "lambda": 0.1,
+                    "warmup_epochs": 50,
+                    "enable_val_image_metrics": True,
+                    "mix_mode": "linear_log_mix",
+                    "log_mix_weight": 0.3,
+                },
+                "falcor_periodic_eval": {
+                    "enabled": True,
+                    "scene": "dummy_scene.pyscene",
+                    "every_n_epochs": 20,
+                    "stage_end_full": True,
+                    "profile": {
+                        "name": "soft8_t018",
+                        "top_k": 3,
+                        "training_soft_routing": True,
+                        "routing_soft_topk": 8,
+                        "routing_temperature": 0.18,
+                    },
+                },
+            }
+        },
+    )
+
+    proxy_cfg = train_script._resolve_proxy_image_loss_config(args)
+    assert proxy_cfg["enabled"] is True
+    assert proxy_cfg["lambda"] == 0.1
+    assert proxy_cfg["warmup_epochs"] == 50
+    assert proxy_cfg["enable_val_image_metrics"] is True
+    assert proxy_cfg["mix_mode"] == "linear_log_mix"
+    assert proxy_cfg["log_mix_weight"] == 0.3
+
+    falcor_cfg = train_script._resolve_falcor_periodic_eval_config(args)
+    assert falcor_cfg["enabled"] is True
+    assert falcor_cfg["every_n_epochs"] == 20
+    assert falcor_cfg["profile"]["name"] == "soft8_t018"
+    assert falcor_cfg["profile"]["routing_temperature"] == 0.18
+
+
+def test_resolve_routing_balance_anneal_config() -> None:
+    args = SimpleNamespace(
+        lambda_routing_balance=0.02,
+        _config_obj={
+            "training": {
+                "routing_balance_anneal": {
+                    "enabled": True,
+                    "start": 0.02,
+                    "end": 0.0,
+                    "decay_end_ratio": 0.6,
+                }
+            }
+        },
+    )
+    cfg = train_script._resolve_routing_balance_anneal_config(args)
+    assert cfg["enabled"] is True
+    assert cfg["start"] == 0.02
+    assert cfg["end"] == 0.0
+    assert cfg["decay_end_ratio"] == 0.6
+
+
+def test_resolve_coeff_suite_config_with_checkpoints() -> None:
+    args = SimpleNamespace(
+        seed=42,
+        batch_size=512,
+        _config_obj={
+            "training": {
+                "coeff_suite": {
+                    "enabled": True,
+                    "run_after_training": True,
+                    "split": "test",
+                    "checkpoints": [
+                        "global_best_falcor.pt",
+                        "global_best_val_soft8_t018.pt",
+                        "best_model.pt",
+                        "last_model.pt",
+                    ],
+                }
+            }
+        },
+    )
+    cfg = train_script._resolve_coeff_suite_config(args)
+    assert cfg["enabled"] is True
+    assert cfg["run_after_training"] is True
+    assert cfg["split"] == "test"
+    assert cfg["checkpoints"] == [
+        "global_best_falcor.pt",
+        "global_best_val_soft8_t018.pt",
+        "best_model.pt",
+        "last_model.pt",
+    ]
+
+
+def test_resolve_global_best_config() -> None:
+    args = SimpleNamespace(
+        _config_obj={
+            "training": {
+                "global_best": {
+                    "enabled": True,
+                    "track_falcor": True,
+                    "track_soft_profile": True,
+                    "soft_profile_name": "soft8_t018",
+                    "soft_metric": "img_psnr",
+                    "soft_metric_maximize": True,
+                }
+            }
+        },
+    )
+    cfg = train_script._resolve_global_best_config(args)
+    assert cfg["enabled"] is True
+    assert cfg["track_falcor"] is True
+    assert cfg["track_soft_profile"] is True
+    assert cfg["soft_profile_name"] == "soft8_t018"
+    assert cfg["soft_metric"] == "img_psnr"
+    assert cfg["soft_metric_maximize"] is True
+
+
+def test_resolve_performance_config_amp_mode_bool_off() -> None:
+    args = SimpleNamespace(
+        amp_mode="off",
+        torch_compile=False,
+        torch_compile_mode="reduce-overhead",
+        torch_compile_dynamic=False,
+        grad_norm_log_every_steps=1,
+        enable_soft_profile_sharing=False,
+        soft_profile_equiv_check_batches=2,
+        soft_profile_mae_tolerance=1e-6,
+        soft_profile_img_psnr_tolerance=5e-4,
+        _config_obj={
+            "training": {
+                "performance": {
+                    "amp_mode": False,
+                }
+            }
+        },
+    )
+    cfg = train_script._resolve_performance_config(args)
+    assert cfg["amp_mode"] == "off"
+
+
+def test_resolve_expert_and_drift_audit_config() -> None:
+    args = SimpleNamespace(
+        top_k=3,
+        seed=42,
+        batch_size=512,
+        _config_obj={
+            "training": {
+                "expert_utilization_audit": {
+                    "enabled": True,
+                    "run_after_training": True,
+                    "split": "test",
+                    "device": "cpu",
+                    "max_samples": 4096,
+                    "profiles": [
+                        {"name": "hard3", "top_k": 3, "training_soft_routing": False},
+                        {"name": "soft8_t020", "top_k": 3, "training_soft_routing": True, "routing_soft_topk": 8, "routing_temperature": 0.2},
+                    ],
+                },
+                "semantic_drift_audit": {
+                    "enabled": True,
+                    "run_after_training": True,
+                    "split": "test",
+                    "device": "cpu",
+                    "max_samples": 4096,
+                    "pairs": [
+                        {
+                            "name": "best_vs_last",
+                            "checkpoint_a": "best_model.pt",
+                            "checkpoint_b": "last_model.pt",
+                        }
+                    ],
+                },
+            }
+        },
+    )
+    util_cfg = train_script._resolve_expert_utilization_audit_config(args)
+    assert util_cfg["enabled"] is True
+    assert util_cfg["max_samples"] == 4096
+    assert len(util_cfg["profiles"]) == 2
+    assert util_cfg["profiles"][1]["routing_temperature"] == 0.2
+
+    drift_cfg = train_script._resolve_semantic_drift_audit_config(args)
+    assert drift_cfg["enabled"] is True
+    assert drift_cfg["max_samples"] == 4096
+    assert len(drift_cfg["pairs"]) == 1
+    assert drift_cfg["pairs"][0]["name"] == "best_vs_last"
 
 
 def test_build_variant_and_init(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -306,6 +508,35 @@ def test_run_training_branches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     train_script.run_training(args4)
 
 
+def test_run_training_resume_branch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_train_deps(monkeypatch)
+
+    monkeypatch.setattr(train_script, "get_git_commit", lambda: "abc")
+    monkeypatch.setattr(train_script, "log_experiment", lambda **_: "EXP-TEST")
+    monkeypatch.setattr(train_script, "load_manifest", lambda *_: {"dataset_id": "D0"})
+
+    resume_ckpt = tmp_path / "resume_latest.pt"
+    resume_ckpt.write_text("x", encoding="utf-8")
+
+    fake_ckpt = {
+        "epoch": 3,
+        "model_state_dict": {},
+        "optimizer_state_dict": {},
+        "meta": {"training": {"stage_index": 1, "stage_name": "single_stage"}},
+    }
+    monkeypatch.setattr(train_script.torch, "load", lambda *a, **k: fake_ckpt)
+
+    args = _build_args(tmp_path)
+    args.resume = str(resume_ckpt)
+    args.load_model = None
+    args.no_init = True
+    args.enable_sh_scaler = False
+    args.enable_rerun = False
+    args.no_auto_log = True
+    args.output_dir = str(tmp_path / "out_resume")
+    train_script.run_training(args)
+
+
 def test_train_parser_defaults_and_apply_variant(monkeypatch: pytest.MonkeyPatch) -> None:
     parser = train_script.build_arg_parser()
     args = parser.parse_args(["--variant", "unified_set"])
@@ -313,12 +544,24 @@ def test_train_parser_defaults_and_apply_variant(monkeypatch: pytest.MonkeyPatch
     assert args.num_gaussians is not None
 
 
+def test_resume_path_and_stage_helpers(tmp_path: Path) -> None:
+    output_dir = tmp_path / "exp"
+    stage_dir = output_dir / "stage01_warmup_joint_fast"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    ckpt = stage_dir / "resume_latest.pt"
+    ckpt.write_text("x", encoding="utf-8")
+
+    resolved = train_script._resolve_resume_checkpoint_path(str(ckpt), output_dir)
+    assert resolved == ckpt.resolve()
+    assert train_script._infer_stage_index_from_checkpoint_path(ckpt) == 1
+
+
 def test_normalize_train_args_fills_missing_fields() -> None:
     args = SimpleNamespace(variant="unified_set", data_root="/tmp/d")
     train_script.normalize_train_args(args)
     assert args.val_image_metrics is False
     assert args.val_superposition is False
-    assert args.enable_rerun is True
+    assert args.enable_rerun is False
 
 
 def test_train_sys_path_insert() -> None:

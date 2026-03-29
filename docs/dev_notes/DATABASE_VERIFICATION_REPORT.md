@@ -236,7 +236,7 @@ UPDATE SET psnr=NULL, ssim=NULL, mae=0.03431, rmse=0.06195
 ### 维护协议
 1. **记录新实验后**: 立即运行 `python tools/logexp.py log ...`
 2. **发现不一致时**: 创建修正脚本（参考 `tools/fix_database_errors.py`）
-3. **更新数据后**: 重新生成 `python tools/summarize_state.py`
+3. **更新数据后**: 用 `python tools/logexp.py query --limit 10` 做快速一致性检查
 4. **定期审计**: 每月交叉验证一次关键实验
 
 ---
@@ -249,8 +249,8 @@ UPDATE SET psnr=NULL, ssim=NULL, mae=0.03431, rmse=0.06195
 
 ### 查询命令
 ```bash
-# 查看所有实验
-sqlite3 project.db "SELECT exp_id, phase, psnr, ssim, compress_ratio FROM experiments ORDER BY run_order"
+# 查看所有实验（canonical DB）
+sqlite3 metadata/project.db "SELECT exp_id, phase, psnr, ssim, compress_ratio FROM experiments ORDER BY run_order"
 
 # 验证数据集probe数量
 python3 -c "import numpy as np; data=np.load('data_generation/output/dataset_2k/probes.npz'); print(data['positions'].shape[0])"

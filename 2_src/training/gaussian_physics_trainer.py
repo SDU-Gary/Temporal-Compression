@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 import os
+import random
 import re
 import numpy as np
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -83,6 +84,10 @@ def _param_group_from_name(name: str) -> str:
         return "coeff"
     if name.startswith("light_encoder."):
         return "encoder"
+    if name.startswith("bypass_proj."):
+        return "encoder"
+    if name.startswith("bypass_mlp."):
+        return "encoder"
     if name.startswith("gamma.") or name.startswith("beta."):
         return "film"
     return "other"
@@ -112,10 +117,13 @@ class GaussianPhysicsTrainer:
         spatial_weight: float = 0.0,
         spatial_k: int = 1,
         image_loss_weight: float = 0.0,
+        image_loss_warmup_epochs: int = 0,
         image_loss_type: str = "mse",
         image_samples: int = 64,
         image_sample_seed: int = 42,
         image_loss_space: str = "linear",
+        proxy_image_loss_mix_mode: str = "linear_log_mix",
+        proxy_image_log_mix_weight: float = 0.3,
         enable_weighted_sh_loss: bool = False,
         sh_loss_weights: Optional[list[float]] = None,
         sh_weight_mode: str = "basis",
@@ -123,6 +131,11 @@ class GaussianPhysicsTrainer:
         compute_superposition_in_val: bool = False,
         param_group_lrs: Optional[Dict[str, float]] = None,
         lambda_routing_balance: float = 0.0,
+        routing_balance_anneal_enabled: bool = False,
+        routing_balance_anneal_start: Optional[float] = None,
+        routing_balance_anneal_end: float = 0.0,
+        routing_balance_anneal_epochs: int = 0,
+        routing_balance_anneal_epoch_offset: int = 0,
         routing_soft_train: bool = False,
         routing_soft_topk: int = 0,
         routing_temp_start: float = 1.0,
@@ -134,6 +147,15 @@ class GaussianPhysicsTrainer:
         ema_save_best: bool = False,
         rerun_logger=None,  # Optional RerunLogger instance
         show_progress: bool = True,
+        amp_mode: str = "off",
+        grad_norm_log_every_steps: int = 1,
+        raw_eval_every_epochs: int = 1,
+        max_train_batches: int = 0,
+        max_val_batches: int = 0,
+        enable_soft_profile_sharing: bool = False,
+        soft_profile_equiv_check_batches: int = 2,
+        soft_profile_mae_tolerance: float = 1e-6,
+        soft_profile_img_psnr_tolerance: float = 5e-4,
     ):
         self.model = model
         self.device = device
@@ -152,17 +174,33 @@ class GaussianPhysicsTrainer:
         self.linearity_aug_pairs = linearity_aug_pairs
         self.spatial_weight = spatial_weight
         self.spatial_k = spatial_k
-        self.image_loss_weight = max(0.0, float(image_loss_weight))
+        self.image_loss_weight_target = max(0.0, float(image_loss_weight))
+        self.image_loss_warmup_epochs = max(0, int(image_loss_warmup_epochs))
+        self._current_image_loss_weight = float(self.image_loss_weight_target)
+        # Backward-compatible alias used by existing logs/checkpoints.
+        self.image_loss_weight = float(self.image_loss_weight_target)
         self.image_loss_type = str(image_loss_type)
         self.image_samples = max(1, int(image_samples))
         self.image_sample_seed = int(image_sample_seed)
         self.image_loss_space = str(image_loss_space)
+        self.proxy_image_loss_mix_mode = str(proxy_image_loss_mix_mode).strip().lower()
+        self.proxy_image_log_mix_weight = float(np.clip(float(proxy_image_log_mix_weight), 0.0, 1.0))
         self.enable_weighted_sh_loss = bool(enable_weighted_sh_loss)
         self.sh_weight_mode = str(sh_weight_mode)
         self.compute_img_metrics_in_val = bool(compute_img_metrics_in_val)
         self.compute_superposition_in_val = bool(compute_superposition_in_val)
         self.param_group_lrs = dict(param_group_lrs or {})
         self.lambda_routing_balance = max(0.0, float(lambda_routing_balance))
+        self.routing_balance_anneal_enabled = bool(routing_balance_anneal_enabled)
+        self.routing_balance_anneal_start = (
+            self.lambda_routing_balance
+            if routing_balance_anneal_start is None
+            else max(0.0, float(routing_balance_anneal_start))
+        )
+        self.routing_balance_anneal_end = max(0.0, float(routing_balance_anneal_end))
+        self.routing_balance_anneal_epochs = max(0, int(routing_balance_anneal_epochs))
+        self.routing_balance_anneal_epoch_offset = max(0, int(routing_balance_anneal_epoch_offset))
+        self._current_lambda_routing_balance = float(self.lambda_routing_balance)
         self.routing_soft_train = bool(routing_soft_train)
         self.routing_soft_topk = int(routing_soft_topk)
         self.routing_temp_start = float(routing_temp_start)
@@ -177,16 +215,38 @@ class GaussianPhysicsTrainer:
         self.rerun_logger = rerun_logger
         self.show_progress = show_progress
         self._progress_prefix = ""
+        self.grad_norm_log_every_steps = max(0, int(grad_norm_log_every_steps))
+        self.raw_eval_every_epochs = max(1, int(raw_eval_every_epochs))
+        self.max_train_batches = max(0, int(max_train_batches))
+        self.max_val_batches = max(0, int(max_val_batches))
+        self.enable_soft_profile_sharing = bool(enable_soft_profile_sharing)
+        self.soft_profile_equiv_check_batches = max(1, int(soft_profile_equiv_check_batches))
+        self.soft_profile_mae_tolerance = float(max(0.0, soft_profile_mae_tolerance))
+        self.soft_profile_img_psnr_tolerance = float(max(0.0, soft_profile_img_psnr_tolerance))
+        self._disabled_soft_profile_share_keys: set[tuple[int, Optional[int]]] = set()
+        self._verified_soft_profile_share_keys: set[tuple[int, Optional[int]]] = set()
         self._probe_positions = None
         self._probe_neighbors = None
         self._optimizer_group_names: list[str] = []
         self._optimizer_group_base_lrs: list[float] = []
         self._ema_state_dict: Optional[Dict[str, torch.Tensor]] = None
+        self.amp_mode = str(amp_mode).strip().lower()
+        if self.amp_mode not in {"off", "bf16", "fp16"}:
+            raise ValueError(f"Unsupported amp_mode: {amp_mode}")
+        if self.device.type != "cuda":
+            self.amp_mode = "off"
+        self._use_amp = bool(self.amp_mode in {"bf16", "fp16"} and self.device.type == "cuda")
+        self._amp_dtype = (
+            torch.bfloat16 if self.amp_mode == "bf16" else (torch.float16 if self.amp_mode == "fp16" else None)
+        )
+        self._grad_scaler = torch.cuda.amp.GradScaler(enabled=(self.amp_mode == "fp16" and self.device.type == "cuda"))
 
         if self.image_loss_type not in {"mse", "charbonnier"}:
             raise ValueError(f"Unsupported image_loss_type: {self.image_loss_type}")
         if self.image_loss_space not in {"linear", "srgb"}:
             raise ValueError(f"Unsupported image_loss_space: {self.image_loss_space}")
+        if self.proxy_image_loss_mix_mode not in {"linear_log_mix", "linear_only", "log_only"}:
+            raise ValueError(f"Unsupported proxy_image_loss_mix_mode: {self.proxy_image_loss_mix_mode}")
         if self.sh_weight_mode != "basis":
             raise ValueError(f"Unsupported sh_weight_mode: {self.sh_weight_mode}")
 
@@ -252,6 +312,11 @@ class GaussianPhysicsTrainer:
             weight_decay=weight_decay,
         )
 
+    def _autocast_context(self):
+        if not self._use_amp or self._amp_dtype is None:
+            return nullcontext()
+        return torch.autocast(device_type=self.device.type, dtype=self._amp_dtype, enabled=True)
+
     def _model_state_dict_clone(self) -> Dict[str, Any]:
         state: Dict[str, Any] = {}
         for key, value in self.model.state_dict().items():
@@ -273,6 +338,43 @@ class GaussianPhysicsTrainer:
             else:
                 state[key] = value.detach().clone()
         return state
+
+    def _capture_rng_state(self) -> Dict[str, Any]:
+        state: Dict[str, Any] = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch_cpu": torch.random.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            try:
+                state["torch_cuda"] = torch.cuda.get_rng_state_all()
+            except Exception:
+                pass
+        return state
+
+    def _restore_rng_state(self, state: Dict[str, Any]) -> None:
+        if not isinstance(state, dict):
+            return
+        if "python" in state:
+            try:
+                random.setstate(state["python"])
+            except Exception:
+                pass
+        if "numpy" in state:
+            try:
+                np.random.set_state(state["numpy"])
+            except Exception:
+                pass
+        if "torch_cpu" in state:
+            try:
+                torch.random.set_rng_state(state["torch_cpu"])
+            except Exception:
+                pass
+        if "torch_cuda" in state and torch.cuda.is_available():
+            try:
+                torch.cuda.set_rng_state_all(state["torch_cuda"])
+            except Exception:
+                pass
 
     def _init_ema_state(self) -> None:
         self._ema_state_dict = {}
@@ -514,16 +616,33 @@ class GaussianPhysicsTrainer:
                 "routing_nonzero_ratio": 0.0,
             }
 
-        weights, _ = routing  # [B, K']
-        if weights.numel() == 0:
+        weights, indices = routing  # [B, K'], [B, K']
+        if weights.numel() == 0 or indices.numel() == 0:
             return torch.tensor(0.0, device=self.device), {
                 "routing_balance_loss": 0.0,
                 "routing_entropy": 0.0,
                 "routing_nonzero_ratio": 0.0,
             }
 
-        usage = torch.mean(weights, dim=0)
-        usage = usage / (torch.sum(usage) + 1e-8)
+        flat_weights = weights.reshape(-1)
+        flat_indices = indices.reshape(-1).to(dtype=torch.long)
+
+        num_experts = int(getattr(self.model, "K", 0))
+        if num_experts <= 0 and hasattr(self.model, "mu") and torch.is_tensor(getattr(self.model, "mu")):
+            num_experts = int(getattr(self.model, "mu").shape[0])
+        if flat_indices.numel() > 0:
+            num_experts = max(num_experts, int(flat_indices.max().item()) + 1)
+        if num_experts <= 0:
+            return torch.tensor(0.0, device=self.device), {
+                "routing_balance_loss": 0.0,
+                "routing_entropy": 0.0,
+                "routing_nonzero_ratio": 0.0,
+            }
+
+        # Aggregate usage by global expert id, not local top-k slot id.
+        usage_sum = torch.zeros((num_experts,), device=flat_weights.device, dtype=flat_weights.dtype)
+        usage_sum.scatter_add_(0, flat_indices, flat_weights)
+        usage = usage_sum / (torch.sum(usage_sum) + 1e-8)
         mean_usage = torch.mean(usage)
         var_usage = torch.mean((usage - mean_usage) ** 2)
         balance_loss = var_usage / (mean_usage * mean_usage + 1e-8)
@@ -548,6 +667,60 @@ class GaussianPhysicsTrainer:
             return float(self.routing_temp_end)
         progress = min(1.0, max(0.0, float(epoch - 1) / float(self.routing_temp_anneal_epochs)))
         return float(self.routing_temp_start + (self.routing_temp_end - self.routing_temp_start) * progress)
+
+    def _image_loss_weight_for_epoch(self, epoch: int) -> float:
+        base = float(self.image_loss_weight_target)
+        if base <= 0.0:
+            return 0.0
+        if self.image_loss_warmup_epochs <= 0:
+            return base
+        progress = min(1.0, max(0.0, float(epoch) / float(self.image_loss_warmup_epochs)))
+        return float(base * progress)
+
+    def _routing_balance_weight_for_epoch(self, epoch: int) -> float:
+        if not self.routing_balance_anneal_enabled:
+            return float(self.lambda_routing_balance)
+        start = float(self.routing_balance_anneal_start)
+        end = float(self.routing_balance_anneal_end)
+        if self.routing_balance_anneal_epochs <= 0:
+            return end
+        global_epoch = max(1, int(self.routing_balance_anneal_epoch_offset) + int(epoch))
+        progress = min(1.0, max(0.0, float(global_epoch - 1) / float(self.routing_balance_anneal_epochs)))
+        return float(start + (end - start) * progress)
+
+    @staticmethod
+    def _metric_higher_is_better(metric_name: str) -> bool:
+        return str(metric_name).strip().lower() in {"img_psnr"}
+
+    def _metric_init_best_value(self, metric_name: str) -> float:
+        if self._metric_higher_is_better(metric_name):
+            return float("-inf")
+        return float("inf")
+
+    def _metric_is_better(self, metric_name: str, current: Optional[float], best: float) -> bool:
+        if current is None:
+            return False
+        try:
+            current_f = float(current)
+        except Exception:
+            return False
+        if not np.isfinite(current_f):
+            return False
+        if self._metric_higher_is_better(metric_name):
+            return current_f > float(best)
+        return current_f < float(best)
+
+    def _metric_for_plateau_scheduler(self, metric_name: str, metrics: Dict[str, float]) -> float:
+        fallback = float(metrics.get("mae", 0.0))
+        value = metrics.get(metric_name, fallback)
+        try:
+            value_f = float(value)
+        except Exception:
+            value_f = fallback
+        if self._metric_higher_is_better(metric_name):
+            # ReduceLROnPlateau is configured in "min" mode.
+            return -value_f
+        return value_f
 
     def _get_sh_loss_weights(self, ref: torch.Tensor) -> torch.Tensor:
         w = self._sh_loss_weights_27.to(device=ref.device, dtype=ref.dtype)
@@ -607,35 +780,76 @@ class GaussianPhysicsTrainer:
         if self.image_loss_space == "srgb":
             image = self._srgb_encode(self._tone_map_reinhard(image))
         else:
-            image = torch.clamp(image, 0.0, 1.0)
+            image = torch.clamp(image, min=0.0)
         return image
 
-    def _compute_image_loss(self, pred_sh: torch.Tensor, target_sh: torch.Tensor) -> torch.Tensor:
-        if self.image_loss_weight <= 0:
-            return torch.tensor(0.0, device=pred_sh.device)
-        pred_img = self._render_sh_to_samples(pred_sh)
-        target_img = self._render_sh_to_samples(target_sh)
+    def _image_loss_from_samples(self, pred_img: torch.Tensor, target_img: torch.Tensor) -> torch.Tensor:
         if self.image_loss_type == "charbonnier":
             return charbonnier_loss(pred_img, target_img, epsilon=self.charbonnier_eps)
         return torch.mean((pred_img - target_img) ** 2)
 
-    def _compute_image_metrics(self, pred_sh: torch.Tensor, target_sh: torch.Tensor) -> Dict[str, float]:
-        from utils.unified_metrics import compute_pair_metrics
+    def _compute_image_loss_components(
+        self, pred_sh: torch.Tensor, target_sh: torch.Tensor
+    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        zero = torch.tensor(0.0, device=pred_sh.device, dtype=pred_sh.dtype)
+        components: Dict[str, torch.Tensor] = {
+            "linear": zero,
+            "log": zero,
+            "mix": zero,
+        }
+        if self._current_image_loss_weight <= 0:
+            return zero, components
 
         pred_img = self._render_sh_to_samples(pred_sh)
         target_img = self._render_sh_to_samples(target_sh)
-        metrics = compute_pair_metrics(
-            target_img,
-            pred_img,
-            max_i=1.0,
-            clip_unit=True,
-            ssim_mode="image",
-        )
+
+        mode = self.proxy_image_loss_mix_mode
+        linear_loss = zero
+        log_loss = zero
+
+        if mode in {"linear_log_mix", "linear_only"}:
+            linear_loss = self._image_loss_from_samples(pred_img, target_img)
+        if mode in {"linear_log_mix", "log_only"}:
+            pred_log = torch.log1p(torch.clamp(pred_img, min=0.0))
+            target_log = torch.log1p(torch.clamp(target_img, min=0.0))
+            log_loss = self._image_loss_from_samples(pred_log, target_log)
+
+        if mode == "linear_only":
+            mix_loss = linear_loss
+        elif mode == "log_only":
+            mix_loss = log_loss
+        else:
+            w = float(self.proxy_image_log_mix_weight)
+            mix_loss = (1.0 - w) * linear_loss + w * log_loss
+
+        components["linear"] = linear_loss
+        components["log"] = log_loss
+        components["mix"] = mix_loss
+        return mix_loss, components
+
+    def _compute_image_loss(self, pred_sh: torch.Tensor, target_sh: torch.Tensor) -> torch.Tensor:
+        loss, _ = self._compute_image_loss_components(pred_sh, target_sh)
+        return loss
+
+    @staticmethod
+    def _image_metric_tensors(pred_img: torch.Tensor, target_img: torch.Tensor) -> Dict[str, torch.Tensor]:
+        pred32 = pred_img.to(dtype=torch.float32)
+        target32 = target_img.to(dtype=torch.float32)
+        diff = pred32 - target32
+        mse = torch.mean(diff * diff)
+        mae = torch.mean(torch.abs(diff))
+        rmse = torch.sqrt(torch.clamp(mse, min=1e-12))
+        psnr = 10.0 * torch.log10(torch.tensor(1.0, device=pred32.device, dtype=pred32.dtype) / torch.clamp(mse, min=1e-12))
         return {
-            "img_mae": float(metrics["mae"]),
-            "img_rmse": float(metrics["rmse"]),
-            "img_psnr": float(metrics["psnr"]),
+            "img_mae": mae,
+            "img_rmse": rmse,
+            "img_psnr": psnr,
         }
+
+    def _compute_image_metrics(self, pred_sh: torch.Tensor, target_sh: torch.Tensor) -> Dict[str, torch.Tensor]:
+        pred_img = self._render_sh_to_samples(pred_sh)
+        target_img = self._render_sh_to_samples(target_sh)
+        return self._image_metric_tensors(pred_img=pred_img, target_img=target_img)
 
     def _recon_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         pred_eval, target_eval = pred, target
@@ -855,12 +1069,14 @@ class GaussianPhysicsTrainer:
         self._train_routing_mode = True
 
         totals = {
-            "total": 0.0,
-            "recon": 0.0,
-            "image": 0.0,
-            "coeff_l1": 0.0,
-            "linearity": 0.0,
-            "spatial": 0.0,
+            "total": torch.tensor(0.0, device=self.device),
+            "recon": torch.tensor(0.0, device=self.device),
+            "image": torch.tensor(0.0, device=self.device),
+            "image_linear": torch.tensor(0.0, device=self.device),
+            "image_log": torch.tensor(0.0, device=self.device),
+            "coeff_l1": torch.tensor(0.0, device=self.device),
+            "linearity": torch.tensor(0.0, device=self.device),
+            "spatial": torch.tensor(0.0, device=self.device),
             "routing_balance": 0.0,
             "routing_entropy": 0.0,
             "routing_nonzero_ratio": 0.0,
@@ -875,7 +1091,9 @@ class GaussianPhysicsTrainer:
                 desc = self._progress_prefix + " [train]" if self._progress_prefix else "train"
                 loader = _tqdm(train_loader, desc=desc, leave=False, unit="batch")
 
-            for batch in loader:
+            for step_idx, batch in enumerate(loader, start=1):
+                if self.max_train_batches > 0 and step_idx > self.max_train_batches:
+                    break
                 unpacked = self.adapter.unpack(batch, self.device)
                 if len(unpacked) == 4:
                     positions, params, targets, mask = unpacked
@@ -883,63 +1101,75 @@ class GaussianPhysicsTrainer:
                     positions, params, targets = unpacked
                     mask = None
 
-                self.optimizer.zero_grad()
-                routing = self._compute_routing(positions, for_training=True)
-            # TODO(perf): 一个训练 step 里除主前向外，还可能触发 image/temporal/linearity/spatial 等额外前向。
-            # 当正则全部开启时，单 step 的有效前向次数显著增加，是当前主要计算热点。
-                preds = self._forward(positions, params, mask, routing=routing)
+                self.optimizer.zero_grad(set_to_none=True)
+                with self._autocast_context():
+                    routing = self._compute_routing(positions, for_training=True)
+                    # TODO(perf): 一个训练 step 里除主前向外，还可能触发 image/temporal/linearity/spatial 等额外前向。
+                    # 当正则全部开启时，单 step 的有效前向次数显著增加，是当前主要计算热点。
+                    preds = self._forward(positions, params, mask, routing=routing)
 
-                loss_recon = self._recon_loss(preds, targets)
-                preds_eval, targets_eval = preds, targets
-                if self.adapter.target_inverse is not None:
-                    preds_eval, targets_eval = self.adapter.inverse_targets(preds, targets)
+                    loss_recon = self._recon_loss(preds, targets)
+                    preds_eval, targets_eval = preds, targets
+                    if self.adapter.target_inverse is not None:
+                        preds_eval, targets_eval = self.adapter.inverse_targets(preds, targets)
 
-                loss_image = self._compute_image_loss(preds_eval, targets_eval)
-                loss_temporal = self._compute_temporal_loss()
-                loss_linearity = self._compute_linearity_loss(positions, params, mask, preds, routing_full=routing)
-                loss_linearity_aug = self._compute_linearity_aug_loss(positions, params, mask, routing_full=routing)
-                probe_idx = batch.get("probe_idx") if isinstance(batch, dict) else None
-                loss_spatial = self._compute_spatial_loss(preds, params, mask, probe_idx)
-                loss_routing_balance = torch.tensor(0.0, device=self.device)
-                routing_stats = {
-                    "routing_balance_loss": 0.0,
-                    "routing_entropy": 0.0,
-                    "routing_nonzero_ratio": 0.0,
-                }
-                if self.lambda_routing_balance > 0.0:
-                    loss_routing_balance, routing_stats = self._compute_routing_balance_loss(routing)
+                    loss_image, image_loss_components = self._compute_image_loss_components(preds_eval, targets_eval)
+                    loss_temporal = self._compute_temporal_loss()
+                    loss_linearity = self._compute_linearity_loss(positions, params, mask, preds, routing_full=routing)
+                    loss_linearity_aug = self._compute_linearity_aug_loss(positions, params, mask, routing_full=routing)
+                    probe_idx = batch.get("probe_idx") if isinstance(batch, dict) else None
+                    loss_spatial = self._compute_spatial_loss(preds, params, mask, probe_idx)
+                    loss_routing_balance = torch.tensor(0.0, device=self.device)
+                    routing_stats = {
+                        "routing_balance_loss": 0.0,
+                        "routing_entropy": 0.0,
+                        "routing_nonzero_ratio": 0.0,
+                    }
+                    if self._current_lambda_routing_balance > 0.0:
+                        loss_routing_balance, routing_stats = self._compute_routing_balance_loss(routing)
 
-                loss_total = (
-                    loss_recon
-                    + self.image_loss_weight * loss_image
-                    + self.temporal_weight * loss_temporal
-                    + self.linearity_weight * (loss_linearity + loss_linearity_aug)
-                    + self.spatial_weight * loss_spatial
-                    + self.lambda_routing_balance * loss_routing_balance
-                )
+                    loss_total = (
+                        loss_recon
+                        + self._current_image_loss_weight * loss_image
+                        + self.temporal_weight * loss_temporal
+                        + self.linearity_weight * (loss_linearity + loss_linearity_aug)
+                        + self.spatial_weight * loss_spatial
+                        + self._current_lambda_routing_balance * loss_routing_balance
+                    )
 
-                loss_total.backward()
+                if self._grad_scaler.is_enabled():
+                    self._grad_scaler.scale(loss_total).backward()
+                    self._grad_scaler.unscale_(self.optimizer)
+                else:
+                    loss_total.backward()
 
-            # Record pre-clip gradient norms
-                pre_clip_norms = self._compute_grad_norms(prefix="grad_pre_clip")
-                pre_clip_norms_list.append(pre_clip_norms)
+                should_log_grad = self.grad_norm_log_every_steps > 0 and (step_idx % self.grad_norm_log_every_steps == 0)
+                if should_log_grad:
+                    pre_clip_norms = self._compute_grad_norms(prefix="grad_pre_clip")
+                    pre_clip_norms_list.append(pre_clip_norms)
 
                 if self.grad_clip is not None:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
 
-            # Record post-clip gradient norms
-                post_clip_norms = self._compute_grad_norms(prefix="grad_post_clip")
-                post_clip_norms_list.append(post_clip_norms)
+                if should_log_grad:
+                    post_clip_norms = self._compute_grad_norms(prefix="grad_post_clip")
+                    post_clip_norms_list.append(post_clip_norms)
 
-                self.optimizer.step()
+                if self._grad_scaler.is_enabled():
+                    self._grad_scaler.step(self.optimizer)
+                    self._grad_scaler.update()
+                else:
+                    self.optimizer.step()
                 self._update_ema()
 
-                totals["total"] += loss_total.item()
-                totals["recon"] += loss_recon.item()
-                totals["image"] += loss_image.item()
-                totals["coeff_l1"] += loss_temporal.item()
-                totals["linearity"] += (loss_linearity.item() + loss_linearity_aug.item())
-                totals["spatial"] += loss_spatial.item()
+                totals["total"] += loss_total.detach()
+                totals["recon"] += loss_recon.detach()
+                totals["image"] += loss_image.detach()
+                totals["image_linear"] += image_loss_components["linear"].detach()
+                totals["image_log"] += image_loss_components["log"].detach()
+                totals["coeff_l1"] += loss_temporal.detach()
+                totals["linearity"] += (loss_linearity.detach() + loss_linearity_aug.detach())
+                totals["spatial"] += loss_spatial.detach()
                 totals["routing_balance"] += float(routing_stats["routing_balance_loss"])
                 totals["routing_entropy"] += float(routing_stats["routing_entropy"])
                 totals["routing_nonzero_ratio"] += float(routing_stats["routing_nonzero_ratio"])
@@ -948,8 +1178,16 @@ class GaussianPhysicsTrainer:
             self._train_routing_mode = False
 
         # Average loss metrics
-        metrics = {k: v / max(1, num_batches) for k, v in totals.items()}
+        metrics = {}
+        denom = max(1, num_batches)
+        for k, v in totals.items():
+            if torch.is_tensor(v):
+                metrics[k] = float((v / denom).detach().item())
+            else:
+                metrics[k] = float(v / denom)
         metrics["routing_temp"] = float(self._current_routing_temp)
+        metrics["image_loss_weight"] = float(self._current_image_loss_weight)
+        metrics["routing_balance_lambda"] = float(self._current_lambda_routing_balance)
 
         # Average and add gradient norms
         avg_pre_clip = self._accumulate_grad_norms(pre_clip_norms_list)
@@ -971,7 +1209,15 @@ class GaussianPhysicsTrainer:
     ) -> Dict[str, float]:
         self.model.eval()
 
-        sums = {"mae": 0.0, "rmse": 0.0, "charbonnier": 0.0, "superposition": 0.0, "img_mae": 0.0, "img_rmse": 0.0, "img_psnr": 0.0}
+        sums = {
+            "mae": torch.tensor(0.0, device=self.device),
+            "rmse": torch.tensor(0.0, device=self.device),
+            "charbonnier": torch.tensor(0.0, device=self.device),
+            "superposition": torch.tensor(0.0, device=self.device),
+            "img_mae": torch.tensor(0.0, device=self.device),
+            "img_rmse": torch.tensor(0.0, device=self.device),
+            "img_psnr": torch.tensor(0.0, device=self.device),
+        }
         num_batches = 0
 
         loader = val_loader
@@ -979,7 +1225,9 @@ class GaussianPhysicsTrainer:
             desc = self._progress_prefix + " [val]" if self._progress_prefix else "val"
             loader = _tqdm(val_loader, desc=desc, leave=False, unit="batch")
 
-        for batch in loader:
+        for step_idx, batch in enumerate(loader, start=1):
+            if self.max_val_batches > 0 and step_idx > self.max_val_batches:
+                break
             unpacked = self.adapter.unpack(batch, self.device)
             if len(unpacked) == 4:
                 positions, params, targets, mask = unpacked
@@ -987,24 +1235,27 @@ class GaussianPhysicsTrainer:
                 positions, params, targets = unpacked
                 mask = None
 
-            preds = self._forward(
-                positions,
-                params,
-                mask,
-                top_k=top_k,
-                training_soft_routing=training_soft_routing,
-                routing_soft_topk=routing_soft_topk,
-                routing_temperature=routing_temperature,
-            )
-            preds_eval, targets_eval = self.adapter.inverse_targets(preds, targets)
+            with self._autocast_context():
+                preds = self._forward(
+                    positions,
+                    params,
+                    mask,
+                    top_k=top_k,
+                    training_soft_routing=training_soft_routing,
+                    routing_soft_topk=routing_soft_topk,
+                    routing_temperature=routing_temperature,
+                )
+                preds_eval, targets_eval = self.adapter.inverse_targets(preds, targets)
 
-            mae = torch.mean(torch.abs(preds_eval - targets_eval)).item()
-            rmse = torch.sqrt(torch.mean((preds_eval - targets_eval) ** 2)).item()
+            pred32 = preds_eval.to(dtype=torch.float32)
+            target32 = targets_eval.to(dtype=torch.float32)
+            mae = torch.mean(torch.abs(pred32 - target32))
+            rmse = torch.sqrt(torch.mean((pred32 - target32) ** 2))
 
             if self.recon_loss == "charbonnier":
-                charbonnier = charbonnier_loss(preds_eval, targets_eval, epsilon=self.charbonnier_eps).item()
+                charbonnier = charbonnier_loss(preds_eval, targets_eval, epsilon=self.charbonnier_eps).to(dtype=torch.float32)
             else:
-                charbonnier = 0.0
+                charbonnier = torch.tensor(0.0, device=self.device, dtype=torch.float32)
 
             sums["mae"] += mae
             sums["rmse"] += rmse
@@ -1017,11 +1268,178 @@ class GaussianPhysicsTrainer:
                 sums["img_psnr"] += img_metrics["img_psnr"]
 
             if self.compute_superposition_in_val and self.linearity_weight > 0:
-                sup_err = self._compute_linearity_loss(positions, params, mask, preds).item()
+                sup_err = self._compute_linearity_loss(positions, params, mask, preds).to(dtype=torch.float32)
                 sums["superposition"] += sup_err
             num_batches += 1
 
-        return {k: v / max(1, num_batches) for k, v in sums.items()}
+        denom = max(1, num_batches)
+        return {k: float((v / denom).detach().item()) for k, v in sums.items()}
+
+    @staticmethod
+    def _soft_profile_share_key(profile_kwargs: Dict[str, Any]) -> tuple[int, Optional[int]]:
+        top_k = int(profile_kwargs.get("top_k", 0))
+        soft_topk_raw = profile_kwargs.get("routing_soft_topk", None)
+        soft_topk = None if soft_topk_raw is None else int(soft_topk_raw)
+        return (top_k, soft_topk)
+
+    def _compute_soft_routing_exponent(
+        self,
+        positions: torch.Tensor,
+        *,
+        top_k: int,
+        routing_soft_topk: Optional[int],
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        if not (hasattr(self.model, "mu") and hasattr(self.model, "log_scale")):
+            return None
+        if not (torch.is_tensor(getattr(self.model, "mu")) and torch.is_tensor(getattr(self.model, "log_scale"))):
+            return None
+
+        mu = getattr(self.model, "mu")
+        log_scale = getattr(self.model, "log_scale")
+        num_experts = int(getattr(self.model, "K", int(mu.shape[0])))
+        if routing_soft_topk is None or int(routing_soft_topk) <= 0:
+            soft_k = num_experts
+        else:
+            soft_k = min(num_experts, max(int(routing_soft_topk), int(top_k)))
+
+        pos_expanded = positions.unsqueeze(1)
+        diff_all = mu.unsqueeze(0) - pos_expanded
+        distances = torch.sum(diff_all * diff_all, dim=-1)
+        _, topk_indices = torch.topk(distances, k=soft_k, largest=False, dim=-1)
+
+        selected_mu = mu[topk_indices]
+        selected_scale = torch.exp(log_scale[topk_indices])
+        diff = pos_expanded - selected_mu
+        exponent = -0.5 * torch.sum((diff / selected_scale) ** 2, dim=-1)
+        return exponent, topk_indices
+
+    @torch.no_grad()
+    def validate_epoch_soft_profile_group(
+        self,
+        val_loader: torch.utils.data.DataLoader,
+        *,
+        profiles: list[Dict[str, Any]],
+        check_equivalence: bool = False,
+    ) -> Dict[str, Dict[str, float]]:
+        if not profiles:
+            return {}
+
+        first = profiles[0]
+        top_k = int(first.get("top_k", self.top_k))
+        routing_soft_topk = first.get("routing_soft_topk", None)
+
+        sums: Dict[str, Dict[str, torch.Tensor]] = {}
+        for profile in profiles:
+            name = str(profile["name"])
+            sums[name] = {
+                "mae": torch.tensor(0.0, device=self.device),
+                "rmse": torch.tensor(0.0, device=self.device),
+                "charbonnier": torch.tensor(0.0, device=self.device),
+                "superposition": torch.tensor(0.0, device=self.device),
+                "img_mae": torch.tensor(0.0, device=self.device),
+                "img_rmse": torch.tensor(0.0, device=self.device),
+                "img_psnr": torch.tensor(0.0, device=self.device),
+            }
+
+        loader = val_loader
+        if self.show_progress and _tqdm is not None:
+            desc = self._progress_prefix + " [val-shared]" if self._progress_prefix else "val-shared"
+            loader = _tqdm(val_loader, desc=desc, leave=False, unit="batch")
+
+        num_batches = 0
+        for step_idx, batch in enumerate(loader, start=1):
+            if self.max_val_batches > 0 and step_idx > self.max_val_batches:
+                break
+
+            unpacked = self.adapter.unpack(batch, self.device)
+            if len(unpacked) == 4:
+                positions, params, targets, mask = unpacked
+            else:
+                positions, params, targets = unpacked
+                mask = None
+
+            with self._autocast_context():
+                routing_base = self._compute_soft_routing_exponent(
+                    positions,
+                    top_k=top_k,
+                    routing_soft_topk=routing_soft_topk,
+                )
+                if routing_base is None:
+                    raise RuntimeError("Soft profile sharing is unavailable for current model.")
+                exponent, topk_indices = routing_base
+
+            for profile in profiles:
+                profile_name = str(profile["name"])
+                temp = float(profile.get("routing_temperature", self._current_routing_temp))
+                temp = max(1e-6, temp)
+                with self._autocast_context():
+                    weights = torch.softmax(exponent / temp, dim=-1)
+                    preds = self._forward(positions, params, mask, routing=(weights, topk_indices), top_k=top_k)
+                    preds_eval, targets_eval = self.adapter.inverse_targets(preds, targets)
+
+                pred32 = preds_eval.to(dtype=torch.float32)
+                target32 = targets_eval.to(dtype=torch.float32)
+                mae = torch.mean(torch.abs(pred32 - target32))
+                rmse = torch.sqrt(torch.mean((pred32 - target32) ** 2))
+                if self.recon_loss == "charbonnier":
+                    charbonnier = charbonnier_loss(preds_eval, targets_eval, epsilon=self.charbonnier_eps).to(dtype=torch.float32)
+                else:
+                    charbonnier = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+
+                sums[profile_name]["mae"] += mae
+                sums[profile_name]["rmse"] += rmse
+                sums[profile_name]["charbonnier"] += charbonnier
+
+                if self.compute_img_metrics_in_val:
+                    img_m = self._compute_image_metrics(preds_eval, targets_eval)
+                    sums[profile_name]["img_mae"] += img_m["img_mae"]
+                    sums[profile_name]["img_rmse"] += img_m["img_rmse"]
+                    sums[profile_name]["img_psnr"] += img_m["img_psnr"]
+
+                if self.compute_superposition_in_val and self.linearity_weight > 0:
+                    sup_err = self._compute_linearity_loss(positions, params, mask, preds).to(dtype=torch.float32)
+                    sums[profile_name]["superposition"] += sup_err
+
+                if check_equivalence and step_idx <= self.soft_profile_equiv_check_batches:
+                    with self._autocast_context():
+                        legacy_preds = self._forward(
+                            positions,
+                            params,
+                            mask,
+                            top_k=top_k,
+                            training_soft_routing=True,
+                            routing_soft_topk=routing_soft_topk,
+                            routing_temperature=temp,
+                        )
+                        legacy_eval, _ = self.adapter.inverse_targets(legacy_preds, targets)
+                    legacy32 = legacy_eval.to(dtype=torch.float32)
+                    delta_mae = torch.mean(torch.abs(pred32 - legacy32))
+                    if float(delta_mae.detach().item()) > self.soft_profile_mae_tolerance:
+                        raise RuntimeError(
+                            f"soft-profile sharing equivalence failed for {profile_name}: "
+                            f"delta_mae={float(delta_mae.detach().item()):.6g}"
+                        )
+                    if self.compute_img_metrics_in_val:
+                        shared_psnr = self._compute_image_metrics(preds_eval, targets_eval)["img_psnr"]
+                        legacy_psnr = self._compute_image_metrics(legacy_eval, targets_eval)["img_psnr"]
+                        delta_psnr = torch.abs(shared_psnr - legacy_psnr)
+                        if float(delta_psnr.detach().item()) > self.soft_profile_img_psnr_tolerance:
+                            raise RuntimeError(
+                                f"soft-profile sharing equivalence failed for {profile_name}: "
+                                f"delta_img_psnr={float(delta_psnr.detach().item()):.6g}"
+                            )
+
+            num_batches += 1
+
+        denom = max(1, num_batches)
+        out: Dict[str, Dict[str, float]] = {}
+        for profile in profiles:
+            name = str(profile["name"])
+            out[name] = {
+                key: float((value / denom).detach().item())
+                for key, value in sums[name].items()
+            }
+        return out
 
     def _log_visualizations(self, epoch: int, val_loader: torch.utils.data.DataLoader):
         """Log 3D visualizations and SH comparisons to Rerun.
@@ -1151,13 +1569,16 @@ class GaussianPhysicsTrainer:
         best_metric_per_profile: str = "mae",
         log_every: int = 0,
         epoch_end_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        resume_state: Optional[Dict[str, Any]] = None,
+        save_resume_every: int = 1,
+        resume_checkpoint_name: str = "resume_latest.pt",
     ) -> Dict[str, Dict[str, list]]:
         history = {
             "train": {"total": [], "recon": [], "image": [], "coeff_l1": [], "linearity": [], "spatial": []},
             "val": {"mae": [], "rmse": [], "charbonnier": [], "superposition": [], "img_mae": [], "img_rmse": [], "img_psnr": []},
         }
 
-        best_value = float("inf")
+        best_value = self._metric_init_best_value(best_metric)
         val_profiles_resolved: list[Dict[str, Any]] = []
         if val_profiles:
             for profile in val_profiles:
@@ -1177,8 +1598,11 @@ class GaussianPhysicsTrainer:
                 )
 
         best_value_by_profile: Dict[str, float] = {
-            profile["name"]: float("inf") for profile in val_profiles_resolved
+            profile["name"]: self._metric_init_best_value(best_metric_per_profile)
+            for profile in val_profiles_resolved
         }
+
+        scheduler = None
 
         def _profile_checkpoint_filename(name: str) -> str:
             safe_name = re.sub(r"[^0-9a-zA-Z_\-]+", "_", str(name).strip())
@@ -1195,11 +1619,12 @@ class GaussianPhysicsTrainer:
             metric_name: str,
             profile_name: Optional[str] = None,
             profile_config: Optional[Dict[str, Any]] = None,
+            save_with_ema_weights: bool = False,
         ) -> None:
             path.parent.mkdir(parents=True, exist_ok=True)
             model_state_to_save = self._model_state_dict_clone()
             raw_state_for_ref = None
-            if self.ema_save_best:
+            if save_with_ema_weights and self.ema_save_best:
                 raw_state_for_ref = model_state_to_save
                 model_state_to_save = self._model_state_dict_with_ema()
             torch.save(
@@ -1211,12 +1636,16 @@ class GaussianPhysicsTrainer:
                     "ema_enabled": bool(self.ema_enabled),
                     "ema_eval": bool(self.ema_eval),
                     "ema_save_best": bool(self.ema_save_best),
-                    "saved_with_ema_weights": bool(self.ema_save_best),
+                    "saved_with_ema_weights": bool(save_with_ema_weights and self.ema_save_best),
                     "optimizer_state_dict": self.optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
                     "best_metric": best_value_to_save,
                     "best_metric_name": metric_name,
+                    "best_metric_by_profile": dict(best_value_by_profile),
                     "val_profile_name": profile_name,
                     "val_profile_config": profile_config,
+                    "history": history,
+                    "rng_state": self._capture_rng_state(),
                     "meta": checkpoint_meta,
                 },
                 path,
@@ -1237,16 +1666,76 @@ class GaussianPhysicsTrainer:
                 num_params=num_params
             )
 
-        scheduler = None
         if self.lr_scheduler == "cosine":
             scheduler = CosineAnnealingLR(self.optimizer, T_max=num_epochs, eta_min=self.lr_min)
         elif self.lr_scheduler == "plateau":
             scheduler = ReduceLROnPlateau(self.optimizer, mode="min", factor=0.5, patience=20, min_lr=self.lr_min)
 
+        start_epoch = 0
+        if isinstance(resume_state, dict):
+            start_epoch = int(resume_state.get("epoch", 0))
+            start_epoch = max(0, min(int(num_epochs), start_epoch))
+
+            optimizer_state = resume_state.get("optimizer_state_dict")
+            if isinstance(optimizer_state, dict):
+                self.optimizer.load_state_dict(optimizer_state)
+
+            if scheduler is not None:
+                scheduler_state = resume_state.get("scheduler_state_dict")
+                if isinstance(scheduler_state, dict):
+                    scheduler.load_state_dict(scheduler_state)
+                elif start_epoch > 0 and isinstance(scheduler, CosineAnnealingLR):
+                    # Backward compatibility: older checkpoints may not store scheduler state.
+                    for _ in range(start_epoch):
+                        scheduler.step()
+
+            if self.ema_enabled and isinstance(resume_state.get("ema_state_dict"), dict):
+                restored_ema: Dict[str, torch.Tensor] = {}
+                for key, value in resume_state["ema_state_dict"].items():
+                    if torch.is_tensor(value):
+                        restored_ema[key] = value.detach().clone()
+                self._ema_state_dict = restored_ema
+
+            history_state = resume_state.get("history")
+            if isinstance(history_state, dict):
+                if isinstance(history_state.get("train"), dict):
+                    for key in history["train"]:
+                        values = history_state["train"].get(key)
+                        if isinstance(values, list):
+                            history["train"][key] = list(values)
+                if isinstance(history_state.get("val"), dict):
+                    for key in history["val"]:
+                        values = history_state["val"].get(key)
+                        if isinstance(values, list):
+                            history["val"][key] = list(values)
+                if isinstance(history_state.get("val_profiles"), dict):
+                    history["val_profiles"] = history_state["val_profiles"]
+
+            if str(resume_state.get("best_metric_name", "")) == str(best_metric):
+                resumed_best = resume_state.get("best_metric")
+                if resumed_best is not None:
+                    best_value = float(resumed_best)
+
+            resumed_profile_best = resume_state.get("best_metric_by_profile")
+            if isinstance(resumed_profile_best, dict):
+                for profile_name in list(best_value_by_profile.keys()):
+                    if profile_name in resumed_profile_best:
+                        try:
+                            best_value_by_profile[profile_name] = float(resumed_profile_best[profile_name])
+                        except Exception:
+                            pass
+
+            rng_state = resume_state.get("rng_state")
+            if isinstance(rng_state, dict):
+                self._restore_rng_state(rng_state)
+
         self._init_spatial_neighbors(train_loader)
 
-        for epoch in range(1, num_epochs + 1):
+        for epoch in range(start_epoch + 1, num_epochs + 1):
             self._current_routing_temp = self._routing_temperature_for_epoch(epoch)
+            self._current_image_loss_weight = self._image_loss_weight_for_epoch(epoch)
+            self._current_lambda_routing_balance = self._routing_balance_weight_for_epoch(epoch)
+            self.image_loss_weight = float(self._current_image_loss_weight)
             if self.show_progress:
                 self._progress_prefix = f"epoch {epoch}/{num_epochs}"
             train_metrics = self.train_epoch(train_loader)
@@ -1266,13 +1755,21 @@ class GaussianPhysicsTrainer:
             val_metrics_ema = None
             val_profiles_metrics: Dict[str, Dict[str, float]] = {}
             if val_loader is not None:
-                val_metrics_raw = self.validate_epoch(val_loader)
+                run_raw_eval = True
+                if self.ema_eval:
+                    run_raw_eval = (
+                        epoch == 1
+                        or epoch == num_epochs
+                        or (self.raw_eval_every_epochs > 0 and epoch % self.raw_eval_every_epochs == 0)
+                    )
+                if run_raw_eval:
+                    val_metrics_raw = self.validate_epoch(val_loader)
                 if self.ema_eval:
                     with self._use_ema_weights():
                         val_metrics_ema = self.validate_epoch(val_loader)
                     val_metrics = val_metrics_ema
                 else:
-                    val_metrics = val_metrics_raw
+                    val_metrics = val_metrics_raw if val_metrics_raw is not None else self.validate_epoch(val_loader)
 
                 for key in history["val"]:
                     history["val"][key].append(val_metrics[key])
@@ -1287,6 +1784,8 @@ class GaussianPhysicsTrainer:
 
                 if val_profiles_resolved:
                     def _run_profile_eval() -> None:
+                        grouped_share_candidates: Dict[tuple[int, Optional[int]], list[Dict[str, Any]]] = {}
+                        fallback_profiles: list[Dict[str, Any]] = []
                         for profile in val_profiles_resolved:
                             profile_name = str(profile["name"])
                             profile_kwargs: Dict[str, Any] = {
@@ -1301,11 +1800,91 @@ class GaussianPhysicsTrainer:
                                 and profile_kwargs["routing_soft_topk"] is None
                                 and profile_kwargs["routing_temperature"] is None
                             ):
+                                val_profiles_metrics[profile_name] = dict(val_metrics)
+                                continue
+                            if (
+                                self.enable_soft_profile_sharing
+                                and bool(profile_kwargs["training_soft_routing"])
+                                and profile_kwargs["routing_temperature"] is not None
+                            ):
+                                share_key = self._soft_profile_share_key(profile_kwargs)
+                                if share_key not in self._disabled_soft_profile_share_keys:
+                                    grouped_share_candidates.setdefault(share_key, []).append(
+                                        {
+                                            "name": profile_name,
+                                            "top_k": int(profile_kwargs["top_k"]),
+                                            "routing_soft_topk": profile_kwargs["routing_soft_topk"],
+                                            "routing_temperature": float(profile_kwargs["routing_temperature"]),
+                                        }
+                                    )
+                                    continue
+                            fallback_profiles.append({"name": profile_name, "kwargs": profile_kwargs})
+
+                        for share_key, group_profiles in grouped_share_candidates.items():
+                            if len(group_profiles) < 2:
+                                fallback_profiles.extend(
+                                    [
+                                        {
+                                            "name": p["name"],
+                                            "kwargs": {
+                                                "top_k": int(p["top_k"]),
+                                                "training_soft_routing": True,
+                                                "routing_soft_topk": p["routing_soft_topk"],
+                                                "routing_temperature": p["routing_temperature"],
+                                            },
+                                        }
+                                        for p in group_profiles
+                                    ]
+                                )
+                                continue
+                            check_equivalence = share_key not in self._verified_soft_profile_share_keys
+                            try:
+                                grouped_metrics = self.validate_epoch_soft_profile_group(
+                                    val_loader,
+                                    profiles=group_profiles,
+                                    check_equivalence=check_equivalence,
+                                )
+                                self._verified_soft_profile_share_keys.add(share_key)
+                                for p in group_profiles:
+                                    name = str(p["name"])
+                                    if name in grouped_metrics:
+                                        val_profiles_metrics[name] = grouped_metrics[name]
+                            except Exception:
+                                self._disabled_soft_profile_share_keys.add(share_key)
+                                fallback_profiles.extend(
+                                    [
+                                        {
+                                            "name": p["name"],
+                                            "kwargs": {
+                                                "top_k": int(p["top_k"]),
+                                                "training_soft_routing": True,
+                                                "routing_soft_topk": p["routing_soft_topk"],
+                                                "routing_temperature": p["routing_temperature"],
+                                            },
+                                        }
+                                        for p in group_profiles
+                                    ]
+                                )
+
+                        for item in fallback_profiles:
+                            profile_name = str(item["name"])
+                            profile_kwargs = dict(item["kwargs"])
+                            if profile_name in val_profiles_metrics:
+                                continue
+                            if (
+                                profile_kwargs["top_k"] == int(self.top_k)
+                                and bool(profile_kwargs["training_soft_routing"]) is False
+                                and profile_kwargs["routing_soft_topk"] is None
+                                and profile_kwargs["routing_temperature"] is None
+                            ):
                                 profile_metrics = dict(val_metrics)
                             else:
                                 profile_metrics = self.validate_epoch(val_loader, **profile_kwargs)
-
                             val_profiles_metrics[profile_name] = profile_metrics
+
+                        for profile in val_profiles_resolved:
+                            profile_name = str(profile["name"])
+                            profile_metrics = val_profiles_metrics.get(profile_name, {})
                             if self.rerun_logger:
                                 self.rerun_logger.log_scalars(epoch, profile_metrics, f"val/{profile_name}")
 
@@ -1325,13 +1904,14 @@ class GaussianPhysicsTrainer:
 
                 if save_best and output_dir is not None:
                     current = val_metrics.get(best_metric, None)
-                    if current is not None and current < best_value:
-                        best_value = current
+                    if self._metric_is_better(best_metric, current, best_value):
+                        best_value = float(current)
                         _save_checkpoint(
                             path=output_dir / "best_model.pt",
                             epoch=epoch,
                             best_value_to_save=float(best_value),
                             metric_name=str(best_metric),
+                            save_with_ema_weights=True,
                         )
 
                 if save_best_profiles and output_dir is not None and val_profiles_metrics:
@@ -1341,8 +1921,11 @@ class GaussianPhysicsTrainer:
                         current_profile_value = profile_metrics.get(best_metric_per_profile, None)
                         if current_profile_value is None:
                             continue
-                        previous = best_value_by_profile.get(profile_name, float("inf"))
-                        if current_profile_value < previous:
+                        previous = best_value_by_profile.get(
+                            profile_name,
+                            self._metric_init_best_value(best_metric_per_profile),
+                        )
+                        if self._metric_is_better(best_metric_per_profile, current_profile_value, previous):
                             best_value_by_profile[profile_name] = float(current_profile_value)
                             _save_checkpoint(
                                 path=output_dir / _profile_checkpoint_filename(profile_name),
@@ -1351,6 +1934,7 @@ class GaussianPhysicsTrainer:
                                 metric_name=str(best_metric_per_profile),
                                 profile_name=profile_name,
                                 profile_config=profile,
+                                save_with_ema_weights=True,
                             )
             in_warmup = self._apply_warmup(epoch)
             if scheduler is not None:
@@ -1359,7 +1943,7 @@ class GaussianPhysicsTrainer:
                         if val_metrics is None:
                             scheduler.step(train_metrics.get("total", 0.0))
                         else:
-                            scheduler.step(val_metrics.get(best_metric, val_metrics["mae"]))
+                            scheduler.step(self._metric_for_plateau_scheduler(best_metric, val_metrics))
                 elif not in_warmup:
                     scheduler.step()
 
@@ -1401,6 +1985,8 @@ class GaussianPhysicsTrainer:
                     f"Epoch {epoch}/{num_epochs} | "
                     f"Train total={train_metrics['total']:.6f}, "
                     f"recon={train_metrics['recon']:.6f}, "
+                    f"lambda_img={float(self._current_image_loss_weight):.4g}, "
+                    f"lambda_balance={float(self._current_lambda_routing_balance):.4g}, "
                     f"coeff_l1={train_metrics['coeff_l1']:.6f}, "
                     f"linearity={train_metrics['linearity']:.6f}"
                 )
@@ -1413,20 +1999,23 @@ class GaussianPhysicsTrainer:
                     )
                 print(msg)
 
+            if output_dir is not None and int(save_resume_every) > 0 and epoch % int(save_resume_every) == 0:
+                _save_checkpoint(
+                    path=output_dir / str(resume_checkpoint_name),
+                    epoch=epoch,
+                    best_value_to_save=float(best_value) if np.isfinite(float(best_value)) else None,
+                    metric_name=str(best_metric),
+                    save_with_ema_weights=False,
+                )
+
         if output_dir is not None:
             output_dir.mkdir(parents=True, exist_ok=True)
-            torch.save(
-                {
-                    "epoch": num_epochs,
-                    "model_state_dict": self._model_state_dict_clone(),
-                    "ema_state_dict": self._ema_state_dict,
-                    "ema_enabled": bool(self.ema_enabled),
-                    "ema_eval": bool(self.ema_eval),
-                    "ema_save_best": bool(self.ema_save_best),
-                    "optimizer_state_dict": self.optimizer.state_dict(),
-                    "meta": checkpoint_meta,
-                },
-                output_dir / "last_model.pt",
+            _save_checkpoint(
+                path=output_dir / "last_model.pt",
+                epoch=num_epochs,
+                best_value_to_save=float(best_value) if np.isfinite(float(best_value)) else None,
+                metric_name=str(best_metric),
+                save_with_ema_weights=False,
             )
 
         return history

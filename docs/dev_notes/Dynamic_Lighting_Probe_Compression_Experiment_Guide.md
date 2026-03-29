@@ -213,5 +213,4 @@ L = L_recon + λ_lin * L_lin + λ_temp * L_temp
 - 所有实验必须记录到 `metadata/project.db`
 - 每次实验结束后执行：
   - `python tools/logexp.py log ...`
-  - `python tools/summarize_state.py`
-
+  - `python tools/logexp.py query --limit 10`

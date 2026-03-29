@@ -53,6 +53,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--warmup-steps", type=int, default=30)
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--num-workers", type=int, default=None)
+    p.add_argument("--amp-mode", choices=["off", "bf16", "fp16"], default=None)
+    p.add_argument("--torch-compile", action="store_true", dest="torch_compile")
+    p.add_argument("--no-torch-compile", action="store_false", dest="torch_compile")
+    p.set_defaults(torch_compile=None)
+    p.add_argument("--torch-compile-mode", choices=["default", "reduce-overhead", "max-autotune"], default=None)
+    p.add_argument("--torch-compile-dynamic", action="store_true", dest="torch_compile_dynamic")
+    p.add_argument("--no-torch-compile-dynamic", action="store_false", dest="torch_compile_dynamic")
+    p.set_defaults(torch_compile_dynamic=None)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--stack", choices=["torch", "nsys", "both"], default="both")
     p.add_argument("--enable-extra-losses", action="store_true")
@@ -87,6 +95,24 @@ def _prepare_train_args(args: argparse.Namespace, train_module: Any):
         run_args.num_workers = int(args.num_workers)
     if args.checkpoint is not None:
         run_args.load_model = args.checkpoint
+
+    performance_cfg = train_module._resolve_performance_config(run_args)
+    run_args.amp_mode = str(performance_cfg.get("amp_mode", getattr(run_args, "amp_mode", "off")))
+    run_args.torch_compile = bool(performance_cfg.get("torch_compile_enabled", getattr(run_args, "torch_compile", False)))
+    run_args.torch_compile_mode = str(
+        performance_cfg.get("torch_compile_mode", getattr(run_args, "torch_compile_mode", "reduce-overhead"))
+    )
+    run_args.torch_compile_dynamic = bool(
+        performance_cfg.get("torch_compile_dynamic", getattr(run_args, "torch_compile_dynamic", False))
+    )
+    if args.amp_mode is not None:
+        run_args.amp_mode = str(args.amp_mode)
+    if args.torch_compile is not None:
+        run_args.torch_compile = bool(args.torch_compile)
+    if args.torch_compile_mode is not None:
+        run_args.torch_compile_mode = str(args.torch_compile_mode)
+    if args.torch_compile_dynamic is not None:
+        run_args.torch_compile_dynamic = bool(args.torch_compile_dynamic)
 
     run_args.seed = int(args.seed)
     run_args.steps = int(args.steps)
@@ -140,6 +166,19 @@ def _profile_training_steps(train_module: Any, run_args: argparse.Namespace, out
     model, adapter, loaders, helpers = train_module.build_variant(run_args.variant, run_args, device)
     train_loader = loaders[0]
 
+    compile_requested = bool(getattr(run_args, "torch_compile", False))
+    compile_applied = False
+    if compile_requested:
+        try:
+            model = torch.compile(
+                model,
+                mode=str(getattr(run_args, "torch_compile_mode", "reduce-overhead")),
+                dynamic=bool(getattr(run_args, "torch_compile_dynamic", False)),
+            )
+            compile_applied = True
+        except Exception:
+            compile_applied = False
+
     if not run_args.no_init:
         helpers["init_fn"](model, train_loader)
         model.to(device)
@@ -182,6 +221,18 @@ def _profile_training_steps(train_module: Any, run_args: argparse.Namespace, out
     loops = total_steps + warmup_steps
     batch_iter = _iter_batches(train_loader)
 
+    amp_mode = str(getattr(run_args, "amp_mode", "off")).strip().lower()
+    if device.type != "cuda":
+        amp_mode = "off"
+    use_amp = amp_mode in {"bf16", "fp16"}
+    amp_dtype = torch.bfloat16 if amp_mode == "bf16" else (torch.float16 if amp_mode == "fp16" else None)
+    grad_scaler = torch.cuda.amp.GradScaler(enabled=(amp_mode == "fp16" and device.type == "cuda"))
+
+    def _autocast_ctx():
+        if use_amp and amp_dtype is not None:
+            return torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=True)
+        return nullcontext()
+
     use_torch_stack = run_args.stack in ("torch", "both")
     prof_ctx = nullcontext()
     prof = None
@@ -216,43 +267,53 @@ def _profile_training_steps(train_module: Any, run_args: argparse.Namespace, out
             trainer.optimizer.zero_grad(set_to_none=True)
 
             t_fwd0 = time.perf_counter()
-            routing = trainer._compute_routing(positions)
-            preds = trainer._forward(positions, params, mask, routing=routing)
+            with _autocast_ctx():
+                routing = trainer._compute_routing(positions)
+                preds = trainer._forward(positions, params, mask, routing=routing)
             _sync_if_cuda(device)
             t_fwd1 = time.perf_counter()
 
             t_loss0 = time.perf_counter()
-            loss_recon = trainer._recon_loss(preds, targets)
-            preds_eval, targets_eval = preds, targets
-            if trainer.adapter.target_inverse is not None:
-                preds_eval, targets_eval = trainer.adapter.inverse_targets(preds, targets)
+            with _autocast_ctx():
+                loss_recon = trainer._recon_loss(preds, targets)
+                preds_eval, targets_eval = preds, targets
+                if trainer.adapter.target_inverse is not None:
+                    preds_eval, targets_eval = trainer.adapter.inverse_targets(preds, targets)
 
-            loss_image = trainer._compute_image_loss(preds_eval, targets_eval)
-            loss_temporal = trainer._compute_temporal_loss()
-            loss_linearity = trainer._compute_linearity_loss(positions, params, mask, preds, routing_full=routing)
-            loss_linearity_aug = trainer._compute_linearity_aug_loss(positions, params, mask, routing_full=routing)
-            probe_idx = batch.get("probe_idx") if isinstance(batch, dict) else None
-            loss_spatial = trainer._compute_spatial_loss(preds, params, mask, probe_idx)
+                loss_image = trainer._compute_image_loss(preds_eval, targets_eval)
+                loss_temporal = trainer._compute_temporal_loss()
+                loss_linearity = trainer._compute_linearity_loss(positions, params, mask, preds, routing_full=routing)
+                loss_linearity_aug = trainer._compute_linearity_aug_loss(positions, params, mask, routing_full=routing)
+                probe_idx = batch.get("probe_idx") if isinstance(batch, dict) else None
+                loss_spatial = trainer._compute_spatial_loss(preds, params, mask, probe_idx)
 
-            loss_total = (
-                loss_recon
-                + trainer.image_loss_weight * loss_image
-                + trainer.temporal_weight * loss_temporal
-                + trainer.linearity_weight * (loss_linearity + loss_linearity_aug)
-                + trainer.spatial_weight * loss_spatial
-            )
+                loss_total = (
+                    loss_recon
+                    + trainer.image_loss_weight * loss_image
+                    + trainer.temporal_weight * loss_temporal
+                    + trainer.linearity_weight * (loss_linearity + loss_linearity_aug)
+                    + trainer.spatial_weight * loss_spatial
+                )
             _sync_if_cuda(device)
             t_loss1 = time.perf_counter()
 
             t_bwd0 = time.perf_counter()
-            loss_total.backward()
+            if grad_scaler.is_enabled():
+                grad_scaler.scale(loss_total).backward()
+                grad_scaler.unscale_(trainer.optimizer)
+            else:
+                loss_total.backward()
             if trainer.grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), trainer.grad_clip)
             _sync_if_cuda(device)
             t_bwd1 = time.perf_counter()
 
             t_opt0 = time.perf_counter()
-            trainer.optimizer.step()
+            if grad_scaler.is_enabled():
+                grad_scaler.step(trainer.optimizer)
+                grad_scaler.update()
+            else:
+                trainer.optimizer.step()
             trainer._update_ema()
             _sync_if_cuda(device)
             t_opt1 = time.perf_counter()
@@ -283,6 +344,9 @@ def _profile_training_steps(train_module: Any, run_args: argparse.Namespace, out
         "steps": int(total_steps),
         "warmup_steps": int(warmup_steps),
         "device": str(device),
+        "amp_mode": amp_mode,
+        "torch_compile_requested": bool(compile_requested),
+        "torch_compile_applied": bool(compile_applied),
         "latency": {
             "dataloader_wait": summarize_latency([r["dataloader_wait_ms"] for r in rows]),
             "step": summarize_latency([r["step_ms"] for r in rows]),
@@ -352,6 +416,18 @@ def _build_self_torch_cmd(args: argparse.Namespace, out_dir: Path) -> list[str]:
         cmd.extend(["--batch-size", str(args.batch_size)])
     if args.num_workers is not None:
         cmd.extend(["--num-workers", str(args.num_workers)])
+    if args.amp_mode is not None:
+        cmd.extend(["--amp-mode", str(args.amp_mode)])
+    if args.torch_compile is True:
+        cmd.append("--torch-compile")
+    elif args.torch_compile is False:
+        cmd.append("--no-torch-compile")
+    if args.torch_compile_mode is not None:
+        cmd.extend(["--torch-compile-mode", str(args.torch_compile_mode)])
+    if args.torch_compile_dynamic is True:
+        cmd.append("--torch-compile-dynamic")
+    elif args.torch_compile_dynamic is False:
+        cmd.append("--no-torch-compile-dynamic")
     if args.checkpoint is not None:
         cmd.extend(["--checkpoint", str(args.checkpoint)])
     if args.enable_extra_losses:
@@ -408,4 +484,3 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
-

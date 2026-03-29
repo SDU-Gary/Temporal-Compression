@@ -1,6 +1,6 @@
 experiment:
   variant: unified_set
-  output_dir: 3_experiments/results/bistro_clean_v2/exp_A1_1_joint_lrs_ema
+  output_dir: 3_experiments/results/bistro_clean_v2/exp_A1_6_P1_bypassB_proxy_l001
   device: cuda
   seed: 42
 
@@ -20,19 +20,28 @@ model:
   intensity_dim: 3
   intensity_offset: 1
   disable_film: false
+  light_encoder_mode: bypass_linear
+  bypass_feature_pairs:
+    - [0, 5]
+    - [1, 6]
+  bypass_feature_norm_mean:
+    - -0.8408854603767395
+    - 0.00390212656930089
+  bypass_feature_norm_std:
+    - 0.08430388569831848
+    - 0.49811413884162903
 
 training:
-  epochs: 2000
+  epochs: 400
   lr: 1.0e-3
   weight_decay: 0.0
   lr_scheduler: cosine
   lr_min: 1.0e-6
-  warmup_epochs: 50
+  warmup_epochs: 20
   dataloader_timeout_seconds: 120
   dataloader_prefetch_factor: 2
   dataloader_persistent_workers: false
   dataloader_multiprocessing_context: none
-  resume: null
   resume_save_every: 1
   resume_checkpoint_name: resume_latest.pt
   heartbeat_enabled: true
@@ -45,11 +54,9 @@ training:
   enable_sh_scaler: false
   enable_weighted_sh_loss: false
   lambda_image: 0.0
-  # Proxy image loss (differentiable SH->image surrogate).
-  # When enabled, this block overrides lambda_image and forces val image metrics.
   proxy_image_loss:
     enabled: true
-    lambda: 0.02
+    lambda: 0.01
     warmup_epochs: 120
     enable_val_image_metrics: true
     mix_mode: linear_log_mix
@@ -58,7 +65,7 @@ training:
   routing_balance_anneal:
     enabled: true
     start: 0.02
-    end: 0.0
+    end: 0.005
     decay_end_ratio: 0.6
   routing_soft_train: true
   routing_soft_topk: 8
@@ -103,6 +110,19 @@ training:
     mlp_batch_size: 256
     timeout_seconds: 1800
     fail_on_timeout: false
+    checkpoints:
+      - global_best_falcor.pt
+      - global_best_val_soft8_t018.pt
+      - best_model.pt
+      - last_model.pt
+
+  global_best:
+    enabled: true
+    track_falcor: true
+    track_soft_profile: true
+    soft_profile_name: soft8_t018
+    soft_metric: img_psnr
+    soft_metric_maximize: true
 
   expert_utilization_audit:
     enabled: false
@@ -176,7 +196,6 @@ training:
   test_compare_profiles:
     enabled: true
 
-  # Low-frequency Falcor evaluation for true render-domain model selection.
   falcor_periodic_eval:
     enabled: true
     scene: 1_data_generation/falcor/scenes/bistro_exterior_emissive_spheres.pyscene
@@ -206,7 +225,7 @@ training:
       routing_temperature: 0.18
 
   performance:
-    amp_mode: off
+    amp_mode: "off"
     grad_norm_log_every_steps: 10
     torch_compile:
       enabled: false
@@ -221,12 +240,12 @@ training:
   staged:
     enabled: true
     stages:
-      - name: warmup_joint_fast
-        epochs: 800
+      - name: stage1_bypass_linear
+        epochs: 400
         lr: 8.0e-4
         lr_scheduler: cosine
         lr_min: 1.0e-6
-        warmup_epochs: 40
+        warmup_epochs: 20
         trainable_groups: [coeff, encoder, film, routing]
         group_lrs:
           all: 1.0e-4
@@ -234,27 +253,11 @@ training:
           encoder: 8.0e-4
           film: 8.0e-4
           routing: 2.0e-4
-        best_metric: mae
-
-      - name: joint_refine
-        epochs: 1200
-        lr: 4.0e-4
-        lr_scheduler: cosine
-        lr_min: 1.0e-6
-        warmup_epochs: 20
-        trainable_groups: [all]
-        group_lrs:
-          all: 1.0e-5
-          coeff: 4.0e-4
-          encoder: 4.0e-4
-          film: 4.0e-4
-          basis: 5.0e-5
-          routing: 1.0e-5
-        best_metric: mae
+        best_metric: img_psnr
 
 evaluation:
-  output_dir: 3_experiments/results/bistro_clean_v2/exp_A1_1_joint_lrs_ema/eval
-  checkpoint: 3_experiments/results/bistro_clean_v2/exp_A1_1_joint_lrs_ema/best_model.pt
+  output_dir: 3_experiments/results/bistro_clean_v2/exp_A1_6_P1_bypassB_proxy_l001/eval
+  checkpoint: 3_experiments/results/bistro_clean_v2/exp_A1_6_P1_bypassB_proxy_l001/global_best_falcor.pt
   data_root: 1_data_generation/output/bistro_clean_v2
   rank: 8
   n_samples: 20

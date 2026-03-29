@@ -205,7 +205,7 @@ Always activate: `source venv/bin/activate`
 
 ## Anti-Patterns to Avoid
 
-1. **Never guess dataset paths** — Query database or check `docs/dev_notes/project_state.md`
+1. **Never guess dataset paths** — Query database (`metadata/project.db`) first; use `docs/dev_notes/project_state.md` only as historical snapshot
 2. **Never use deprecated methods** — TemporalMLP and TPE are archived; use PG-GCPL (GaussianPhysicsCompressionUnified)
 3. **Never modify BSDF physical realism** — Mitsuba rendering parameters are calibrated
 4. **Never bypass virtual environment** — Dependencies are version-specific
@@ -248,7 +248,8 @@ Always activate: `source venv/bin/activate`
 
 ## Additional Documentation
 
+- `docs/dev_notes/DEVELOPMENT_TRUTH_2026-03-08.md`: Current code-truth snapshot (date-versioned)
 - `docs/dev_notes/CLAUDE.md`: 588-line comprehensive development guide
 - `AGENTS.md`: Project knowledge base
-- `docs/dev_notes/project_state.md`: Auto-generated project context
+- `docs/dev_notes/project_state.md`: Historical project context snapshot (not auto-generated in current repo)
 - `README.md`: Quick start guide

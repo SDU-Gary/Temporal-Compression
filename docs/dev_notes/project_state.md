@@ -2,6 +2,7 @@
 
 **Generated**: 2026-01-08 11:49:49
 **DB Last Updated**: 2026-01-08 11:48:47
+**Status**: Historical snapshot (not auto-generated in current repository state)
 
 ---
 
@@ -75,15 +76,15 @@
 ## Action Protocol
 
 **After conversation compact**:
-1. Run: `python tools/summarize_state.py` to regenerate this file
-2. Run: `cat project_state.md` to read context
+1. Query live DB first: `python tools/logexp.py query --limit 10`
+2. Optionally read this snapshot: `cat docs/dev_notes/project_state.md`
 3. Read [ENV], [TASKS], [MILESTONES], [RECENT] sections
 4. **NEVER guess dataset paths** - query DB or check this file
 
 **After completing experiment**:
 1. Log immediately: `python tools/logexp.py log --phase ... --results ...`
 2. If baseline: `python tools/logexp.py set-baseline <exp_id>`
-3. Regenerate: `python tools/summarize_state.py`
+3. Verify persistence: `python tools/logexp.py query --limit 5`
 
 **For task planning**:
 1. Add task: `python tools/logexp.py add-task "..." --priority 2`

@@ -1,16 +1,14 @@
 experiment:
   variant: unified_set
-  output_dir: 3_experiments/results/bistro_clean_v2/exp_A1_1_joint_lrs_ema
+  output_dir: 3_experiments/results/bistro_clean_v2/exp_A1_7_P0_bypassB_seed73
   device: cuda
-  seed: 42
-
+  seed: 73
 data:
   data_root: 1_data_generation/output/bistro_clean_v2
   train_ratio: 0.7
   val_ratio: 0.15
   batch_size: 512
   num_workers: 0
-
 model:
   num_gaussians: 30
   rank: 8
@@ -20,24 +18,33 @@ model:
   intensity_dim: 3
   intensity_offset: 1
   disable_film: false
-
+  light_encoder_mode: bypass_linear
+  bypass_feature_pairs:
+  - - 0
+    - 5
+  - - 1
+    - 6
+  bypass_feature_norm_mean:
+  - -0.8408854603767395
+  - 0.00390212656930089
+  bypass_feature_norm_std:
+  - 0.08430388569831848
+  - 0.49811413884162903
 training:
-  epochs: 2000
-  lr: 1.0e-3
+  epochs: 400
+  lr: 0.001
   weight_decay: 0.0
   lr_scheduler: cosine
-  lr_min: 1.0e-6
-  warmup_epochs: 50
+  lr_min: 1.0e-06
+  warmup_epochs: 20
   dataloader_timeout_seconds: 120
   dataloader_prefetch_factor: 2
   dataloader_persistent_workers: false
   dataloader_multiprocessing_context: none
-  resume: null
   resume_save_every: 1
   resume_checkpoint_name: resume_latest.pt
   heartbeat_enabled: true
   heartbeat_history: true
-
   recon_loss: charbonnier
   lambda_temporal: 0.001
   lambda_linearity: 0.1
@@ -45,8 +52,6 @@ training:
   enable_sh_scaler: false
   enable_weighted_sh_loss: false
   lambda_image: 0.0
-  # Proxy image loss (differentiable SH->image surrogate).
-  # When enabled, this block overrides lambda_image and forces val image metrics.
   proxy_image_loss:
     enabled: true
     lambda: 0.02
@@ -58,21 +63,19 @@ training:
   routing_balance_anneal:
     enabled: true
     start: 0.02
-    end: 0.0
+    end: 0.005
     decay_end_ratio: 0.6
   routing_soft_train: true
   routing_soft_topk: 8
   routing_temp_start: 1.0
   routing_temp_end: 0.2
   routing_temp_anneal_epochs: 320
-
   ema:
     enabled: true
     decay: 0.999
     eval_on_ema: true
     save_best_with_ema: true
     raw_eval_every_epochs: 10
-
   oracle_monitor:
     enabled: true
     split: test
@@ -85,7 +88,6 @@ training:
     num_workers: 0
     timeout_seconds: 240
     fail_on_timeout: false
-
   coeff_suite:
     enabled: true
     run_after_training: true
@@ -96,14 +98,25 @@ training:
     batch_size: 512
     num_workers: 0
     probe_train_ratio: 0.8
-    ridge_alpha: 1.0e-4
+    ridge_alpha: 0.0001
     mlp_hidden: 128
     mlp_epochs: 30
-    mlp_lr: 1.0e-3
+    mlp_lr: 0.001
     mlp_batch_size: 256
     timeout_seconds: 1800
     fail_on_timeout: false
-
+    checkpoints:
+    - global_best_falcor.pt
+    - global_best_val_soft8_t018.pt
+    - best_model.pt
+    - last_model.pt
+  global_best:
+    enabled: true
+    track_falcor: true
+    track_soft_profile: true
+    soft_profile_name: soft8_t018
+    soft_metric: img_psnr
+    soft_metric_maximize: true
   expert_utilization_audit:
     enabled: false
     run_after_training: true
@@ -116,15 +129,14 @@ training:
     timeout_seconds: 900
     fail_on_timeout: false
     profiles:
-      - name: hard3
-        top_k: 3
-        training_soft_routing: false
-      - name: soft8_t020
-        top_k: 3
-        training_soft_routing: true
-        routing_soft_topk: 8
-        routing_temperature: 0.20
-
+    - name: hard3
+      top_k: 3
+      training_soft_routing: false
+    - name: soft8_t020
+      top_k: 3
+      training_soft_routing: true
+      routing_soft_topk: 8
+      routing_temperature: 0.2
   semantic_drift_audit:
     enabled: false
     run_after_training: true
@@ -137,46 +149,42 @@ training:
     timeout_seconds: 1200
     fail_on_timeout: false
     pairs:
-      - name: best_vs_last
-        checkpoint_a: best_model.pt
-        checkpoint_b: last_model.pt
+    - name: best_vs_last
+      checkpoint_a: best_model.pt
+      checkpoint_b: last_model.pt
     profiles:
-      - name: hard3
-        top_k: 3
-        training_soft_routing: false
-      - name: soft8_t020
-        top_k: 3
-        training_soft_routing: true
-        routing_soft_topk: 8
-        routing_temperature: 0.20
-
+    - name: hard3
+      top_k: 3
+      training_soft_routing: false
+    - name: soft8_t020
+      top_k: 3
+      training_soft_routing: true
+      routing_soft_topk: 8
+      routing_temperature: 0.2
   val_profiles:
     enabled: true
     best_metric: img_psnr
     profiles:
-      - name: hard3
-        top_k: 3
-        training_soft_routing: false
-      - name: soft8_t018
-        top_k: 3
-        training_soft_routing: true
-        routing_soft_topk: 8
-        routing_temperature: 0.18
-      - name: soft8_t020
-        top_k: 3
-        training_soft_routing: true
-        routing_soft_topk: 8
-        routing_temperature: 0.20
-      - name: soft8_t022
-        top_k: 3
-        training_soft_routing: true
-        routing_soft_topk: 8
-        routing_temperature: 0.22
-
+    - name: hard3
+      top_k: 3
+      training_soft_routing: false
+    - name: soft8_t018
+      top_k: 3
+      training_soft_routing: true
+      routing_soft_topk: 8
+      routing_temperature: 0.18
+    - name: soft8_t020
+      top_k: 3
+      training_soft_routing: true
+      routing_soft_topk: 8
+      routing_temperature: 0.2
+    - name: soft8_t022
+      top_k: 3
+      training_soft_routing: true
+      routing_soft_topk: 8
+      routing_temperature: 0.22
   test_compare_profiles:
     enabled: true
-
-  # Low-frequency Falcor evaluation for true render-domain model selection.
   falcor_periodic_eval:
     enabled: true
     scene: 1_data_generation/falcor/scenes/bistro_exterior_emissive_spheres.pyscene
@@ -204,9 +212,8 @@ training:
       training_soft_routing: true
       routing_soft_topk: 8
       routing_temperature: 0.18
-
   performance:
-    amp_mode: off
+    amp_mode: 'off'
     grad_norm_log_every_steps: 10
     torch_compile:
       enabled: false
@@ -215,46 +222,32 @@ training:
     soft_profile_sharing:
       enabled: true
       equiv_check_batches: 2
-      mae_tolerance: 1.0e-6
-      img_psnr_tolerance: 5.0e-4
-
+      mae_tolerance: 1.0e-06
+      img_psnr_tolerance: 0.0005
   staged:
     enabled: true
     stages:
-      - name: warmup_joint_fast
-        epochs: 800
-        lr: 8.0e-4
-        lr_scheduler: cosine
-        lr_min: 1.0e-6
-        warmup_epochs: 40
-        trainable_groups: [coeff, encoder, film, routing]
-        group_lrs:
-          all: 1.0e-4
-          coeff: 8.0e-4
-          encoder: 8.0e-4
-          film: 8.0e-4
-          routing: 2.0e-4
-        best_metric: mae
-
-      - name: joint_refine
-        epochs: 1200
-        lr: 4.0e-4
-        lr_scheduler: cosine
-        lr_min: 1.0e-6
-        warmup_epochs: 20
-        trainable_groups: [all]
-        group_lrs:
-          all: 1.0e-5
-          coeff: 4.0e-4
-          encoder: 4.0e-4
-          film: 4.0e-4
-          basis: 5.0e-5
-          routing: 1.0e-5
-        best_metric: mae
-
+    - name: stage1_bypass_linear
+      epochs: 400
+      lr: 0.0008
+      lr_scheduler: cosine
+      lr_min: 1.0e-06
+      warmup_epochs: 20
+      trainable_groups:
+      - coeff
+      - encoder
+      - film
+      - routing
+      group_lrs:
+        all: 0.0001
+        coeff: 0.0008
+        encoder: 0.0008
+        film: 0.0008
+        routing: 0.0002
+      best_metric: img_psnr
 evaluation:
-  output_dir: 3_experiments/results/bistro_clean_v2/exp_A1_1_joint_lrs_ema/eval
-  checkpoint: 3_experiments/results/bistro_clean_v2/exp_A1_1_joint_lrs_ema/best_model.pt
+  output_dir: 3_experiments/results/bistro_clean_v2/exp_A1_7_P0_bypassB_seed73/eval
+  checkpoint: 3_experiments/results/bistro_clean_v2/exp_A1_7_P0_bypassB_seed73/global_best_falcor.pt
   data_root: 1_data_generation/output/bistro_clean_v2
   rank: 8
   n_samples: 20

@@ -98,7 +98,7 @@ group1_5D_parametric/
 ## WORKFLOW
 1. **Configure**: Create/modify YAML config in `configs/`
 2. **Train**: `python scripts/train.py --config configs/my_config.yaml`
-3. **Evaluate**: (TODO) reintroduce mainline `scripts/eval.py`
+3. **Evaluate**: `python scripts/eval.py --data-root ... --checkpoint ... --split test`
 4. **Analyze**: Use analysis tools to diagnose performance
 5. **Visualize**: Generate visualizations for paper/thesis
 6. **Organize**: Store results in appropriate hierarchical location
@@ -110,4 +110,4 @@ group1_5D_parametric/
 
 **Shell Scripts**: Use `run_*.sh` scripts for complex multi-step experiments.
 
-**Database Integration**: All experiments logged to SQLite database (`project.db`) via `tools/logexp.py`.
+**Database Integration**: All experiments logged to SQLite database (`metadata/project.db`) via `tools/logexp.py`.

@@ -15,7 +15,7 @@ This model is schema-agnostic: it only depends on descriptor dimension and mask.
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -139,13 +139,19 @@ class GaussianPhysicsCompressionUnified(nn.Module):
         intensity_offset: int = 1,
         film_hidden: int = 64,
         enable_film: bool = True,
+        light_encoder_mode: str = "normal",
+        bypass_feature_pairs: Sequence[Sequence[int]] | None = None,
+        bypass_feature_norm_mean: Sequence[float] | None = None,
+        bypass_feature_norm_std: Sequence[float] | None = None,
     ) -> None:
         super().__init__()
 
         self.K = num_gaussians
         self.rank = rank
         self.sh_dim = sh_dim
+        self.embed_dim = embed_dim
         self.enable_film = enable_film
+        self.light_dim = light_dim
 
         # Gaussian parameters
         self.mu = nn.Parameter(torch.randn(num_gaussians, 3) * 0.1)
@@ -165,6 +171,74 @@ class GaussianPhysicsCompressionUnified(nn.Module):
             intensity_dim=intensity_dim,
             intensity_offset=intensity_offset,
         )
+        self.light_encoder_mode = str(light_encoder_mode).strip().lower()
+        if self.light_encoder_mode not in {
+            "normal",
+            "bypass_fixed",
+            "bypass_linear",
+            "bypass_mlp_16_32",
+        }:
+            raise ValueError(f"Unsupported light_encoder_mode: {light_encoder_mode}")
+
+        if bypass_feature_pairs is None:
+            parsed_pairs = [(0, 5), (1, 6)]
+        else:
+            parsed_pairs = []
+            for item in bypass_feature_pairs:
+                if not isinstance(item, (list, tuple)) or len(item) < 2:
+                    raise ValueError(
+                        "bypass_feature_pairs must be a sequence of [light_index, feature_index]"
+                    )
+                light_idx = int(item[0])
+                feat_idx = int(item[1])
+                if light_idx < 0:
+                    raise ValueError("bypass_feature_pairs light_index must be >= 0")
+                if feat_idx < 0 or feat_idx >= int(light_dim):
+                    raise ValueError(
+                        f"bypass_feature_pairs feature_index out of range: {feat_idx}, light_dim={light_dim}"
+                    )
+                parsed_pairs.append((light_idx, feat_idx))
+            if not parsed_pairs:
+                raise ValueError("bypass_feature_pairs cannot be empty")
+        self.bypass_feature_pairs = tuple(parsed_pairs)
+        self._bypass_num_features = len(self.bypass_feature_pairs)
+
+        if bypass_feature_norm_mean is None:
+            mean_vals = [0.0] * self._bypass_num_features
+        else:
+            mean_vals = [float(x) for x in bypass_feature_norm_mean]
+            if len(mean_vals) != self._bypass_num_features:
+                raise ValueError(
+                    f"bypass_feature_norm_mean length mismatch: {len(mean_vals)} "
+                    f"!= num_features {self._bypass_num_features}"
+                )
+
+        if bypass_feature_norm_std is None:
+            std_vals = [1.0] * self._bypass_num_features
+        else:
+            std_vals = [float(x) for x in bypass_feature_norm_std]
+            if len(std_vals) != self._bypass_num_features:
+                raise ValueError(
+                    f"bypass_feature_norm_std length mismatch: {len(std_vals)} "
+                    f"!= num_features {self._bypass_num_features}"
+                )
+        std_vals = [max(1e-6, abs(x)) for x in std_vals]
+
+        self.bypass_feature_norm_mean = tuple(mean_vals)
+        self.bypass_feature_norm_std = tuple(std_vals)
+        if self.light_encoder_mode == "bypass_linear":
+            self.bypass_proj = nn.Linear(self._bypass_num_features, embed_dim)
+            self.bypass_mlp = None
+        elif self.light_encoder_mode == "bypass_mlp_16_32":
+            self.bypass_proj = None
+            self.bypass_mlp = nn.Sequential(
+                nn.Linear(self._bypass_num_features, 16),
+                nn.ReLU(inplace=True),
+                nn.Linear(16, embed_dim),
+            )
+        else:
+            self.bypass_proj = None
+            self.bypass_mlp = None
 
         # FiLM modulation for dynamic basis
         self.gamma = nn.Sequential(
@@ -182,6 +256,63 @@ class GaussianPhysicsCompressionUnified(nn.Module):
         for layer in [self.gamma[-1], self.beta[-1]]:
             nn.init.zeros_(layer.weight)
             nn.init.zeros_(layer.bias)
+
+    def _encode_light_set(
+        self,
+        light_params: torch.Tensor,
+        light_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.light_encoder_mode == "normal":
+            return self.light_encoder(light_params, light_mask)
+
+        if light_params.dim() == 2:
+            light_params = light_params.unsqueeze(1)
+        bsz, n_lights, _ = light_params.shape
+
+        if light_mask is None:
+            light_mask = torch.ones(
+                (bsz, n_lights),
+                device=light_params.device,
+                dtype=light_params.dtype,
+            )
+        else:
+            light_mask = light_mask.to(device=light_params.device, dtype=light_params.dtype)
+
+        cols = []
+        for light_idx, feat_idx in self.bypass_feature_pairs:
+            src_light = min(max(int(light_idx), 0), int(n_lights) - 1)
+            vals = light_params[:, src_light, int(feat_idx)]
+            vals = vals * light_mask[:, src_light]
+            cols.append(vals)
+        features = torch.stack(cols, dim=-1)
+
+        mean = torch.tensor(
+            self.bypass_feature_norm_mean,
+            device=features.device,
+            dtype=features.dtype,
+        )
+        std = torch.tensor(
+            self.bypass_feature_norm_std,
+            device=features.device,
+            dtype=features.dtype,
+        )
+        features = (features - mean) / std
+
+        if self.light_encoder_mode == "bypass_fixed":
+            repeats = (self.embed_dim + self._bypass_num_features - 1) // self._bypass_num_features
+            return features.repeat(1, repeats)[:, : self.embed_dim]
+
+        if self.light_encoder_mode == "bypass_linear":
+            if self.bypass_proj is None:
+                raise RuntimeError("bypass_proj is not initialized for bypass_linear mode")
+            return self.bypass_proj(features)
+
+        if self.light_encoder_mode == "bypass_mlp_16_32":
+            if self.bypass_mlp is None:
+                raise RuntimeError("bypass_mlp is not initialized for bypass_mlp_16_32 mode")
+            return self.bypass_mlp(features)
+
+        raise RuntimeError(f"Unsupported light_encoder_mode in _encode_light_set: {self.light_encoder_mode}")
 
     def compute_gaussian_routing(
         self,
@@ -257,7 +388,7 @@ class GaussianPhysicsCompressionUnified(nn.Module):
         gaussian_weights, topk_indices = routing
 
         # 1) Encode light set
-        z = self.light_encoder(light_params, light_mask)  # [B, embed_dim]
+        z = self._encode_light_set(light_params, light_mask)  # [B, embed_dim]
 
         # 2) Select parameters
         selected_U = self.U[topk_indices]  # [B, K', sh_dim, rank]

@@ -35,6 +35,11 @@ project.db
 
 # Data files / outputs (too large for git)
 1_data_generation/output/
+1_data_generation/scenes/Sponza/
+1_data_generation/scenes/ZeroDay/
+1_data_generation/scenes/**/*.zip
+1_data_generation/scenes/**/*.fbx
+1_data_generation/scenes/**/*.dds
 3_experiments/output/
 3_experiments/results/
 3_experiments/test_rerun*/

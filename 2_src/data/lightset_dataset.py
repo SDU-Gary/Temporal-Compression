@@ -172,6 +172,38 @@ class LightSetDataset(Dataset):
         }
         return sample
 
+    def __getitems__(self, indices) -> list[Dict[str, torch.Tensor]]:
+        if not indices:
+            return []
+        idx_tensor = torch.as_tensor(indices, dtype=torch.long)
+        probe_idx = torch.div(idx_tensor, self.num_configs, rounding_mode="floor")
+        config_idx = torch.remainder(idx_tensor, self.num_configs)
+
+        if self._probe_positions_tensor is not None:
+            probe_pos_b = self._probe_positions_tensor[probe_idx]
+            light_params_b = self._light_configs_tensor[config_idx]
+            light_mask_b = self._light_mask_tensor[config_idx]
+            sh_coeffs_b = self._tensor_subset_tensor[probe_idx, config_idx, :]
+        else:
+            probe_pos_b = torch.from_numpy(self.probe_positions_norm[probe_idx.numpy()])
+            light_params_b = torch.from_numpy(self.light_configs_subset[config_idx.numpy()])
+            light_mask_b = torch.from_numpy(self.light_mask_subset[config_idx.numpy()])
+            sh_coeffs_b = torch.from_numpy(self.tensor_subset[probe_idx.numpy(), config_idx.numpy(), :])
+
+        samples: list[Dict[str, torch.Tensor]] = []
+        for i in range(int(idx_tensor.numel())):
+            samples.append(
+                {
+                    "probe_position": probe_pos_b[i],
+                    "light_params": light_params_b[i],
+                    "light_mask": light_mask_b[i],
+                    "sh_coeffs": sh_coeffs_b[i],
+                    "probe_idx": probe_idx[i].to(dtype=torch.long),
+                    "config_idx": config_idx[i].to(dtype=torch.long),
+                }
+            )
+        return samples
+
     def get_full_probe_positions(self, normalized: bool = True) -> np.ndarray:
         if normalized and self.normalize_probes:
             return self.probe_positions_norm

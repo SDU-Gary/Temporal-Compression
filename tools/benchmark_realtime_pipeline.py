@@ -165,10 +165,83 @@ def _fps_from_ms(ms_mean: float) -> float:
     return float(1000.0 / ms_mean)
 
 
+def _parse_single_routing_profile_json(raw: Optional[str]) -> Dict[str, Any]:
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    data = json.loads(text)
+    if isinstance(data, dict):
+        if "profiles" in data:
+            profiles = data.get("profiles", [])
+            if not isinstance(profiles, list) or not profiles:
+                return {}
+            first = profiles[0]
+            if not isinstance(first, dict):
+                raise ValueError("routing-profile-json profiles[0] must be a mapping")
+            return dict(first)
+        return dict(data)
+    if isinstance(data, list):
+        if not data:
+            return {}
+        first = data[0]
+        if not isinstance(first, dict):
+            raise ValueError("routing-profile-json[0] must be a mapping")
+        return dict(first)
+    raise ValueError("routing-profile-json must decode to dict/list")
+
+
+def _resolve_benchmark_routing_profile(
+    *,
+    model_meta: Dict[str, Any],
+    top_k_override: Optional[int],
+    training_soft_routing_override: Optional[bool],
+    routing_soft_topk_override: Optional[int],
+    routing_temperature_override: Optional[float],
+    routing_profile_json: Optional[str],
+) -> Dict[str, Any]:
+    base_top_k = int(model_meta.get("top_k", 3))
+    if top_k_override is not None:
+        base_top_k = int(top_k_override)
+
+    profile = _parse_single_routing_profile_json(routing_profile_json)
+    top_k = int(profile.get("top_k", base_top_k))
+    training_soft_routing = bool(profile.get("training_soft_routing", False))
+    routing_soft_topk = profile.get("routing_soft_topk", None)
+    routing_temperature = profile.get("routing_temperature", 1.0)
+
+    if training_soft_routing_override is not None:
+        training_soft_routing = bool(training_soft_routing_override)
+    if routing_soft_topk_override is not None:
+        routing_soft_topk = int(routing_soft_topk_override)
+    if routing_temperature_override is not None:
+        routing_temperature = float(routing_temperature_override)
+
+    if routing_soft_topk is not None:
+        routing_soft_topk = int(routing_soft_topk)
+        if routing_soft_topk <= 0:
+            routing_soft_topk = None
+    routing_temperature = float(routing_temperature)
+    if not training_soft_routing:
+        routing_soft_topk = None
+        routing_temperature = 1.0
+    else:
+        routing_temperature = max(1e-6, routing_temperature)
+
+    return {
+        "top_k": int(top_k),
+        "training_soft_routing": bool(training_soft_routing),
+        "routing_soft_topk": routing_soft_topk,
+        "routing_temperature": float(routing_temperature),
+    }
+
+
 @dataclass
 class ModelProvider:
     model: Any
     top_k: int
+    training_soft_routing: bool
+    routing_soft_topk: Optional[int]
+    routing_temperature: float
     probe_positions_norm: Any
     light_configs: Any
     light_mask: Any
@@ -185,6 +258,10 @@ class ModelProvider:
         light_mask_np: np.ndarray,
         device_str: str,
         top_k_override: Optional[int],
+        training_soft_routing_override: Optional[bool],
+        routing_soft_topk_override: Optional[int],
+        routing_temperature_override: Optional[float],
+        routing_profile_json: Optional[str],
         sync_cuda: bool,
     ) -> "ModelProvider":
         import torch
@@ -205,14 +282,24 @@ class ModelProvider:
         sh_dim = int(state["U"].shape[1])
 
         model_meta = meta.get("model", {}) if isinstance(meta, dict) else {}
-        top_k = int(model_meta.get("top_k", 3))
-        if top_k_override is not None:
-            top_k = int(top_k_override)
+        # Reusable routing profile for benchmark inference (hard/soft parity with training/eval).
+        routing_profile = _resolve_benchmark_routing_profile(
+            model_meta=model_meta,
+            top_k_override=top_k_override,
+            training_soft_routing_override=training_soft_routing_override,
+            routing_soft_topk_override=routing_soft_topk_override,
+            routing_temperature_override=routing_temperature_override,
+            routing_profile_json=routing_profile_json,
+        )
 
         light_dim = int(model_meta.get("light_dim", 12))
         intensity_dim = int(model_meta.get("intensity_dim", 3))
         intensity_offset = int(model_meta.get("intensity_offset", 1))
         enable_film = bool(model_meta.get("enable_film", True))
+        light_encoder_mode = str(model_meta.get("light_encoder_mode", "normal"))
+        bypass_feature_pairs = model_meta.get("bypass_feature_pairs", None)
+        bypass_feature_norm_mean = model_meta.get("bypass_feature_norm_mean", None)
+        bypass_feature_norm_std = model_meta.get("bypass_feature_norm_std", None)
 
         model = GaussianPhysicsCompressionUnified(
             num_gaussians=K,
@@ -223,6 +310,10 @@ class ModelProvider:
             intensity_dim=intensity_dim,
             intensity_offset=intensity_offset,
             enable_film=enable_film,
+            light_encoder_mode=light_encoder_mode,
+            bypass_feature_pairs=bypass_feature_pairs,
+            bypass_feature_norm_mean=bypass_feature_norm_mean,
+            bypass_feature_norm_std=bypass_feature_norm_std,
         ).to(device)
         missing, unexpected = model.load_state_dict(state, strict=False)
         if missing or unexpected:
@@ -247,7 +338,10 @@ class ModelProvider:
 
         return cls(
             model=model,
-            top_k=top_k,
+            top_k=routing_profile["top_k"],
+            training_soft_routing=bool(routing_profile["training_soft_routing"]),
+            routing_soft_topk=routing_profile["routing_soft_topk"],
+            routing_temperature=float(routing_profile["routing_temperature"]),
             probe_positions_norm=probe_positions_norm,
             light_configs=light_configs,
             light_mask=light_mask,
@@ -267,7 +361,15 @@ class ModelProvider:
             torch.cuda.synchronize(self.device)
 
         with torch.no_grad():
-            pred = self.model(self.probe_positions_norm, params, top_k=self.top_k, light_mask=mask)
+            pred = self.model(
+                self.probe_positions_norm,
+                params,
+                top_k=self.top_k,
+                light_mask=mask,
+                training_soft_routing=bool(self.training_soft_routing),
+                routing_soft_topk=self.routing_soft_topk,
+                routing_temperature=float(self.routing_temperature),
+            )
             if self.scaler is not None:
                 pred = self.scaler.inverse(pred)
 
@@ -317,6 +419,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Path to Falcor worker script (Python 3.10)")
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
     parser.add_argument("--top-k", type=int, default=None, help="Override model top_k from checkpoint meta")
+    soft_group = parser.add_mutually_exclusive_group()
+    soft_group.add_argument(
+        "--training-soft-routing",
+        dest="training_soft_routing",
+        action="store_true",
+        help="Enable soft routing during model inference in benchmark",
+    )
+    soft_group.add_argument(
+        "--no-training-soft-routing",
+        dest="training_soft_routing",
+        action="store_false",
+        help="Force hard routing during model inference in benchmark",
+    )
+    parser.set_defaults(training_soft_routing=None)
+    parser.add_argument(
+        "--routing-soft-topk",
+        type=int,
+        default=None,
+        help="Soft routing candidate count for benchmark inference",
+    )
+    parser.add_argument(
+        "--routing-temperature",
+        type=float,
+        default=None,
+        help="Soft routing temperature for benchmark inference",
+    )
+    parser.add_argument(
+        "--routing-profile-json",
+        default="",
+        help=(
+            "Reusable routing profile JSON (single profile or {profiles:[...]}; "
+            "benchmark uses the first profile)"
+        ),
+    )
 
     parser.add_argument("--sync-gpu", action="store_true", default=False,
                         help="Force per-frame GPU synchronization/readback (slow, debugging only)")
@@ -437,6 +573,7 @@ def _run_split_runtime(
 
     model_sh_npz: Optional[Path] = None
     infer_ms_full: Optional[np.ndarray] = None
+    model_routing_profile: Optional[Dict[str, Any]] = None
 
     if "model" in routes:
         model_provider = ModelProvider.create(
@@ -446,8 +583,22 @@ def _run_split_runtime(
             light_mask_np=light_mask,
             device_str=args.device,
             top_k_override=args.top_k,
+            training_soft_routing_override=args.training_soft_routing,
+            routing_soft_topk_override=args.routing_soft_topk,
+            routing_temperature_override=args.routing_temperature,
+            routing_profile_json=args.routing_profile_json,
             sync_cuda=args.sync_gpu,
         )
+        model_routing_profile = {
+            "top_k": int(model_provider.top_k),
+            "training_soft_routing": bool(model_provider.training_soft_routing),
+            "routing_soft_topk": (
+                int(model_provider.routing_soft_topk)
+                if model_provider.routing_soft_topk is not None
+                else None
+            ),
+            "routing_temperature": float(model_provider.routing_temperature),
+        }
 
         sh_model = np.zeros((len(all_frames), num_probes, 27), dtype=np.float32)
         infer_ms = np.zeros((len(all_frames),), dtype=np.float64)
@@ -594,6 +745,7 @@ def _run_split_runtime(
         "pt_use_nee": bool(args.pt_use_nee),
         "sync_gpu_forced": bool(args.sync_gpu),
         "sync_every": int(max(0, int(args.sync_every))),
+        "model_routing_profile": model_routing_profile,
     }
 
     if rows:
@@ -647,6 +799,8 @@ def _run_split_runtime(
         model_result["fps_route_only_full"] = _fps_from_ms(model_result["total_full_ms"]["mean"])
         model_result["fps_with_gbuffer_full"] = _fps_from_ms(model_result["with_gbuffer_full_ms"]["mean"])
         summary.setdefault("results", {})["model"] = model_result
+        if model_routing_profile is not None:
+            summary.setdefault("results", {}).setdefault("model", {})["routing_profile"] = dict(model_routing_profile)
 
         if "gt" in summary.get("results", {}):
             gt_total = float(summary["results"]["gt"]["total_ms"]["mean"])

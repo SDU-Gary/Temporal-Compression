@@ -87,6 +87,10 @@ def _build_model_from_checkpoint(
     intensity_offset = int(model_meta.get("intensity_offset", 1))
     top_k = int(model_meta.get("top_k", 3))
     enable_film = bool(model_meta.get("enable_film", True))
+    light_encoder_mode = str(model_meta.get("light_encoder_mode", "normal"))
+    bypass_feature_pairs = model_meta.get("bypass_feature_pairs", None)
+    bypass_feature_norm_mean = model_meta.get("bypass_feature_norm_mean", None)
+    bypass_feature_norm_std = model_meta.get("bypass_feature_norm_std", None)
 
     model = GaussianPhysicsCompressionUnified(
         num_gaussians=num_gaussians,
@@ -97,6 +101,10 @@ def _build_model_from_checkpoint(
         intensity_dim=intensity_dim,
         intensity_offset=intensity_offset,
         enable_film=enable_film,
+        light_encoder_mode=light_encoder_mode,
+        bypass_feature_pairs=bypass_feature_pairs,
+        bypass_feature_norm_mean=bypass_feature_norm_mean,
+        bypass_feature_norm_std=bypass_feature_norm_std,
     ).to(device)
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing or unexpected:
@@ -113,6 +121,10 @@ def _build_model_from_checkpoint(
         "intensity_offset": intensity_offset,
         "top_k": top_k,
         "enable_film": enable_film,
+        "light_encoder_mode": light_encoder_mode,
+        "bypass_feature_pairs": bypass_feature_pairs,
+        "bypass_feature_norm_mean": bypass_feature_norm_mean,
+        "bypass_feature_norm_std": bypass_feature_norm_std,
     }
     return model, info
 

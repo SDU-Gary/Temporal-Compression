@@ -13,7 +13,6 @@ tools/
 ├── db_utils.py                 # Database connection utilities
 ├── workflow_config.py          # Python environment management
 ├── run_summary.py              # Pipeline summary generation
-├── fix_database_errors.py      # Database repair utilities
 ├── (removed)                  # import_existing_data.py (historical)
 ├── manifest_utils.py           # Dataset manifest handling
 ├── median_filter_dataset.py    # Data preprocessing
@@ -37,8 +36,7 @@ tools/
 
 ### DATABASE TOOLS
 - **logexp.py**: CLI for experiment logging, task management, and baseline setting
-- **db_utils.py**: SQLite database connection utilities (project.db)
-- **fix_database_errors.py**: Database repair and validation utilities
+- **db_utils.py**: SQLite database connection utilities (`metadata/project.db` by default)
 
 ### PIPELINE TOOLS
 - **run_pipeline.py**: Orchestrates dataset → train → eval workflows from YAML configs
@@ -81,7 +79,7 @@ python tools/ema_smooth_dataset.py --input probes.npz --alpha 0.3
 ```
 
 ## CONVENTIONS
-- **Database-first**: All experiments logged to SQLite (project.db)
+- **Database-first**: All experiments logged to SQLite (`metadata/project.db`)
 - **YAML-driven**: Pipelines configured via YAML files in `pipelines/` directory
 - **Context persistence**: Prefer writing concise docs under `docs/` and logging experiments via `tools/logexp.py`
 - **Blender integration**: Scene export utilities in `blender/` subdirectory

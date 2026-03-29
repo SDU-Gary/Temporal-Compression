@@ -30,7 +30,7 @@ Graduate thesis project on hierarchical neural compression for multi-temporal li
 │   ├── mitsuba/                # Local Mitsuba documentation
 │   └── literature_review/      # Research paper analyses
 ├── archive/                    # Historical/deprecated methods
-├── metadata/                   # Project database (project.db)
+├── metadata/                   # Project database (metadata/project.db)
 └── pipelines/                  # Workflow pipeline definitions
 ```
 
@@ -48,10 +48,10 @@ Graduate thesis project on hierarchical neural compression for multi-temporal li
 
 ## CODE MAP
 **Key Models**:
-- `gaussian_physics_5D.py`: Gaussian-Physics hybrid compression (5D physics basis)
-- `physics_low_rank.py`: Physics-guided low-rank decomposition (Tucker)
-- `gaussian_mixture.py`: 3D Gaussian spatial representation
-- `gaussian_physics_trainer.py`: Training infrastructure with multiple losses
+- `gaussian_physics_unified.py`: Current mainline unified model (LightSetEncoder + Gaussian routing + FiLM low-rank)
+- `gaussian_physics_trainer.py`: Training infrastructure with multi-loss + EMA/staged/oracle/coeff-suite support
+- `lightset_dataset.py`: Mainline dataset loader for `parametric_tensor.npz`
+- `train.py`: Unified training entry with YAML + staged training
 
 **Critical Utilities**:
 - `config.py`: YAML configuration loading with validation
@@ -72,18 +72,18 @@ Graduate thesis project on hierarchical neural compression for multi-temporal li
 
 **Chinese Documentation**: Most documentation in Chinese with bilingual code comments.
 
-**Database-driven Experiment Tracking**: All experiments logged to SQLite database (`project.db`).
+**Database-driven Experiment Tracking**: All experiments logged to SQLite database (`metadata/project.db`).
 
 **No Traditional CI/CD**: Custom shell scripts (`run_*.sh`) instead of GitHub Actions/Makefile.
 
 **Virtual Environment**: Use `source venv/bin/activate` but no `requirements.txt`.
 
 ## ANTI-PATTERNS (THIS PROJECT)
-1. **Never guess dataset paths** - Always query database or check `project_state.md`
+1. **Never guess dataset paths** - Always query database or check `docs/dev_notes/project_state.md`
 2. **Never modify BSDF physical realism parameters** in Mitsuba (specular_reflectance/transmittance)
 3. **Never use deprecated TemporalMLP methods** - Use PG-GCPL (Physics-Guided Gaussian-Physics Compression)
 4. **Never bypass virtual environment activation**
-5. **Never confuse experimental methods with target architecture** - Refer to `docs/thesis/多时刻光照压缩任务书.md`
+5. **Never confuse experimental methods with target architecture** - Refer to `4_thesis/report/多时刻光照压缩任务书.md`
 6. **Never use deprecated Mitsuba API methods** (put(), props.keys(), del props[key])
 
 ## UNIQUE STYLES
@@ -108,7 +108,7 @@ python generate_dataset.py
 
 # Train model
 cd 3_experiments
-python scripts/train.py --config configs/baseline.yaml
+python scripts/train.py --config configs/bistro_clean_train.yaml
 
 # Run pipeline
 python tools/run_pipeline.py --config pipelines/pgcpl_bistro_dev.yaml
@@ -136,12 +136,12 @@ pytest tests/
 
 **Dataset Reality Check**: Config files may declare incorrect probe counts - always trust actual `probes.npz` data.
 
-**Memory System**: SQLite database maintains experiment history across conversation compactions. Regenerate context with `python tools/summarize_state.py`.
+**Memory System**: SQLite database (`metadata/project.db`) maintains experiment history across conversation compactions. `tools/summarize_state.py` has been removed; use `tools/logexp.py query ...` or open `docs/dev_notes/project_state.md` snapshot.
 
 **Performance Targets**: 1:17 compression ratio, >38dB PSNR, <0.5ms decompression, 60 FPS @ 1080p.
 
 **Critical Files**: 
-- `docs/thesis/多时刻光照压缩任务书.md`: Authoritative task specification
+- `4_thesis/report/多时刻光照压缩任务书.md`: Authoritative task specification
 - `docs/dev_notes/CLAUDE.md`: Comprehensive development guide
-- `project_state.md`: Auto-generated project context (<500 words)
+- `docs/dev_notes/project_state.md`: Historical project context snapshot (manual refresh only)
 - `DATABASE_VERIFICATION_REPORT.md`: Database validation methodology

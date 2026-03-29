@@ -56,6 +56,10 @@ def apply_config(args: argparse.Namespace, defaults: argparse.Namespace, cfg: Di
         "intensity_dim": model.get("intensity_dim"),
         "intensity_offset": model.get("intensity_offset"),
         "disable_film": model.get("disable_film"),
+        "light_encoder_mode": model.get("light_encoder_mode"),
+        "bypass_feature_pairs": model.get("bypass_feature_pairs"),
+        "bypass_feature_norm_mean": model.get("bypass_feature_norm_mean"),
+        "bypass_feature_norm_std": model.get("bypass_feature_norm_std"),
         "epochs": training.get("epochs") or training.get("num_epochs"),
         "lr": training.get("lr"),
         "weight_decay": training.get("weight_decay"),
@@ -71,6 +75,7 @@ def apply_config(args: argparse.Namespace, defaults: argparse.Namespace, cfg: Di
         "lambda_spatial": training.get("lambda_spatial"),
         "spatial_k": training.get("spatial_k"),
         "lambda_image": training.get("lambda_image"),
+        "image_loss_warmup_epochs": training.get("image_loss_warmup_epochs"),
         "lambda_routing_balance": training.get("lambda_routing_balance"),
         "routing_soft_train": training.get("routing_soft_train"),
         "routing_soft_topk": training.get("routing_soft_topk"),
@@ -91,6 +96,9 @@ def apply_config(args: argparse.Namespace, defaults: argparse.Namespace, cfg: Di
         "sh_scaler_max_samples": training.get("sh_scaler_max_samples"),
         "no_init": training.get("no_init"),
         "load_model": training.get("load_model"),
+        "resume": training.get("resume"),
+        "resume_save_every": training.get("resume_save_every"),
+        "resume_checkpoint_name": training.get("resume_checkpoint_name"),
         "enable_rerun": training.get("enable_rerun") or training.get("rerun"),
         "rerun_log_freq": training.get("rerun_log_freq"),
         "rerun_save_path": training.get("rerun_save_path"),
@@ -106,4 +114,3 @@ def apply_config(args: argparse.Namespace, defaults: argparse.Namespace, cfg: Di
         default = getattr(defaults, key, None)
         if current == default:
             setattr(args, key, value)
-

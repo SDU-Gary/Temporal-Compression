@@ -1,13 +1,37 @@
 """Database connection and initialization utilities."""
 
+import os
 import sqlite3
 import time
 from pathlib import Path
 from contextlib import contextmanager
 from typing import Optional
 
-# Database path (project root)
-DB_PATH = Path(__file__).parent.parent / "project.db"
+# Database paths:
+# - Canonical path: metadata/project.db
+# - Legacy path:    project.db (kept only for backward compatibility)
+_ROOT = Path(__file__).resolve().parent.parent
+PRIMARY_DB_PATH = _ROOT / "metadata" / "project.db"
+LEGACY_DB_PATH = _ROOT / "project.db"
+
+
+def _resolve_db_path() -> Path:
+    """Resolve active DB path, defaulting to metadata/project.db.
+
+    Override with env var `PGCPL_DB_PATH` when needed.
+    Relative env paths are resolved from repository root.
+    """
+    raw = os.environ.get("PGCPL_DB_PATH")
+    if raw is None or str(raw).strip() == "":
+        return PRIMARY_DB_PATH
+
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = (_ROOT / candidate).resolve()
+    return candidate
+
+
+DB_PATH = _resolve_db_path()
 
 
 @contextmanager
@@ -25,6 +49,7 @@ def get_db():
     - Row factory for dict-like access
     - Foreign keys enabled
     """
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row  # Enable dict-like access: row['column_name']
     conn.execute("PRAGMA foreign_keys = ON")  # Enforce foreign key constraints
@@ -52,7 +77,9 @@ def init_db(schema_path: Optional[Path] = None):
         FileNotFoundError: If schema.sql doesn't exist
     """
     if schema_path is None:
-        schema_path = Path(__file__).parent.parent / "schema.sql"
+        schema_path = _ROOT / "metadata" / "schema.sql"
+        if not schema_path.exists():
+            schema_path = _ROOT / "schema.sql"
 
     if not schema_path.exists():
         raise FileNotFoundError(f"Schema file not found: {schema_path}")

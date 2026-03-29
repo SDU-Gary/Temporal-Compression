@@ -1,0 +1,44 @@
+name: zeroday_prod
+output_dir: 1_data_generation/output/zeroday_temporal/prod
+
+generator:
+  script: 1_data_generation/falcor/generate_zeroday_temporal.py
+  args:
+    scene: 1_data_generation/scenes/ZeroDay/MEASURE_SEVEN/MEASURE_SEVEN_COLORED_LIGHTS.fbx
+    num_frames: 250
+    fps: 30
+    sh_mode: cubemap
+    cube_res: 32
+    spp: 256
+    accum_frames: 1
+    probe_mode: adaptive
+    max_probes: 800
+    probe_uniform_ratio: 0.3
+    gbuffer_width: 640
+    gbuffer_height: 360
+    gbuffer_num_cameras: 8
+    candidate_frame_step: 5
+    validation_frame_step: 1
+    validity_method: rayquery_hybrid
+    visibility_margin: 0.02
+    collision_distance: 0.03
+    collision_signed_epsilon: 0.01
+    rayquery_collision_rays: 12
+    rayquery_max_visibility_cameras: 8
+    rayquery_origin_epsilon: 0.002
+    rayquery_refine_only_passing: true
+
+presets:
+  smoke:
+    args:
+      num_frames: 40
+      frame_step: 2
+      cube_res: 16
+      spp: 64
+      max_probes: 128
+      gbuffer_width: 320
+      gbuffer_height: 180
+      candidate_frame_step: 5
+      validation_frame_step: 2
+      validity_method: rayquery_hybrid
+      rayquery_collision_rays: 8

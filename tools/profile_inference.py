@@ -40,6 +40,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", default="cuda")
     p.add_argument("--top-k", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=1024)
+    p.add_argument("--amp-mode", choices=["off", "bf16", "fp16"], default="off")
+    p.add_argument("--torch-compile", action="store_true", dest="torch_compile")
+    p.add_argument("--no-torch-compile", action="store_false", dest="torch_compile")
+    p.set_defaults(torch_compile=False)
+    p.add_argument("--torch-compile-mode", choices=["default", "reduce-overhead", "max-autotune"], default="reduce-overhead")
+    p.add_argument("--torch-compile-dynamic", action="store_true", dest="torch_compile_dynamic")
+    p.add_argument("--no-torch-compile-dynamic", action="store_false", dest="torch_compile_dynamic")
+    p.set_defaults(torch_compile_dynamic=False)
     p.add_argument("--frames", type=int, default=300)
     p.add_argument("--warmup-frames", type=int, default=30)
     p.add_argument("--profile-level", choices=["model", "pipeline", "both"], default="both")
@@ -101,6 +109,10 @@ def _load_model_and_data(args: argparse.Namespace):
     intensity_dim = int(model_meta.get("intensity_dim", 3))
     intensity_offset = int(model_meta.get("intensity_offset", 1))
     enable_film = bool(model_meta.get("enable_film", True))
+    light_encoder_mode = str(model_meta.get("light_encoder_mode", "normal"))
+    bypass_feature_pairs = model_meta.get("bypass_feature_pairs", None)
+    bypass_feature_norm_mean = model_meta.get("bypass_feature_norm_mean", None)
+    bypass_feature_norm_std = model_meta.get("bypass_feature_norm_std", None)
 
     model = GaussianPhysicsCompressionUnified(
         num_gaussians=K,
@@ -111,6 +123,10 @@ def _load_model_and_data(args: argparse.Namespace):
         intensity_dim=intensity_dim,
         intensity_offset=intensity_offset,
         enable_film=enable_film,
+        light_encoder_mode=light_encoder_mode,
+        bypass_feature_pairs=bypass_feature_pairs,
+        bypass_feature_norm_mean=bypass_feature_norm_mean,
+        bypass_feature_norm_std=bypass_feature_norm_std,
     ).to(device)
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing or unexpected:
@@ -118,6 +134,19 @@ def _load_model_and_data(args: argparse.Namespace):
             f"Checkpoint state mismatch. missing={missing}, unexpected={unexpected}"
         )
     model.eval()
+    compile_requested = bool(getattr(args, "torch_compile", False))
+    compile_applied = False
+    if compile_requested:
+        try:
+            model = torch.compile(
+                model,
+                mode=str(getattr(args, "torch_compile_mode", "reduce-overhead")),
+                dynamic=bool(getattr(args, "torch_compile_dynamic", False)),
+            )
+            model.eval()
+            compile_applied = True
+        except Exception:
+            compile_applied = False
 
     scaler = None
     scaler_meta = meta.get("sh_scaler") if isinstance(meta, dict) else None
@@ -153,6 +182,8 @@ def _load_model_and_data(args: argparse.Namespace):
         "loader": loader,
         "top_k": top_k,
         "scaler": scaler,
+        "compile_requested": bool(compile_requested),
+        "compile_applied": bool(compile_applied),
     }
 
 
@@ -164,6 +195,19 @@ def _profile_model_level(args: argparse.Namespace, out_dir: Path) -> Dict[str, A
     loader = ctx["loader"]
     top_k = ctx["top_k"]
     scaler = ctx.get("scaler")
+    compile_requested = bool(ctx.get("compile_requested", False))
+    compile_applied = bool(ctx.get("compile_applied", False))
+
+    amp_mode = str(getattr(args, "amp_mode", "off")).strip().lower()
+    if device.type != "cuda":
+        amp_mode = "off"
+    use_amp = amp_mode in {"bf16", "fp16"}
+    amp_dtype = torch.bfloat16 if amp_mode == "bf16" else (torch.float16 if amp_mode == "fp16" else None)
+
+    def _autocast_ctx():
+        if use_amp and amp_dtype is not None:
+            return torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=True)
+        return nullcontext()
 
     total_frames = int(max(1, args.frames))
     warmup = int(max(0, args.warmup_frames))
@@ -203,18 +247,20 @@ def _profile_model_level(args: argparse.Namespace, out_dir: Path) -> Dict[str, A
 
                 t_step0 = time.perf_counter()
                 t_route0 = time.perf_counter()
-                if hasattr(model, "compute_gaussian_routing"):
-                    routing = model.compute_gaussian_routing(positions, top_k=top_k)
-                else:
-                    routing = None
+                with _autocast_ctx():
+                    if hasattr(model, "compute_gaussian_routing"):
+                        routing = model.compute_gaussian_routing(positions, top_k=top_k)
+                    else:
+                        routing = None
                 _sync_if_cuda(torch, device)
                 t_route1 = time.perf_counter()
 
                 t_fwd0 = time.perf_counter()
-                if routing is not None and hasattr(model, "forward_with_routing"):
-                    preds = model.forward_with_routing(routing, params, light_mask=mask)
-                else:
-                    preds = model(positions, params, top_k=top_k, light_mask=mask)
+                with _autocast_ctx():
+                    if routing is not None and hasattr(model, "forward_with_routing"):
+                        preds = model.forward_with_routing(routing, params, light_mask=mask)
+                    else:
+                        preds = model(positions, params, top_k=top_k, light_mask=mask)
                 if scaler is not None:
                     preds = scaler.inverse(preds)
                 _sync_if_cuda(torch, device)
@@ -243,6 +289,9 @@ def _profile_model_level(args: argparse.Namespace, out_dir: Path) -> Dict[str, A
         "frames": int(total_frames),
         "warmup_frames": int(warmup),
         "device": str(device),
+        "amp_mode": amp_mode,
+        "torch_compile_requested": bool(compile_requested),
+        "torch_compile_applied": bool(compile_applied),
         "latency": {
             "step": summarize_latency([r["step_ms"] for r in rows]),
             "forward": summarize_latency([r["forward_ms"] for r in rows]),
@@ -386,6 +435,18 @@ def run_profile(args: argparse.Namespace) -> Dict[str, Any]:
         torch_cmd.extend(["--top-k", str(args.top_k)])
     if args.device is not None:
         torch_cmd.extend(["--device", str(args.device)])
+    if args.amp_mode is not None:
+        torch_cmd.extend(["--amp-mode", str(args.amp_mode)])
+    if args.torch_compile:
+        torch_cmd.append("--torch-compile")
+    else:
+        torch_cmd.append("--no-torch-compile")
+    if args.torch_compile_mode is not None:
+        torch_cmd.extend(["--torch-compile-mode", str(args.torch_compile_mode)])
+    if args.torch_compile_dynamic:
+        torch_cmd.append("--torch-compile-dynamic")
+    else:
+        torch_cmd.append("--no-torch-compile-dynamic")
 
     nsys_cmd = build_nsys_command(torch_cmd, out_dir / "nsys_inference")
     ncu_cmd = build_ncu_command(torch_cmd, out_dir / "ncu_inference")
@@ -440,4 +501,3 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
-

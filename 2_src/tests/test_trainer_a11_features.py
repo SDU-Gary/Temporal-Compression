@@ -195,6 +195,39 @@ def test_routing_balance_metrics_with_soft_routing() -> None:
     assert 0.0 <= metrics["routing_nonzero_ratio"] <= 1.0
 
 
+def test_routing_balance_uses_global_expert_indices() -> None:
+    model = _RoutingDummyModel(num_gaussians=8)
+    trainer = GaussianPhysicsTrainer(
+        model=model,
+        device=torch.device("cpu"),
+        adapter=BatchAdapter(params_key="light_params", mask_key="light_mask"),
+        lr=1e-3,
+        weight_decay=0.0,
+        recon_loss="mse",
+        temporal_weight=0.0,
+        linearity_weight=0.0,
+        spatial_weight=0.0,
+        lambda_routing_balance=1.0,
+        show_progress=False,
+    )
+
+    # Slot usage is perfectly uniform (all weights are 0.5/0.5),
+    # but expert usage is imbalanced because expert 0 appears in every sample.
+    weights = torch.full((4, 2), 0.5, dtype=torch.float32)
+    indices = torch.tensor(
+        [
+            [0, 1],
+            [0, 2],
+            [0, 3],
+            [0, 4],
+        ],
+        dtype=torch.long,
+    )
+    loss, stats = trainer._compute_routing_balance_loss((weights, indices))
+    assert float(loss.detach().item()) > 0.0
+    assert stats["routing_nonzero_ratio"] < 1.0
+
+
 def test_fit_saves_best_checkpoints_for_val_profiles(tmp_path: Path) -> None:
     model = _RoutingDummyModel()
     trainer = GaussianPhysicsTrainer(
@@ -239,3 +272,101 @@ def test_fit_saves_best_checkpoints_for_val_profiles(tmp_path: Path) -> None:
     assert "best_value_by_profile" in last_payload
     assert "hard3" in last_payload["val_profiles_metrics"]
     assert "soft8_t020" in last_payload["val_profiles_metrics"]
+
+
+def test_metric_direction_and_image_loss_warmup() -> None:
+    model = _RoutingDummyModel()
+    trainer = GaussianPhysicsTrainer(
+        model=model,
+        device=torch.device("cpu"),
+        adapter=BatchAdapter(params_key="light_params", mask_key="light_mask"),
+        lr=1e-3,
+        weight_decay=0.0,
+        recon_loss="mse",
+        temporal_weight=0.0,
+        linearity_weight=0.0,
+        spatial_weight=0.0,
+        image_loss_weight=0.2,
+        image_loss_warmup_epochs=4,
+        show_progress=False,
+    )
+
+    assert trainer._metric_higher_is_better("img_psnr") is True
+    assert trainer._metric_higher_is_better("mae") is False
+    assert trainer._metric_is_better("img_psnr", 11.0, 10.0) is True
+    assert trainer._metric_is_better("mae", 0.4, 0.5) is True
+    assert abs(trainer._image_loss_weight_for_epoch(1) - 0.05) < 1e-8
+    assert abs(trainer._image_loss_weight_for_epoch(4) - 0.2) < 1e-8
+
+
+def test_proxy_image_loss_mix_modes() -> None:
+    model = _RoutingDummyModel()
+    common_kwargs = dict(
+        model=model,
+        device=torch.device("cpu"),
+        adapter=BatchAdapter(params_key="light_params", mask_key="light_mask"),
+        lr=1e-3,
+        weight_decay=0.0,
+        recon_loss="mse",
+        temporal_weight=0.0,
+        linearity_weight=0.0,
+        spatial_weight=0.0,
+        image_loss_weight=1.0,
+        show_progress=False,
+    )
+    pred = torch.ones((2, 27), dtype=torch.float32) * 0.3
+    target = torch.ones((2, 27), dtype=torch.float32) * 0.15
+
+    trainer_linear = GaussianPhysicsTrainer(
+        **common_kwargs,
+        proxy_image_loss_mix_mode="linear_only",
+    )
+    loss_linear, comp_linear = trainer_linear._compute_image_loss_components(pred, target)
+    assert torch.allclose(loss_linear, comp_linear["linear"])
+    assert torch.allclose(comp_linear["log"], torch.tensor(0.0))
+
+    trainer_log = GaussianPhysicsTrainer(
+        **common_kwargs,
+        proxy_image_loss_mix_mode="log_only",
+    )
+    loss_log, comp_log = trainer_log._compute_image_loss_components(pred, target)
+    assert torch.allclose(loss_log, comp_log["log"])
+    assert torch.allclose(comp_log["linear"], torch.tensor(0.0))
+
+    trainer_mix = GaussianPhysicsTrainer(
+        **common_kwargs,
+        proxy_image_loss_mix_mode="linear_log_mix",
+        proxy_image_log_mix_weight=0.25,
+    )
+    loss_mix, comp_mix = trainer_mix._compute_image_loss_components(pred, target)
+    expected_mix = 0.75 * comp_mix["linear"] + 0.25 * comp_mix["log"]
+    assert torch.allclose(loss_mix, expected_mix, atol=1e-6)
+
+
+def test_routing_balance_anneal_schedule_with_epoch_offset() -> None:
+    model = _RoutingDummyModel()
+    trainer = GaussianPhysicsTrainer(
+        model=model,
+        device=torch.device("cpu"),
+        adapter=BatchAdapter(params_key="light_params", mask_key="light_mask"),
+        lr=1e-3,
+        weight_decay=0.0,
+        recon_loss="mse",
+        temporal_weight=0.0,
+        linearity_weight=0.0,
+        spatial_weight=0.0,
+        lambda_routing_balance=0.02,
+        routing_balance_anneal_enabled=True,
+        routing_balance_anneal_start=0.02,
+        routing_balance_anneal_end=0.0,
+        routing_balance_anneal_epochs=10,
+        routing_balance_anneal_epoch_offset=5,
+        show_progress=False,
+    )
+
+    w_epoch1 = trainer._routing_balance_weight_for_epoch(1)
+    w_epoch5 = trainer._routing_balance_weight_for_epoch(5)
+    w_epoch6 = trainer._routing_balance_weight_for_epoch(6)
+    assert abs(w_epoch1 - 0.01) < 1e-8
+    assert abs(w_epoch5 - 0.002) < 1e-8
+    assert abs(w_epoch6 - 0.0) < 1e-8
