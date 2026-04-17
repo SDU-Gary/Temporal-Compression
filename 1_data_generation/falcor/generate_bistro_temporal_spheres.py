@@ -6,8 +6,6 @@ from __future__ import annotations
 import argparse
 import math
 import os
-import time
-from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple
 
@@ -35,6 +33,13 @@ from falcor_render import (  # noqa: E402
 )
 from coords import normalize_pos  # noqa: E402
 from scene_io import apply_scene_overrides, load_emissive_objects, load_scene_json  # noqa: E402
+from temporal_dataset_common import (  # noqa: E402
+    bake_temporal_tensor,
+    build_base_temporal_metadata,
+    parse_frame_indices,
+    resolve_num_samples,
+    save_temporal_dataset,
+)
 
 
 def build_descriptor_point(
@@ -172,21 +177,6 @@ def _compute_trajectories(
     blue[:, orth] += orth_offset
 
     return red.astype(np.float32), green.astype(np.float32), blue.astype(np.float32)
-
-
-def _parse_frame_indices(num_frames: int, frame_indices: str, frame_step: int | None) -> List[int]:
-    if frame_indices:
-        items = []
-        for token in frame_indices.split(","):
-            token = token.strip()
-            if token == "":
-                continue
-            items.append(int(token))
-        indices = sorted(set([i for i in items if 0 <= i < num_frames]))
-        return indices
-    if frame_step is not None and frame_step > 0:
-        return list(range(0, num_frames, frame_step))
-    return list(range(num_frames))
 
 
 def main() -> None:
@@ -334,7 +324,7 @@ def main() -> None:
                 light.radius = float(light_radii[idx])
             light.intensity = falcor.float3(float(color[0]), float(color[1]), float(color[2]))
 
-    frame_indices = _parse_frame_indices(args.num_frames, args.frame_indices, args.frame_step)
+    frame_indices = parse_frame_indices(args.num_frames, args.frame_indices, args.frame_step)
     if len(frame_indices) == 0:
         raise ValueError("No frame indices selected.")
 
@@ -381,10 +371,6 @@ def main() -> None:
     M = len(frame_indices)
     N = len(light_trajs)
 
-    tensor = np.zeros((P, M, 27), dtype=np.float32)
-    light_configs = np.zeros((M, N, 12), dtype=np.float32)
-    light_mask = np.ones((M, N), dtype=np.float32)
-
     def render_probe_sh(probe: np.ndarray) -> np.ndarray:
         if args.sh_mode == "cubemap":
             return render_sh_cubemap(
@@ -414,9 +400,9 @@ def main() -> None:
         radiances = np.array(radiances, dtype=np.float32)
         return fit_sh_coefficients(directions, radiances, max_order=2)
 
-    start_time = time.time()
     display_total = len(frame_indices)
-    for out_idx, frame_idx in enumerate(frame_indices):
+
+    def _per_frame_setup(frame_idx: int, _out_idx: int) -> np.ndarray:
         # Update animation time (seconds).
         t_sec = float(frame_idx) / float(args.fps)
         try:
@@ -433,82 +419,88 @@ def main() -> None:
             for light, pos in zip(spheres, positions):
                 light.position = falcor.float3(float(pos[0]), float(pos[1]), float(pos[2]))
 
-        # Descriptors
+        descriptors = np.zeros((int(N), 12), dtype=np.float32)
         for light_idx, (pos, color) in enumerate(zip(positions, light_colors)):
-            light_configs[out_idx, light_idx] = build_descriptor_point(
+            descriptors[int(light_idx), :] = build_descriptor_point(
                 color,
                 normalize_pos(pos, bounds[0], bounds[1]),
             )
+        return descriptors
 
-        for probe_idx in tqdm(range(P), desc=f"Frame {out_idx + 1}/{display_total}", leave=False):
-            probe = probes[probe_idx]
-            sh = render_probe_sh(probe)
-            tensor[probe_idx, out_idx, :] = sh
-
-        elapsed = time.time() - start_time
-        avg_per = elapsed / max(1, out_idx + 1)
-        eta = avg_per * (M - out_idx - 1)
+    def _on_frame_progress(out_idx: int, frame_idx: int, elapsed: float, eta: float) -> None:
         print(
             f"Frame {out_idx + 1}/{display_total} (src {frame_idx + 1}/{args.num_frames}): "
-            f"elapsed={avg_per * (out_idx + 1):.1f}s, eta={eta:.1f}s",
+            f"elapsed={elapsed:.1f}s, eta={eta:.1f}s",
             flush=True,
         )
 
-    num_samples = int(args.num_sh_samples)
-    if args.sh_mode == "cubemap":
-        num_samples = int(args.cube_res) * int(args.cube_res) * 6
+    bake_out = bake_temporal_tensor(
+        probes=probes,
+        frame_indices=frame_indices,
+        num_lights=int(N),
+        light_descriptor_dim=12,
+        render_probe_sh=render_probe_sh,
+        per_frame_setup=_per_frame_setup,
+        probe_progress_desc_fn=lambda out_idx, total: f"Frame {int(out_idx) + 1}/{int(total)}",
+        on_frame_progress=_on_frame_progress,
+    )
 
-    metadata = {
-        "engine": "Falcor",
-        "scene": str(Path(args.scene).resolve()),
-        "scene_json": str(Path(args.scene_json).resolve()) if args.scene_json else None,
-        "num_probes": int(P),
-        "num_configs": int(M),
-        "num_frames": int(args.num_frames),
-        "fps": float(args.fps),
-        "duration_sec": float((args.num_frames - 1) / args.fps),
-        "frame_indices": frame_indices,
-        "num_lights": int(N),
-        "light_descriptor_dim": 12,
-        "sh_mode": args.sh_mode,
-        "cube_res": int(args.cube_res),
-        "num_sh_samples": int(args.num_sh_samples),
-        "num_samples": num_samples,
-        "spp": int(desired_spp),
-        "spp_per_frame": int(per_frame_spp),
-        "accum_frames": int(args.accum_frames),
-        "radiance_clamp": float(args.radiance_clamp),
-        "bounds": {"min": bounds[0].tolist(), "max": bounds[1].tolist()},
-        "probe_mode": args.probe_mode,
-        "probe_uniform_ratio": float(args.probe_uniform_ratio),
-        "probe_surface_offset_range": [
-            float(args.probe_surface_offset_min),
-            float(args.probe_surface_offset_max),
-        ],
-        "probe_file": str(args.probe_file) if args.probe_file else None,
-        "ball_radius": float(radius),
-        "ball_intensity": float(args.ball_intensity),
-        "lighting_mode": "emissive_mesh" if not args.use_analytic_lights else "analytic_lights",
-        "trajectory_params": {
-            "height_base_ratio": float(args.height_base_ratio),
-            "height_amp_ratio": float(args.height_amp_ratio),
-            "axis_margin_ratio": float(args.axis_margin_ratio),
-            "orth_offset_ratio": float(args.orth_offset_ratio),
+    tensor = bake_out["tensor"]
+    light_configs = bake_out["light_configs"]
+    light_mask = bake_out["light_mask"]
+    num_samples = resolve_num_samples(args.sh_mode, int(args.cube_res), int(args.num_sh_samples))
+
+    metadata = build_base_temporal_metadata(
+        scene=str(args.scene),
+        num_probes=int(P),
+        num_configs=int(M),
+        num_frames=int(args.num_frames),
+        fps=float(args.fps),
+        frame_indices=frame_indices,
+        num_lights=int(N),
+        light_descriptor_dim=12,
+        sh_mode=str(args.sh_mode),
+        cube_res=int(args.cube_res),
+        num_sh_samples=int(args.num_sh_samples),
+        num_samples=int(num_samples),
+        spp=int(desired_spp),
+        spp_per_frame=int(per_frame_spp),
+        accum_frames=int(args.accum_frames),
+        radiance_clamp=float(args.radiance_clamp),
+        bounds_min=bounds[0].tolist(),
+        bounds_max=bounds[1].tolist(),
+        duration_sec=float((args.num_frames - 1) / args.fps),
+    )
+    metadata.update(
+        {
+            "scene_json": str(Path(args.scene_json).resolve()) if args.scene_json else None,
+            "probe_mode": args.probe_mode,
+            "probe_uniform_ratio": float(args.probe_uniform_ratio),
+            "probe_surface_offset_range": [
+                float(args.probe_surface_offset_min),
+                float(args.probe_surface_offset_max),
+            ],
+            "probe_file": str(args.probe_file) if args.probe_file else None,
+            "ball_radius": float(radius),
+            "ball_intensity": float(args.ball_intensity),
+            "lighting_mode": "emissive_mesh" if not args.use_analytic_lights else "analytic_lights",
+            "trajectory_params": {
+                "height_base_ratio": float(args.height_base_ratio),
+                "height_amp_ratio": float(args.height_amp_ratio),
+                "axis_margin_ratio": float(args.axis_margin_ratio),
+                "orth_offset_ratio": float(args.orth_offset_ratio),
+            },
         },
-        "generation_date": datetime.now().isoformat(),
-    }
+    )
 
-    np.savez_compressed(
-        output_dir / "parametric_tensor.npz",
+    save_temporal_dataset(
+        output_dir=output_dir,
         tensor=tensor,
         probe_positions=probes,
         light_configs=light_configs,
         light_mask=light_mask,
         metadata=metadata,
     )
-    with open(output_dir / "metadata.json", "w") as f:
-        import json
-        json.dump(metadata, f, indent=2)
 
     print(f"Saved dataset to: {output_dir}")
 

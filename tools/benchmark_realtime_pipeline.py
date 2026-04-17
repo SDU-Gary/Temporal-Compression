@@ -482,6 +482,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Strength for axis-test SH coefficient")
     parser.add_argument("--save-sampled-images-dir", default=None,
                         help="Optional dir to dump sampled metric frames (npz)")
+    parser.add_argument(
+        "--dump-sampled-images-every",
+        type=int,
+        default=0,
+        help=(
+            "If >0, dump sampled route images every N benchmark frames without "
+            "requiring metric computation."
+        ),
+    )
     parser.add_argument("--roi", default=None,
                         help="Optional normalized ROI x0,y0,x1,y1 for extra image metrics")
     parser.add_argument("--output-scale", type=float, default=1.0,
@@ -669,6 +678,8 @@ def _run_split_runtime(
         cmd.extend(["--save-frame-metrics-every", str(max(1, int(args.save_frame_metrics_every)))])
     if args.save_sampled_images_dir:
         cmd.extend(["--save-sampled-images-dir", str(args.save_sampled_images_dir)])
+    if int(max(0, int(args.dump_sampled_images_every))) > 0:
+        cmd.extend(["--dump-sampled-images-every", str(int(args.dump_sampled_images_every))])
     if args.roi:
         cmd.extend(["--roi", str(args.roi)])
     if args.pt_reference:
@@ -745,6 +756,7 @@ def _run_split_runtime(
         "pt_use_nee": bool(args.pt_use_nee),
         "sync_gpu_forced": bool(args.sync_gpu),
         "sync_every": int(max(0, int(args.sync_every))),
+        "dump_sampled_images_every": int(max(0, int(args.dump_sampled_images_every))),
         "model_routing_profile": model_routing_profile,
     }
 

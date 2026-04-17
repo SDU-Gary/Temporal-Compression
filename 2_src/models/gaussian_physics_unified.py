@@ -15,7 +15,7 @@ This model is schema-agnostic: it only depends on descriptor dimension and mask.
 
 from __future__ import annotations
 
-from typing import Sequence, Tuple
+from typing import Literal, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -143,6 +143,7 @@ class GaussianPhysicsCompressionUnified(nn.Module):
         bypass_feature_pairs: Sequence[Sequence[int]] | None = None,
         bypass_feature_norm_mean: Sequence[float] | None = None,
         bypass_feature_norm_std: Sequence[float] | None = None,
+        contraction_mode: Literal["legacy", "fused"] = "fused",
     ) -> None:
         super().__init__()
 
@@ -152,6 +153,12 @@ class GaussianPhysicsCompressionUnified(nn.Module):
         self.embed_dim = embed_dim
         self.enable_film = enable_film
         self.light_dim = light_dim
+        self.contraction_mode = str(contraction_mode).strip().lower()
+        if self.contraction_mode not in {"legacy", "fused"}:
+            raise ValueError(
+                f"Unsupported contraction_mode: {contraction_mode}. "
+                "Expected one of {'legacy', 'fused'}."
+            )
 
         # Gaussian parameters
         self.mu = nn.Parameter(torch.randn(num_gaussians, 3) * 0.1)
@@ -314,6 +321,67 @@ class GaussianPhysicsCompressionUnified(nn.Module):
 
         raise RuntimeError(f"Unsupported light_encoder_mode in _encode_light_set: {self.light_encoder_mode}")
 
+    def _contract_selected_params(
+        self,
+        gaussian_weights: torch.Tensor,
+        z: torch.Tensor,
+        selected_u: torch.Tensor,
+        selected_coeffs: torch.Tensor,
+        selected_u_l0: torch.Tensor,
+        selected_coeffs_l0: torch.Tensor,
+        contraction_mode: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        mode = str(contraction_mode).strip().lower()
+        if mode == "legacy":
+            time_weights = torch.einsum("bkrl,bl->bkr", selected_coeffs, z)
+            time_weights_l0 = torch.einsum("bkrl,bl->bkr", selected_coeffs_l0, z)
+            sh_contrib = torch.einsum("bkdr,bkr->bkd", selected_u, time_weights)
+            l0_contrib = torch.einsum("bkdr,bkr->bkd", selected_u_l0, time_weights_l0)
+            sh_pred = torch.einsum("bk,bkd->bd", gaussian_weights, sh_contrib)
+            l0_pred = torch.einsum("bk,bkd->bd", gaussian_weights, l0_contrib)
+            return sh_pred, l0_pred
+
+        if mode != "fused":
+            raise ValueError(f"Unsupported contraction_mode: {contraction_mode}")
+
+        bsz, k_count = int(gaussian_weights.shape[0]), int(gaussian_weights.shape[1])
+        rank = int(selected_u.shape[-1])
+        embed_dim = int(z.shape[-1])
+        sh_dim = int(selected_u.shape[-2])
+
+        coeffs_stack = torch.stack(
+            [selected_coeffs, selected_coeffs_l0],
+            dim=2,
+        )  # [B, K, 2, rank, embed_dim]
+        coeffs_flat = coeffs_stack.contiguous().reshape(bsz * k_count * 2, rank, embed_dim)
+        z_expand = (
+            z[:, None, None, :]
+            .expand(bsz, k_count, 2, embed_dim)
+            .contiguous()
+            .reshape(bsz * k_count * 2, embed_dim, 1)
+        )
+        time_weights = torch.bmm(coeffs_flat, z_expand).reshape(bsz, k_count, 2, rank)
+        sh_time = time_weights[:, :, 0, :]
+        l0_time = time_weights[:, :, 1, :]
+
+        sh_contrib = torch.bmm(
+            selected_u.contiguous().reshape(bsz * k_count, sh_dim, rank),
+            sh_time.contiguous().reshape(bsz * k_count, rank, 1),
+        ).reshape(bsz, k_count, sh_dim)
+        l0_contrib = torch.bmm(
+            selected_u_l0.contiguous().reshape(bsz * k_count, 3, rank),
+            l0_time.contiguous().reshape(bsz * k_count, rank, 1),
+        ).reshape(bsz, k_count, 3)
+
+        contrib_cat = torch.cat([sh_contrib, l0_contrib], dim=-1)
+        pred_cat = torch.bmm(
+            gaussian_weights.contiguous().unsqueeze(1),
+            contrib_cat.contiguous(),
+        ).squeeze(1)
+        sh_pred = pred_cat[:, :sh_dim]
+        l0_pred = pred_cat[:, sh_dim:]
+        return sh_pred, l0_pred
+
     def compute_gaussian_routing(
         self,
         positions: torch.Tensor,
@@ -331,10 +399,22 @@ class GaussianPhysicsCompressionUnified(nn.Module):
 
         if training_soft_routing:
             if routing_soft_topk is None or int(routing_soft_topk) <= 0:
-                soft_k = self.K
-            else:
-                soft_k = min(self.K, max(int(routing_soft_topk), int(top_k)))
-
+                # Full-K soft routing: avoid top-k truncation for a smooth dense path.
+                selected_mu = self.mu.unsqueeze(0).expand(B, -1, -1)
+                selected_scale = torch.exp(self.log_scale).unsqueeze(0).expand(B, -1, -1)
+                diff = pos_expanded - selected_mu
+                weighted_diff = diff / selected_scale
+                exponent = -0.5 * torch.sum(weighted_diff ** 2, dim=-1)
+                temperature = max(1e-6, float(routing_temperature))
+                logits = exponent / temperature
+                weights = torch.softmax(logits, dim=-1)
+                all_indices = torch.arange(
+                    int(self.K),
+                    device=positions.device,
+                    dtype=torch.long,
+                ).unsqueeze(0).expand(B, -1)
+                return weights, all_indices
+            soft_k = min(self.K, max(int(routing_soft_topk), int(top_k)))
             topk_values, topk_indices = torch.topk(
                 distances, k=soft_k, largest=False, dim=-1
             )
@@ -384,38 +464,63 @@ class GaussianPhysicsCompressionUnified(nn.Module):
         routing: Tuple[torch.Tensor, torch.Tensor],
         light_params: torch.Tensor,
         light_mask: torch.Tensor | None = None,
+        *,
+        param_select_mode: Literal["gather", "dense_masked"] = "gather",
+        contraction_mode: Literal["legacy", "fused"] | None = None,
     ) -> torch.Tensor:
         gaussian_weights, topk_indices = routing
 
         # 1) Encode light set
         z = self._encode_light_set(light_params, light_mask)  # [B, embed_dim]
 
-        # 2) Select parameters
-        selected_U = self.U[topk_indices]  # [B, K', sh_dim, rank]
-        selected_coeffs = self.coeffs[topk_indices]  # [B, K', rank, embed_dim]
-        selected_U_l0 = self.U_l0[topk_indices]  # [B, K', 3, rank]
-        selected_coeffs_l0 = self.coeffs_l0[topk_indices]  # [B, K', rank, embed_dim]
+        contract_mode = self.contraction_mode if contraction_mode is None else str(contraction_mode).strip().lower()
+        if contract_mode not in {"legacy", "fused"}:
+            raise ValueError(f"Unsupported contraction_mode: {contraction_mode}")
 
-        # 3) Compute rank weights
-        # time_weights: [B, K', rank]
-        # TODO(perf): 这里与后续多次 einsum 是主要算子热点，适合优先尝试 torch.compile。
-        time_weights = torch.einsum('bkrl,bl->bkr', selected_coeffs, z)
-        time_weights_l0 = torch.einsum('bkrl,bl->bkr', selected_coeffs_l0, z)
+        mode = str(param_select_mode).strip().lower()
+        if mode not in {"gather", "dense_masked"}:
+            raise ValueError(f"Unsupported param_select_mode: {param_select_mode}")
 
-        # 4) Dynamic basis modulation (FiLM)
+        if mode == "dense_masked":
+            batch_size = int(gaussian_weights.shape[0])
+            dense_weights = torch.zeros(
+                batch_size,
+                int(self.K),
+                dtype=gaussian_weights.dtype,
+                device=gaussian_weights.device,
+            )
+            dense_weights.scatter_add_(1, topk_indices.long(), gaussian_weights)
+            selected_u = self.U.unsqueeze(0).expand(batch_size, -1, -1, -1)
+            selected_coeffs = self.coeffs.unsqueeze(0).expand(batch_size, -1, -1, -1)
+            selected_u_l0 = self.U_l0.unsqueeze(0).expand(batch_size, -1, -1, -1)
+            selected_coeffs_l0 = self.coeffs_l0.unsqueeze(0).expand(batch_size, -1, -1, -1)
+            active_weights = dense_weights
+        else:
+            # 2) Select parameters
+            selected_U = self.U[topk_indices]  # [B, K', sh_dim, rank]
+            selected_coeffs = self.coeffs[topk_indices]  # [B, K', rank, embed_dim]
+            selected_U_l0 = self.U_l0[topk_indices]  # [B, K', 3, rank]
+            selected_coeffs_l0 = self.coeffs_l0[topk_indices]  # [B, K', rank, embed_dim]
+            selected_u = selected_U
+            selected_u_l0 = selected_U_l0
+            active_weights = gaussian_weights
+
+        # Dynamic basis modulation (FiLM)
         if self.enable_film:
             gamma = self.gamma(z).view(-1, 1, 1, self.rank)
             beta = self.beta(z).view(-1, 1, 1, self.rank)
-            selected_U = selected_U * (1.0 + gamma) + beta
-            selected_U_l0 = selected_U_l0 * (1.0 + gamma) + beta
+            selected_u = selected_u * (1.0 + gamma) + beta
+            selected_u_l0 = selected_u_l0 * (1.0 + gamma) + beta
 
-        # 5) SH contributions and sum
-        sh_contrib = torch.einsum('bkdr,bkr->bkd', selected_U, time_weights)
-        sh_pred = torch.einsum('bk,bkd->bd', gaussian_weights, sh_contrib)
-
-        # L0 branch (R,G,B)
-        l0_contrib = torch.einsum('bkdr,bkr->bkd', selected_U_l0, time_weights_l0)
-        l0_pred = torch.einsum('bk,bkd->bd', gaussian_weights, l0_contrib)
+        sh_pred, l0_pred = self._contract_selected_params(
+            active_weights,
+            z,
+            selected_u,
+            selected_coeffs,
+            selected_u_l0,
+            selected_coeffs_l0,
+            contraction_mode=contract_mode,
+        )
         l0_pred = torch.nn.functional.softplus(l0_pred)
 
         if self.sh_dim >= 27:

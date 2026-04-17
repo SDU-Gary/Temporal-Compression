@@ -167,6 +167,11 @@ def _crop_roi(img: np.ndarray, roi: Tuple[float, float, float, float]) -> np.nda
     return img[iy0:iy1, ix0:ix1, ...]
 
 
+def _linear_to_srgb_u8(img_linear: np.ndarray) -> np.ndarray:
+    srgb = srgb_encode(tone_map_reinhard(np.asarray(img_linear, dtype=np.float32)))
+    return np.clip(srgb * 255.0 + 0.5, 0.0, 255.0).astype(np.uint8)
+
+
 def _prepare_falcor_runtime(falcor_python_path: str | None) -> None:
     """Ensure libFalcor and its companion libs are discoverable before import."""
     if not falcor_python_path:
@@ -269,6 +274,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Strength for axis-test SH coefficient")
     p.add_argument("--save-sampled-images-dir", default=None,
                    help="Optional output dir for sampled metric frames (npz: linear/srgb/depth)")
+    p.add_argument(
+        "--dump-sampled-images-every",
+        type=int,
+        default=0,
+        help=(
+            "If >0, dump sampled images every N benchmark frames even when "
+            "metric computation is disabled."
+        ),
+    )
     p.add_argument("--output-scale", type=float, default=1.0,
                    help="Scale applied to SH shading output before metrics/output")
     p.add_argument("--metric-align-scale-gt", type=float, default=1.0,
@@ -498,6 +512,7 @@ def main() -> None:
 
     do_image_metrics = bool(args.compute_image_metrics and set(routes) == {"gt", "model"})
     metric_every = max(1, int(args.save_frame_metrics_every))
+    dump_every = int(max(0, int(args.dump_sampled_images_every)))
     image_metrics: List[Dict[str, float]] = []
     roi = _parse_roi(args.roi)
     metric_align_scale = {
@@ -562,13 +577,23 @@ def main() -> None:
 
         need_image_metrics_this_frame = bool(do_image_metrics and is_bench and (bench_counter % metric_every == 0))
         need_pt_metrics_this_frame = bool(args.pt_reference and is_bench and (bench_counter % metric_every == 0))
+        need_dump_images_this_frame = bool(
+            save_sampled_images_dir is not None
+            and is_bench
+            and dump_every > 0
+            and (bench_counter % dump_every == 0)
+        )
 
         row: Dict[str, Any] = {
             "frame": int(frame),
             "is_warmup": not is_bench,
             "gbuffer_ms": gbuffer_ms,
             "gbuffer_rendered": int(rendered_gbuffer_this_frame),
-            "metric_sampled": int(need_image_metrics_this_frame or need_pt_metrics_this_frame),
+            "metric_sampled": int(
+                need_image_metrics_this_frame
+                or need_pt_metrics_this_frame
+                or need_dump_images_this_frame
+            ),
         }
 
         rendered_images: Dict[str, np.ndarray] = {}
@@ -653,7 +678,7 @@ def main() -> None:
             should_sync = bool(args.sync_gpu)
             if (not should_sync) and int(args.sync_every) > 0 and is_bench and (bench_counter % int(args.sync_every) == 0):
                 should_sync = True
-            if need_image_metrics_this_frame or need_pt_metrics_this_frame:
+            if need_image_metrics_this_frame or need_pt_metrics_this_frame or need_dump_images_this_frame:
                 should_sync = True
 
             shade_sync_ms = 0.0
@@ -664,7 +689,7 @@ def main() -> None:
                 shade_sync_ms = (t_sync1 - t_sync0) * 1000.0
                 if img.shape[-1] > 3:
                     img = img[..., :3]
-                if need_image_metrics_this_frame or need_pt_metrics_this_frame:
+                if need_image_metrics_this_frame or need_pt_metrics_this_frame or need_dump_images_this_frame:
                     rendered_images[route] = img
 
             source_ms = (t_src1 - t_src0) * 1000.0
@@ -725,7 +750,7 @@ def main() -> None:
             phase_times["gbuffer"]["ms"].append(gbuffer_ms)
             frame_rows.append(row)
 
-            if (need_image_metrics_this_frame or need_pt_metrics_this_frame):
+            if (need_image_metrics_this_frame or need_pt_metrics_this_frame or need_dump_images_this_frame):
                 rec: Dict[str, float] = {"frame": int(frame)}
                 has_metric = False
 
@@ -830,30 +855,42 @@ def main() -> None:
                     if pt_metric_count > 0:
                         has_metric = True
 
-                if save_sampled_images_dir is not None and has_metric:
-                    depth_np = np.asarray(dep_tex.to_numpy(), dtype=np.float32)
-                    if depth_np.ndim == 3 and depth_np.shape[-1] > 1:
-                        depth_np = depth_np[..., 0]
+                if save_sampled_images_dir is not None and (has_metric or need_dump_images_this_frame):
                     save_path = save_sampled_images_dir / f"frame_{int(frame):04d}.npz"
-                    payload: Dict[str, np.ndarray] = {"depth": depth_np.astype(np.float32)}
-                    if "gt" in rendered_images:
-                        payload["gt_linear"] = rendered_images["gt"].astype(np.float32)
-                    if "model" in rendered_images:
-                        payload["model_linear"] = rendered_images["model"].astype(np.float32)
-                    if "pt" in rendered_images:
-                        payload["pt_linear"] = rendered_images["pt"].astype(np.float32)
-                    if "gt" in rendered_images and "model" in rendered_images:
-                        gt_img = srgb_encode(tone_map_reinhard(rendered_images["gt"]))
-                        model_img = srgb_encode(tone_map_reinhard(rendered_images["model"]))
-                        payload["gt_srgb"] = gt_img.astype(np.float32)
-                        payload["model_srgb"] = model_img.astype(np.float32)
-                        payload["err_srgb"] = np.abs(gt_img - model_img).astype(np.float32)
-                        payload["err_linear"] = np.abs(rendered_images["gt"] - rendered_images["model"]).astype(np.float32)
-                    if "pt" in rendered_images and "gt" in rendered_images:
-                        payload["err_pt_gt_linear"] = np.abs(rendered_images["pt"] - rendered_images["gt"]).astype(np.float32)
-                    if "pt" in rendered_images and "model" in rendered_images:
-                        payload["err_pt_model_linear"] = np.abs(rendered_images["pt"] - rendered_images["model"]).astype(np.float32)
-                    np.savez_compressed(save_path, **payload)
+                    if has_metric:
+                        depth_np = np.asarray(dep_tex.to_numpy(), dtype=np.float32)
+                        if depth_np.ndim == 3 and depth_np.shape[-1] > 1:
+                            depth_np = depth_np[..., 0]
+                        payload: Dict[str, np.ndarray] = {"depth": depth_np.astype(np.float32)}
+                        if "gt" in rendered_images:
+                            payload["gt_linear"] = rendered_images["gt"].astype(np.float32)
+                        if "model" in rendered_images:
+                            payload["model_linear"] = rendered_images["model"].astype(np.float32)
+                        if "pt" in rendered_images:
+                            payload["pt_linear"] = rendered_images["pt"].astype(np.float32)
+                        if "gt" in rendered_images and "model" in rendered_images:
+                            gt_img = srgb_encode(tone_map_reinhard(rendered_images["gt"]))
+                            model_img = srgb_encode(tone_map_reinhard(rendered_images["model"]))
+                            payload["gt_srgb"] = gt_img.astype(np.float32)
+                            payload["model_srgb"] = model_img.astype(np.float32)
+                            payload["err_srgb"] = np.abs(gt_img - model_img).astype(np.float32)
+                            payload["err_linear"] = np.abs(rendered_images["gt"] - rendered_images["model"]).astype(np.float32)
+                        if "pt" in rendered_images and "gt" in rendered_images:
+                            payload["err_pt_gt_linear"] = np.abs(rendered_images["pt"] - rendered_images["gt"]).astype(np.float32)
+                        if "pt" in rendered_images and "model" in rendered_images:
+                            payload["err_pt_model_linear"] = np.abs(rendered_images["pt"] - rendered_images["model"]).astype(np.float32)
+                        np.savez_compressed(save_path, **payload)
+                    else:
+                        # Fast export path: lightweight uncompressed u8 sRGB payload.
+                        payload_fast: Dict[str, np.ndarray] = {}
+                        if "gt" in rendered_images:
+                            payload_fast["gt_srgb_u8"] = _linear_to_srgb_u8(rendered_images["gt"])
+                        if "model" in rendered_images:
+                            payload_fast["model_srgb_u8"] = _linear_to_srgb_u8(rendered_images["model"])
+                        if "pt" in rendered_images:
+                            payload_fast["pt_srgb_u8"] = _linear_to_srgb_u8(rendered_images["pt"])
+                        if payload_fast:
+                            np.savez(save_path, **payload_fast)
 
                 if has_metric:
                     image_metrics.append(rec)
@@ -878,6 +915,7 @@ def main() -> None:
         "output_scale": float(args.output_scale),
         "metric_align_scale_gt": float(args.metric_align_scale_gt),
         "metric_align_scale_model": float(args.metric_align_scale_model),
+        "dump_sampled_images_every": int(max(0, int(args.dump_sampled_images_every))),
         "roi": str(args.roi) if args.roi else None,
         "pt_reference": bool(args.pt_reference),
         "pt_spp": int(max(1, int(args.pt_spp))),

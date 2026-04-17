@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import torch
@@ -36,6 +37,7 @@ class _RoutingDummyModel(torch.nn.Module):
         self.mu = torch.nn.Parameter(torch.linspace(-1.0, 1.0, num_gaussians).unsqueeze(-1).repeat(1, 3))
         self.log_scale = torch.nn.Parameter(torch.zeros(num_gaussians, 3))
         self.U = torch.nn.Parameter(torch.randn(num_gaussians, sh_dim, 1) * 0.01)
+        self.last_param_select_mode = None
 
     def compute_gaussian_routing(
         self,
@@ -58,7 +60,8 @@ class _RoutingDummyModel(torch.nn.Module):
         weights = torch.softmax(-values, dim=-1)
         return weights, indices
 
-    def forward_with_routing(self, routing, params, light_mask=None):
+    def forward_with_routing(self, routing, params, light_mask=None, param_select_mode: str = "gather"):
+        self.last_param_select_mode = str(param_select_mode)
         weights, indices = routing
         selected = self.U[indices, :, 0]
         return torch.einsum('bk,bkd->bd', weights, selected)
@@ -193,6 +196,30 @@ def test_routing_balance_metrics_with_soft_routing() -> None:
     assert "routing_temp" in metrics
     assert torch.isfinite(torch.tensor(metrics["routing_balance"]))
     assert 0.0 <= metrics["routing_nonzero_ratio"] <= 1.0
+
+
+def test_cuda_graph_requested_on_cpu_falls_back_to_eager() -> None:
+    model = _RoutingDummyModel()
+    trainer = GaussianPhysicsTrainer(
+        model=model,
+        device=torch.device("cpu"),
+        adapter=BatchAdapter(params_key="light_params", mask_key="light_mask"),
+        lr=1e-3,
+        weight_decay=0.0,
+        recon_loss="mse",
+        temporal_weight=0.0,
+        linearity_weight=0.0,
+        spatial_weight=0.0,
+        grad_norm_log_every_steps=0,
+        cuda_graph_train=True,
+        show_progress=False,
+    )
+
+    loader = torch.utils.data.DataLoader(_TinyDataset(), batch_size=4, shuffle=False)
+    metrics = trainer.train_epoch(loader)
+    assert metrics["cuda_graph_requested"] == 1.0
+    assert metrics["cuda_graph_enabled"] == 0.0
+    assert metrics["cuda_graph_fallback_eager"] == 0.0
 
 
 def test_routing_balance_uses_global_expert_indices() -> None:
@@ -370,3 +397,94 @@ def test_routing_balance_anneal_schedule_with_epoch_offset() -> None:
     assert abs(w_epoch1 - 0.01) < 1e-8
     assert abs(w_epoch5 - 0.002) < 1e-8
     assert abs(w_epoch6 - 0.0) < 1e-8
+
+
+def test_fit_emits_profiler_artifacts(tmp_path: Path) -> None:
+    model = _BiasModel()
+    trainer = GaussianPhysicsTrainer(
+        model=model,
+        device=torch.device("cpu"),
+        adapter=BatchAdapter(params_key="light_params", mask_key="light_mask"),
+        lr=1e-3,
+        weight_decay=0.0,
+        recon_loss="mse",
+        temporal_weight=0.0,
+        linearity_weight=0.0,
+        spatial_weight=0.0,
+        profile_train=True,
+        profile_wait=0,
+        profile_warmup=0,
+        profile_active=1,
+        profile_repeat=1,
+        show_progress=False,
+    )
+    loader = torch.utils.data.DataLoader(_TinyDataset(), batch_size=4, shuffle=False)
+    trainer.fit(
+        train_loader=loader,
+        val_loader=loader,
+        num_epochs=1,
+        output_dir=tmp_path,
+        checkpoint_meta={"test": "profiling"},
+        save_best=False,
+        best_metric="mae",
+    )
+
+    profiler_dir = tmp_path / "profiling"
+    assert (profiler_dir / "config.json").exists()
+    assert (profiler_dir / "run_summary.json").exists()
+    summary_obj = json.loads((profiler_dir / "run_summary.json").read_text(encoding="utf-8"))
+    assert int(summary_obj.get("steps", 0)) > 0
+
+
+def test_linearity_loss_cadence_runs_every_n_steps() -> None:
+    model = _BiasModel()
+    trainer = GaussianPhysicsTrainer(
+        model=model,
+        device=torch.device("cpu"),
+        adapter=BatchAdapter(params_key="light_params", mask_key="light_mask"),
+        lr=1e-3,
+        weight_decay=0.0,
+        recon_loss="mse",
+        temporal_weight=0.0,
+        linearity_weight=0.1,
+        linearity_aug_pairs=0,
+        linearity_every_steps=2,
+        spatial_weight=0.0,
+        show_progress=False,
+    )
+    loader = torch.utils.data.DataLoader(_TinyDataset(), batch_size=2, shuffle=False)
+    metrics = trainer.train_epoch(loader)
+
+    assert metrics["linearity_eval_steps"] == 2.0
+    assert metrics["linearity_skip_steps"] == 2.0
+
+
+def test_train_routing_param_mode_only_affects_training_forward() -> None:
+    model = _RoutingDummyModel()
+    trainer = GaussianPhysicsTrainer(
+        model=model,
+        device=torch.device("cpu"),
+        adapter=BatchAdapter(params_key="light_params", mask_key="light_mask"),
+        lr=1e-3,
+        weight_decay=0.0,
+        recon_loss="mse",
+        temporal_weight=0.0,
+        linearity_weight=0.0,
+        spatial_weight=0.0,
+        train_routing_param_mode="dense_masked",
+        show_progress=False,
+    )
+
+    positions = torch.zeros((2, 3), dtype=torch.float32)
+    params = torch.zeros((2, 2, 12), dtype=torch.float32)
+    mask = torch.ones((2, 2), dtype=torch.float32)
+    routing = trainer._compute_routing(positions, for_training=True)
+    assert routing is not None
+
+    trainer._train_routing_mode = True
+    _ = trainer._forward(positions, params, mask=mask, routing=routing)
+    assert model.last_param_select_mode == "dense_masked"
+
+    trainer._train_routing_mode = False
+    _ = trainer._forward(positions, params, mask=mask, routing=routing)
+    assert model.last_param_select_mode == "gather"

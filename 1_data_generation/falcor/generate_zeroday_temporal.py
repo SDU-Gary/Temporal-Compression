@@ -4,12 +4,10 @@
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import os
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Sequence
 
@@ -44,21 +42,13 @@ from probe_validity import (  # noqa: E402
     normalize_rows,
     sample_probes_adaptive,
 )
-
-
-def _parse_frame_indices(num_frames: int, frame_indices: str, frame_step: int | None) -> List[int]:
-    if frame_indices:
-        items = []
-        for token in frame_indices.split(","):
-            token = token.strip()
-            if token == "":
-                continue
-            items.append(int(token))
-        indices = sorted(set([i for i in items if 0 <= i < num_frames]))
-        return indices
-    if frame_step is not None and frame_step > 0:
-        return list(range(0, num_frames, frame_step))
-    return list(range(num_frames))
+from temporal_dataset_common import (  # noqa: E402
+    bake_temporal_tensor,
+    build_base_temporal_metadata,
+    parse_frame_indices,
+    resolve_num_samples,
+    save_temporal_dataset,
+)
 
 
 def _set_scene_time(testbed, frame_idx: int, fps: float) -> None:
@@ -517,7 +507,7 @@ def main() -> None:
     _pause_clock(pt_testbed)
 
     bounds = get_scene_bounds(pt_scene)
-    frame_indices = _parse_frame_indices(int(args.num_frames), args.frame_indices, args.frame_step)
+    frame_indices = parse_frame_indices(int(args.num_frames), args.frame_indices, args.frame_step)
     if len(frame_indices) == 0:
         raise ValueError("No frame indices selected.")
     validation_frame_step = max(1, int(args.validation_frame_step))
@@ -674,9 +664,6 @@ def main() -> None:
     P = int(probes.shape[0])
     M = int(len(frame_indices))
     N = 1
-    tensor = np.zeros((P, M, 27), dtype=np.float32)
-    light_configs = np.zeros((M, N, 12), dtype=np.float32)
-    light_mask = np.ones((M, N), dtype=np.float32)
     dummy_desc = _build_dummy_descriptor(np.float32)
 
     def render_probe_sh(probe: np.ndarray) -> np.ndarray:
@@ -707,71 +694,82 @@ def main() -> None:
             )
         return fit_sh_coefficients(directions, np.asarray(radiances, dtype=np.float32), max_order=2)
 
-    start_bake = time.time()
-    for out_idx, frame_idx in enumerate(frame_indices):
+    def _per_frame_setup(frame_idx: int, _out_idx: int) -> np.ndarray:
         _set_scene_time(pt_testbed, int(frame_idx), float(args.fps))
-        light_configs[out_idx, 0, :] = dummy_desc
-        for probe_idx in tqdm(valid_indices, desc=f"Bake frame {out_idx + 1}/{M}", leave=False):
-            probe = probes[int(probe_idx)]
-            tensor[int(probe_idx), out_idx, :] = render_probe_sh(probe)
+        return np.asarray(dummy_desc, dtype=np.float32).reshape(1, 12)
 
-    bake_seconds = float(time.time() - start_bake)
-    num_samples = int(args.num_sh_samples)
-    if args.sh_mode == "cubemap":
-        num_samples = int(args.cube_res) * int(args.cube_res) * 6
+    bake_out = bake_temporal_tensor(
+        probes=probes,
+        frame_indices=frame_indices,
+        num_lights=int(N),
+        light_descriptor_dim=12,
+        render_probe_sh=render_probe_sh,
+        per_frame_setup=_per_frame_setup,
+        valid_indices=valid_indices,
+        probe_progress_desc_fn=lambda out_idx, total: f"Bake frame {int(out_idx) + 1}/{int(total)}",
+    )
 
-    metadata = {
-        "engine": "Falcor",
-        "scene": str(Path(args.scene).resolve()),
-        "num_probes": int(P),
-        "num_valid_probes": int(num_valid),
-        "num_configs": int(M),
-        "num_frames": int(args.num_frames),
-        "fps": float(args.fps),
-        "duration_sec": float((args.num_frames - 1) / max(args.fps, 1e-6)),
-        "frame_indices": list(frame_indices),
-        "num_lights": int(N),
-        "light_descriptor_dim": 12,
-        "sh_mode": args.sh_mode,
-        "cube_res": int(args.cube_res),
-        "num_sh_samples": int(args.num_sh_samples),
-        "num_samples": int(num_samples),
-        "spp": int(desired_spp),
-        "spp_per_frame": int(per_frame_spp),
-        "accum_frames": int(args.accum_frames),
-        "radiance_clamp": float(args.radiance_clamp),
-        "bounds": {"min": bounds[0].tolist(), "max": bounds[1].tolist()},
-        "probe_mode": args.probe_mode,
-        "probe_uniform_ratio": float(args.probe_uniform_ratio),
-        "probe_file": str(args.probe_file) if args.probe_file else None,
-        "probe_validation": {
-            "policy": "all_frames_intersection",
-            "validity_method": str(args.validity_method),
-            "candidate_frame_step": int(candidate_frame_step),
-            "validation_frame_step": int(validation_frame_step),
-            "num_candidate_frames": int(len(candidate_frames)),
-            "num_validation_frames": int(len(validation_frames)),
-            "num_validation_cameras": int(len(camera_poses)),
-            "visibility_margin": float(args.visibility_margin),
-            "collision_distance": float(args.collision_distance),
-            "collision_signed_epsilon": float(args.collision_signed_epsilon),
-            "frame_pass_counts": frame_pass_counts,
-            "frame_visible_counts": frame_visible_counts,
-            "frame_collision_counts": frame_collision_counts,
-            "validation_seconds": validate_seconds,
-        },
-        "candidate_pool": {
-            "gbuffer_width": int(args.gbuffer_width),
-            "gbuffer_height": int(args.gbuffer_height),
-            "max_points_per_view": int(args.max_points_per_view),
-            "max_surface_candidates": int(args.max_surface_candidates),
-            "surface_offset_range": [float(args.surface_offset_min), float(args.surface_offset_max)],
-            "candidate_voxel_size": float(args.candidate_voxel_size),
-            "candidate_points_count": int(candidate_points_count),
-        },
-        "bake_seconds": float(bake_seconds),
-        "generation_date": datetime.now().isoformat(),
-    }
+    tensor = bake_out["tensor"]
+    light_configs = bake_out["light_configs"]
+    light_mask = bake_out["light_mask"]
+    bake_seconds = float(bake_out["bake_seconds"])
+    num_samples = resolve_num_samples(args.sh_mode, int(args.cube_res), int(args.num_sh_samples))
+
+    metadata = build_base_temporal_metadata(
+        scene=str(args.scene),
+        num_probes=int(P),
+        num_configs=int(M),
+        num_frames=int(args.num_frames),
+        fps=float(args.fps),
+        frame_indices=frame_indices,
+        num_lights=int(N),
+        light_descriptor_dim=12,
+        sh_mode=str(args.sh_mode),
+        cube_res=int(args.cube_res),
+        num_sh_samples=int(args.num_sh_samples),
+        num_samples=int(num_samples),
+        spp=int(desired_spp),
+        spp_per_frame=int(per_frame_spp),
+        accum_frames=int(args.accum_frames),
+        radiance_clamp=float(args.radiance_clamp),
+        bounds_min=bounds[0].tolist(),
+        bounds_max=bounds[1].tolist(),
+        duration_sec=float((args.num_frames - 1) / max(args.fps, 1e-6)),
+    )
+    metadata.update(
+        {
+            "num_valid_probes": int(num_valid),
+            "probe_mode": args.probe_mode,
+            "probe_uniform_ratio": float(args.probe_uniform_ratio),
+            "probe_file": str(args.probe_file) if args.probe_file else None,
+            "probe_validation": {
+                "policy": "all_frames_intersection",
+                "validity_method": str(args.validity_method),
+                "candidate_frame_step": int(candidate_frame_step),
+                "validation_frame_step": int(validation_frame_step),
+                "num_candidate_frames": int(len(candidate_frames)),
+                "num_validation_frames": int(len(validation_frames)),
+                "num_validation_cameras": int(len(camera_poses)),
+                "visibility_margin": float(args.visibility_margin),
+                "collision_distance": float(args.collision_distance),
+                "collision_signed_epsilon": float(args.collision_signed_epsilon),
+                "frame_pass_counts": frame_pass_counts,
+                "frame_visible_counts": frame_visible_counts,
+                "frame_collision_counts": frame_collision_counts,
+                "validation_seconds": validate_seconds,
+            },
+            "candidate_pool": {
+                "gbuffer_width": int(args.gbuffer_width),
+                "gbuffer_height": int(args.gbuffer_height),
+                "max_points_per_view": int(args.max_points_per_view),
+                "max_surface_candidates": int(args.max_surface_candidates),
+                "surface_offset_range": [float(args.surface_offset_min), float(args.surface_offset_max)],
+                "candidate_voxel_size": float(args.candidate_voxel_size),
+                "candidate_points_count": int(candidate_points_count),
+            },
+            "bake_seconds": float(bake_seconds),
+        }
+    )
     if args.validity_method in ("rayquery_hybrid", "rayquery_full"):
         metadata["probe_validation"]["rayquery"] = {
             "collision_rays": int(args.rayquery_collision_rays),
@@ -784,17 +782,15 @@ def main() -> None:
             "frame_valid_counts": frame_rq_valid_counts,
         }
 
-    np.savez_compressed(
-        output_dir / "parametric_tensor.npz",
+    save_temporal_dataset(
+        output_dir=output_dir,
         tensor=tensor,
         probe_positions=probes,
         light_configs=light_configs,
         light_mask=light_mask,
-        valid_mask=valid_mask.astype(np.float32),
         metadata=metadata,
+        extra_arrays={"valid_mask": valid_mask.astype(np.float32)},
     )
-    with open(output_dir / "metadata.json", "w") as f:
-        json.dump(metadata, f, indent=2)
 
     print(f"Saved dataset to: {output_dir}", flush=True)
 

@@ -1,0 +1,304 @@
+experiment:
+  variant: unified_set
+  output_dir: 3_experiments/results/bistro_clean_v2/exp_A2_2_A_temp035_seed19
+  device: cuda
+  seed: 19
+data:
+  data_root: 1_data_generation/output/bistro_clean_v2
+  train_ratio: 0.7
+  val_ratio: 0.15
+  batch_size: 512
+  num_workers: 0
+model:
+  num_gaussians: 30
+  rank: 8
+  top_k: 3
+  light_dim: 12
+  embed_dim: 32
+  intensity_dim: 3
+  intensity_offset: 1
+  disable_film: false
+  light_encoder_mode: bypass_linear
+  bypass_feature_pairs:
+  - - 0
+    - 5
+  - - 1
+    - 6
+  bypass_feature_norm_mean:
+  - -0.8408854603767395
+  - 0.00390212656930089
+  bypass_feature_norm_std:
+  - 0.08430388569831848
+  - 0.49811413884162903
+training:
+  epochs: 400
+  lr: 0.001
+  weight_decay: 0.0
+  lr_scheduler: cosine
+  lr_min: 1.0e-06
+  warmup_epochs: 20
+  dataloader_timeout_seconds: 120
+  dataloader_prefetch_factor: 2
+  dataloader_persistent_workers: false
+  dataloader_multiprocessing_context: none
+  resume_save_every: 1
+  resume_checkpoint_name: resume_latest.pt
+  heartbeat_enabled: true
+  heartbeat_history: true
+  recon_loss: charbonnier
+  lambda_temporal: 0.001
+  lambda_linearity: 0.1
+  linearity_aug_pairs: 2
+  enable_sh_scaler: false
+  enable_weighted_sh_loss: false
+  lambda_image: 0.0
+  proxy_image_loss:
+    enabled: true
+    lambda: 0.02
+    warmup_epochs: 120
+    enable_val_image_metrics: true
+    mix_mode: linear_log_mix
+    log_mix_weight: 0.3
+  gbuffer_image_loss:
+    enabled: true
+    lambda: 0.02
+    warmup_epochs: 80
+    every_steps: 8
+    loss_type: charbonnier
+    dataset_root: 1_data_generation/output/bistro_clean_v2_gbuffer
+    pixel_sample_count: 8192
+    domain: linear
+    gt_color_space: linear
+    strict_keys: true
+    pos_key: posW
+    normal_key: normW
+    albedo_key: albedo
+    gt_linear_key: gt_linear
+    light_params_key: light_params
+    light_mask_key: light_mask
+    valid_mask_key: valid_mask
+  proxy_gbuffer_handover:
+    enabled: true
+    start_epoch: 150
+    end_epoch: 220
+    proxy_start_scale: 1.0
+    proxy_end_scale: 0.0
+    gbuffer_start_scale: 0.0
+    gbuffer_end_scale: 1.0
+  loss_effective_contribution:
+    enabled: true
+    ema_decay: 0.98
+    warmup_steps: 200
+    frequency_aware: true
+    clamp_min_scale: 0.2
+    clamp_max_scale: 5.0
+    target_ratio_default: 0.25
+    target_ratios:
+      image: 0.25
+      gbuffer: 0.25
+      temporal: 0.10
+      linearity: 0.10
+      spatial: 0.10
+      routing_balance: 0.05
+  optimization_monitoring:
+    enabled: true
+    shared_groups: [routing, basis, coeff, encoder, film]
+    grad_diagnostics_every_steps: 50
+    update_ratio_every_steps: 20
+    spectrum_every_epochs: 1
+    pulse_recovery_tolerance: 0.02
+    pulse_recovery_max_steps: 64
+    gns_enabled: true
+  lambda_routing_balance: 0.02
+  routing_balance_anneal:
+    enabled: true
+    start: 0.02
+    end: 0.005
+    decay_end_ratio: 0.6
+  routing_soft_train: true
+  routing_soft_topk: 8
+  routing_temp_start: 1.0
+  routing_temp_end: 0.35
+  routing_temp_anneal_epochs: 320
+  ema:
+    enabled: true
+    decay: 0.999
+    eval_on_ema: true
+    save_best_with_ema: true
+    raw_eval_every_epochs: 10
+  oracle_monitor:
+    enabled: true
+    split: test
+    period_epochs: 20
+    lightweight_max_samples: 2048
+    lightweight_sample_seed: 42
+    stage_end_full: true
+    full_max_samples: 0
+    batch_size: 512
+    num_workers: 0
+    timeout_seconds: 240
+    fail_on_timeout: false
+  coeff_suite:
+    enabled: true
+    run_after_training: true
+    split: test
+    device: cpu
+    max_samples: 8192
+    sample_seed: 42
+    batch_size: 512
+    num_workers: 0
+    probe_train_ratio: 0.8
+    ridge_alpha: 0.0001
+    mlp_hidden: 128
+    mlp_epochs: 30
+    mlp_lr: 0.001
+    mlp_batch_size: 256
+    timeout_seconds: 1800
+    fail_on_timeout: false
+    checkpoints:
+    - global_best_falcor.pt
+    - global_best_val_soft8_t018.pt
+    - best_model.pt
+    - last_model.pt
+  global_best:
+    enabled: true
+    track_falcor: true
+    track_soft_profile: true
+    soft_profile_name: soft8_t018
+    soft_metric: img_psnr
+    soft_metric_maximize: true
+  expert_utilization_audit:
+    enabled: false
+    run_after_training: true
+    split: test
+    device: cpu
+    max_samples: 8192
+    sample_seed: 42
+    batch_size: 512
+    num_workers: 0
+    timeout_seconds: 900
+    fail_on_timeout: false
+    profiles:
+    - name: hard3
+      top_k: 3
+      training_soft_routing: false
+    - name: soft8_t020
+      top_k: 3
+      training_soft_routing: true
+      routing_soft_topk: 8
+      routing_temperature: 0.2
+  semantic_drift_audit:
+    enabled: false
+    run_after_training: true
+    split: test
+    device: cpu
+    max_samples: 8192
+    sample_seed: 42
+    batch_size: 512
+    num_workers: 0
+    timeout_seconds: 1200
+    fail_on_timeout: false
+    pairs:
+    - name: best_vs_last
+      checkpoint_a: best_model.pt
+      checkpoint_b: last_model.pt
+    profiles:
+    - name: hard3
+      top_k: 3
+      training_soft_routing: false
+    - name: soft8_t020
+      top_k: 3
+      training_soft_routing: true
+      routing_soft_topk: 8
+      routing_temperature: 0.2
+  val_profiles:
+    enabled: true
+    best_metric: img_psnr
+    profiles:
+    - name: hard3
+      top_k: 3
+      training_soft_routing: false
+    - name: soft8_t018
+      top_k: 3
+      training_soft_routing: true
+      routing_soft_topk: 8
+      routing_temperature: 0.18
+    - name: soft8_t020
+      top_k: 3
+      training_soft_routing: true
+      routing_soft_topk: 8
+      routing_temperature: 0.2
+    - name: soft8_t022
+      top_k: 3
+      training_soft_routing: true
+      routing_soft_topk: 8
+      routing_temperature: 0.22
+  test_compare_profiles:
+    enabled: true
+  falcor_periodic_eval:
+    enabled: true
+    scene: 1_data_generation/falcor/scenes/bistro_exterior_emissive_spheres.pyscene
+    every_n_epochs: 25
+    stage_end_full: true
+    best_metric: mean_real_render_hdr_psnr
+    maximize: true
+    timeout_seconds: 2400
+    fail_on_timeout: false
+    fail_on_error: false
+    max_frames: 24
+    warmup_frames: 8
+    benchmark_frames: 24
+    save_frame_metrics_every: 8
+    width: 1280
+    height: 720
+    fps: 30.0
+    route: both
+    compute_image_metrics: true
+    split_runtime: true
+    async_mode: true
+    profile:
+      name: soft8_t018
+      top_k: 3
+      training_soft_routing: true
+      routing_soft_topk: 8
+      routing_temperature: 0.18
+  performance:
+    amp_mode: 'off'
+    grad_norm_log_every_steps: 10
+    torch_compile:
+      enabled: false
+      mode: reduce-overhead
+      dynamic: false
+    soft_profile_sharing:
+      enabled: true
+      equiv_check_batches: 2
+      mae_tolerance: 1.0e-06
+      img_psnr_tolerance: 0.0005
+  staged:
+    enabled: true
+    stages:
+    - name: stage1_a2_2_a_temp035
+      epochs: 400
+      lr: 0.0008
+      lr_scheduler: cosine
+      lr_min: 1.0e-06
+      warmup_epochs: 20
+      trainable_groups:
+      - coeff
+      - encoder
+      - film
+      - routing
+      group_lrs:
+        all: 0.0001
+        coeff: 0.0008
+        encoder: 0.0008
+        film: 0.0008
+        routing: 0.0002
+      best_metric: img_psnr
+evaluation:
+  output_dir: 3_experiments/results/bistro_clean_v2/exp_A2_2_A_temp035_seed19/eval
+  checkpoint: 3_experiments/results/bistro_clean_v2/exp_A2_2_A_temp035_seed19/global_best_falcor.pt
+  data_root: 1_data_generation/output/bistro_clean_v2
+  rank: 8
+  n_samples: 20
+  probe_idx: 0

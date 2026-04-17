@@ -5,6 +5,7 @@ from argparse import Namespace
 from pathlib import Path
 
 import pytest
+import warnings
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -75,6 +76,7 @@ def test_apply_config_maps_routing_training_fields() -> None:
         routing_temp_start=1.0,
         routing_temp_end=1.0,
         routing_temp_anneal_epochs=0,
+        train_routing_param_mode="gather",
     )
     defaults = Namespace(
         lambda_routing_balance=0.0,
@@ -83,6 +85,7 @@ def test_apply_config_maps_routing_training_fields() -> None:
         routing_temp_start=1.0,
         routing_temp_end=1.0,
         routing_temp_anneal_epochs=0,
+        train_routing_param_mode="gather",
     )
     cfg_utils.apply_config(
         args,
@@ -95,6 +98,7 @@ def test_apply_config_maps_routing_training_fields() -> None:
                 "routing_temp_start": 1.0,
                 "routing_temp_end": 0.2,
                 "routing_temp_anneal_epochs": 320,
+                "train_routing_param_mode": "dense_masked",
             }
         },
     )
@@ -104,3 +108,60 @@ def test_apply_config_maps_routing_training_fields() -> None:
     assert args.routing_temp_start == 1.0
     assert args.routing_temp_end == 0.2
     assert args.routing_temp_anneal_epochs == 320
+    assert args.train_routing_param_mode == "dense_masked"
+
+
+def test_apply_config_alias_compat_with_deprecation_warning() -> None:
+    args = Namespace(
+        data_root=None,
+        epochs=None,
+        eval_output_dir=None,
+        enable_rerun=False,
+        show_progress=True,
+    )
+    defaults = Namespace(
+        data_root=None,
+        epochs=None,
+        eval_output_dir=None,
+        enable_rerun=False,
+        show_progress=True,
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cfg_utils.apply_config(
+            args,
+            defaults,
+            {
+                "data": {"dataset_path": "/tmp/data"},
+                "training": {"num_epochs": 12, "rerun": True, "progress": False},
+                "eval": {"out_dir": "/tmp/eval"},
+            },
+        )
+
+    assert args.data_root == "/tmp/data"
+    assert args.epochs == 12
+    assert args.eval_output_dir == "/tmp/eval"
+    assert args.enable_rerun is True
+    assert args.show_progress is False
+    messages = [str(w.message) for w in caught]
+    assert any("data.dataset_path -> data.data_root" in m for m in messages)
+    assert any("training.num_epochs -> training.epochs" in m for m in messages)
+    assert any("eval -> evaluation" in m for m in messages)
+    assert any("evaluation.out_dir -> evaluation.output_dir" in m for m in messages)
+
+
+def test_apply_config_prefers_canonical_keys_over_aliases() -> None:
+    args = Namespace(data_root=None, epochs=None)
+    defaults = Namespace(data_root=None, epochs=None)
+
+    cfg_utils.apply_config(
+        args,
+        defaults,
+        {
+            "data": {"data_root": "/canon", "dataset_path": "/legacy"},
+            "training": {"epochs": 5, "num_epochs": 10},
+        },
+    )
+    assert args.data_root == "/canon"
+    assert args.epochs == 5

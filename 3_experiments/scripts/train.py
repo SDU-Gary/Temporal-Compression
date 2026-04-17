@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import atexit
-from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import numpy as np
 import os
@@ -32,6 +31,28 @@ from train_config_utils import (
     apply_config as apply_config_from_config,
     load_yaml as load_yaml_config,
 )
+from train_runtime_config import (
+    apply_runtime_overrides as _apply_runtime_overrides_impl,
+    resolve_coeff_suite_config as _resolve_coeff_suite_config_impl,
+    resolve_ema_config as _resolve_ema_config_impl,
+    resolve_expert_utilization_audit_config as _resolve_expert_utilization_audit_config_impl,
+    resolve_falcor_periodic_eval_config as _resolve_falcor_periodic_eval_config_impl,
+    resolve_gbuffer_image_loss_config as _resolve_gbuffer_image_loss_config_impl,
+    resolve_global_best_config as _resolve_global_best_config_impl,
+    resolve_global_group_lrs as _resolve_global_group_lrs_impl,
+    resolve_oracle_monitor_config as _resolve_oracle_monitor_config_impl,
+    resolve_performance_config as _resolve_performance_config_impl,
+    resolve_proxy_image_loss_config as _resolve_proxy_image_loss_config_impl,
+    resolve_routing_balance_anneal_config as _resolve_routing_balance_anneal_config_impl,
+    resolve_runtime_config_bundle as _resolve_runtime_config_bundle_impl,
+    resolve_semantic_drift_audit_config as _resolve_semantic_drift_audit_config_impl,
+    resolve_staged_specs as _resolve_staged_specs_impl,
+    resolve_val_profiles_config as _resolve_val_profiles_config_impl,
+    RuntimeConfigBundle,
+)
+from train_variant_registry import VariantRegistry
+from train_hooks import HeartbeatHook, HookManager, Phase0MetricsHook, TrainingEvent
+from train_audit_hooks import FalcorPeriodicAuditHook, OracleAuditHook, PostTrainingAuditHook
 
 _ROOT, _SRC = ensure_repo_paths(__file__, root_levels=2)
 
@@ -48,6 +69,7 @@ torch = None
 BatchAdapter = None
 GaussianPhysicsTrainer = None
 create_dataloaders_lightset = None
+create_gbuffer_supervision_dataloader = None
 GaussianPhysicsCompressionUnified = None
 _TRAIN_ARG_DEFAULTS = None
 
@@ -57,6 +79,7 @@ def _lazy_imports() -> None:
     global BatchAdapter
     global GaussianPhysicsTrainer
     global create_dataloaders_lightset
+    global create_gbuffer_supervision_dataloader
     global GaussianPhysicsCompressionUnified
 
     if torch is None:
@@ -73,6 +96,12 @@ def _lazy_imports() -> None:
         from data.lightset_dataset import create_dataloaders_lightset as _create_dataloaders_lightset
 
         create_dataloaders_lightset = _create_dataloaders_lightset
+    if create_gbuffer_supervision_dataloader is None:
+        from data.gbuffer_supervision_dataset import (
+            create_gbuffer_supervision_dataloader as _create_gbuffer_supervision_dataloader,
+        )
+
+        create_gbuffer_supervision_dataloader = _create_gbuffer_supervision_dataloader
     if GaussianPhysicsCompressionUnified is None:
         from models.gaussian_physics_unified import (
             GaussianPhysicsCompressionUnified as _GaussianPhysicsCompressionUnified,
@@ -146,49 +175,79 @@ def _resolve_bypass_feature_pairs(raw: Any) -> List[List[int]] | None:
     return out
 
 
+def _resolve_initial_cuda_graph_train(args: argparse.Namespace) -> bool:
+    enabled = bool(getattr(args, "cuda_graph_train", False))
+    cfg = getattr(args, "_config_obj", None)
+    if not isinstance(cfg, dict):
+        return enabled
+    training = cfg.get("training", {})
+    if not isinstance(training, dict):
+        return enabled
+    performance = training.get("performance", {})
+    if not isinstance(performance, dict):
+        return enabled
+    cuda_graph_cfg = performance.get("cuda_graph", {})
+    if not isinstance(cuda_graph_cfg, dict):
+        return enabled
+    return bool(cuda_graph_cfg.get("enabled", enabled))
+
+
+_VARIANT_REGISTRY = VariantRegistry()
+
+
+def _build_unified_set_variant(args: argparse.Namespace, device: torch.device):
+    cuda_graph_train = _resolve_initial_cuda_graph_train(args)
+    train_loader, val_loader, test_loader = create_dataloaders_lightset(
+        data_root=args.data_root,
+        batch_size=args.batch_size,
+        train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
+        num_workers=args.num_workers,
+        normalize_probes=True,
+        dataloader_timeout_seconds=getattr(args, "dataloader_timeout_seconds", 0),
+        dataloader_prefetch_factor=getattr(args, "dataloader_prefetch_factor", None),
+        dataloader_persistent_workers=getattr(args, "dataloader_persistent_workers", None),
+        dataloader_multiprocessing_context=getattr(args, "dataloader_multiprocessing_context", "none"),
+        train_drop_last=bool(cuda_graph_train),
+    )
+    model = GaussianPhysicsCompressionUnified(
+        num_gaussians=args.num_gaussians,
+        rank=args.rank,
+        sh_dim=27,
+        light_dim=args.light_dim,
+        embed_dim=args.embed_dim,
+        intensity_dim=args.intensity_dim,
+        intensity_offset=args.intensity_offset,
+        enable_film=not args.disable_film,
+        light_encoder_mode=str(getattr(args, "light_encoder_mode", "normal")),
+        bypass_feature_pairs=_resolve_bypass_feature_pairs(
+            getattr(args, "bypass_feature_pairs", None)
+        ),
+        bypass_feature_norm_mean=getattr(args, "bypass_feature_norm_mean", None),
+        bypass_feature_norm_std=getattr(args, "bypass_feature_norm_std", None),
+        contraction_mode=str(getattr(args, "contraction_mode", "fused")),
+    ).to(device)
+    adapter = BatchAdapter(params_key="light_params", mask_key="light_mask")
+    init_fn = _init_5d
+    temporal_loss_fn = None
+    loaders = (train_loader, val_loader, test_loader)
+    return model, adapter, loaders, {"init_fn": init_fn, "temporal_loss_fn": temporal_loss_fn}
+
+
+def register_variant(name: str, builder, *, overwrite: bool = False) -> None:
+    _VARIANT_REGISTRY.register(name, builder, overwrite=overwrite)
+
+
+register_variant("unified_set", _build_unified_set_variant)
+
+
 def build_variant(
     variant: str,
     args: argparse.Namespace,
     device: torch.device,
 ) -> Tuple[torch.nn.Module, BatchAdapter, Tuple, Dict]:
     _lazy_imports()
-    if variant == "unified_set":
-        train_loader, val_loader, test_loader = create_dataloaders_lightset(
-            data_root=args.data_root,
-            batch_size=args.batch_size,
-            train_ratio=args.train_ratio,
-            val_ratio=args.val_ratio,
-            num_workers=args.num_workers,
-            normalize_probes=True,
-            dataloader_timeout_seconds=getattr(args, "dataloader_timeout_seconds", 0),
-            dataloader_prefetch_factor=getattr(args, "dataloader_prefetch_factor", None),
-            dataloader_persistent_workers=getattr(args, "dataloader_persistent_workers", None),
-            dataloader_multiprocessing_context=getattr(args, "dataloader_multiprocessing_context", "none"),
-        )
-        model = GaussianPhysicsCompressionUnified(
-            num_gaussians=args.num_gaussians,
-            rank=args.rank,
-            sh_dim=27,
-            light_dim=args.light_dim,
-            embed_dim=args.embed_dim,
-            intensity_dim=args.intensity_dim,
-            intensity_offset=args.intensity_offset,
-            enable_film=not args.disable_film,
-            light_encoder_mode=str(getattr(args, "light_encoder_mode", "normal")),
-            bypass_feature_pairs=_resolve_bypass_feature_pairs(
-                getattr(args, "bypass_feature_pairs", None)
-            ),
-            bypass_feature_norm_mean=getattr(args, "bypass_feature_norm_mean", None),
-            bypass_feature_norm_std=getattr(args, "bypass_feature_norm_std", None),
-        ).to(device)
-        adapter = BatchAdapter(params_key="light_params", mask_key="light_mask")
-        init_fn = _init_5d
-        temporal_loss_fn = None
-    else:
-        raise ValueError(f"Unknown variant: {variant}")
-
-    loaders = (train_loader, val_loader, test_loader)
-    return model, adapter, loaders, {"init_fn": init_fn, "temporal_loss_fn": temporal_loss_fn}
+    return _VARIANT_REGISTRY.build(variant, args, device)
 
 
 _TRAINABLE_GROUPS = {"all", "routing", "basis", "coeff", "encoder", "film"}
@@ -304,638 +363,67 @@ def _set_trainable_groups(model, trainable_groups: List[str]) -> Dict[str, Any]:
 
 
 def _resolve_staged_specs(args: argparse.Namespace) -> List[Dict[str, Any]]:
-    cfg = getattr(args, "_config_obj", None)
-    if not isinstance(cfg, dict):
-        return []
-
-    training_cfg = cfg.get("training")
-    if not isinstance(training_cfg, dict):
-        return []
-
-    staged_cfg = training_cfg.get("staged")
-    if not isinstance(staged_cfg, dict) or not bool(staged_cfg.get("enabled", False)):
-        return []
-
-    raw_stages = staged_cfg.get("stages")
-    if not isinstance(raw_stages, list) or not raw_stages:
-        raise ValueError("training.staged.enabled=true but training.staged.stages is missing or empty")
-
-    specs: List[Dict[str, Any]] = []
-    for idx, raw in enumerate(raw_stages, start=1):
-        if not isinstance(raw, dict):
-            raise ValueError(f"training.staged.stages[{idx-1}] must be a mapping")
-
-        name = str(raw.get("name") or f"stage{idx}")
-        epochs = int(raw.get("epochs", 0))
-        if epochs <= 0:
-            raise ValueError(f"training.staged.stages[{idx-1}].epochs must be > 0")
-
-        trainable_groups = raw.get("trainable_groups", ["all"])
-        if isinstance(trainable_groups, str):
-            trainable_groups = [x.strip() for x in trainable_groups.split(",") if x.strip()]
-        if not isinstance(trainable_groups, list) or not trainable_groups:
-            raise ValueError(f"training.staged.stages[{idx-1}].trainable_groups must be a non-empty list")
-
-        raw_group_lrs = raw.get("group_lrs", {})
-        if raw_group_lrs is None:
-            raw_group_lrs = {}
-        if not isinstance(raw_group_lrs, dict):
-            raise ValueError(f"training.staged.stages[{idx-1}].group_lrs must be a mapping when provided")
-
-        group_lrs: Dict[str, float] = {}
-        for key, value in raw_group_lrs.items():
-            group_lrs[str(key)] = float(value)
-
-        spec = {
-            "name": name,
-            "epochs": epochs,
-            "lr": float(raw.get("lr", args.lr)),
-            "weight_decay": float(raw.get("weight_decay", args.weight_decay)),
-            "lr_scheduler": str(raw.get("lr_scheduler", args.lr_scheduler)),
-            "lr_min": float(raw.get("lr_min", args.lr_min)),
-            "warmup_epochs": int(raw.get("warmup_epochs", int(getattr(args, "warmup_epochs", 0)))),
-            "best_metric": str(raw.get("best_metric", "mae")),
-            "trainable_groups": [str(x) for x in trainable_groups],
-            "group_lrs": group_lrs,
-        }
-        specs.append(spec)
-
-    return specs
+    return _resolve_staged_specs_impl(args)
 
 
 def _resolve_ema_config(args: argparse.Namespace) -> Dict[str, Any]:
-    cfg = getattr(args, "_config_obj", None)
-    raw_eval_default = max(1, int(getattr(args, "ema_raw_eval_every_epochs", 1)))
-    if not isinstance(cfg, dict):
-        return {
-            "enabled": False,
-            "decay": 0.999,
-            "eval_on_ema": False,
-            "save_best_with_ema": False,
-            "raw_eval_every_epochs": raw_eval_default,
-        }
-
-    training_cfg = cfg.get("training")
-    if not isinstance(training_cfg, dict):
-        return {
-            "enabled": False,
-            "decay": 0.999,
-            "eval_on_ema": False,
-            "save_best_with_ema": False,
-            "raw_eval_every_epochs": raw_eval_default,
-        }
-
-    ema_cfg = training_cfg.get("ema")
-    if not isinstance(ema_cfg, dict):
-        return {
-            "enabled": False,
-            "decay": 0.999,
-            "eval_on_ema": False,
-            "save_best_with_ema": False,
-            "raw_eval_every_epochs": raw_eval_default,
-        }
-
-    enabled = bool(ema_cfg.get("enabled", False))
-    decay = float(ema_cfg.get("decay", 0.999))
-    eval_on_ema = bool(ema_cfg.get("eval_on_ema", True if enabled else False))
-    save_best_with_ema = bool(ema_cfg.get("save_best_with_ema", True if enabled else False))
-    raw_eval_every_epochs = int(ema_cfg.get("raw_eval_every_epochs", raw_eval_default))
-    return {
-        "enabled": enabled,
-        "decay": decay,
-        "eval_on_ema": eval_on_ema,
-        "save_best_with_ema": save_best_with_ema,
-        "raw_eval_every_epochs": max(1, raw_eval_every_epochs),
-    }
+    return _resolve_ema_config_impl(args)
 
 
 def _resolve_oracle_monitor_config(args: argparse.Namespace) -> Dict[str, Any]:
-    cfg = getattr(args, "_config_obj", None)
-    if not isinstance(cfg, dict):
-        return {"enabled": False}
-
-    training_cfg = cfg.get("training")
-    if not isinstance(training_cfg, dict):
-        return {"enabled": False}
-
-    oracle_cfg = training_cfg.get("oracle_monitor")
-    if not isinstance(oracle_cfg, dict):
-        return {"enabled": False}
-
-    enabled = bool(oracle_cfg.get("enabled", False))
-    if not enabled:
-        return {"enabled": False}
-
-    return {
-        "enabled": True,
-        "split": str(oracle_cfg.get("split", "test")),
-        "period_epochs": int(oracle_cfg.get("period_epochs", 0)),
-        "lightweight_max_samples": int(oracle_cfg.get("lightweight_max_samples", 4096)),
-        "lightweight_sample_seed": int(oracle_cfg.get("lightweight_sample_seed", args.seed)),
-        "stage_end_full": bool(oracle_cfg.get("stage_end_full", True)),
-        "full_max_samples": int(oracle_cfg.get("full_max_samples", 0)),
-        "batch_size": int(oracle_cfg.get("batch_size", args.batch_size)),
-        "num_workers": int(oracle_cfg.get("num_workers", 0)),
-        "top_k": int(oracle_cfg.get("top_k", args.top_k)),
-        "timeout_seconds": int(oracle_cfg.get("timeout_seconds", 180)),
-        "fail_on_timeout": bool(oracle_cfg.get("fail_on_timeout", False)),
-    }
+    return _resolve_oracle_monitor_config_impl(args)
 
 
 def _resolve_coeff_suite_config(args: argparse.Namespace) -> Dict[str, Any]:
-    cfg = getattr(args, "_config_obj", None)
-    if not isinstance(cfg, dict):
-        return {"enabled": False}
-
-    training_cfg = cfg.get("training")
-    if not isinstance(training_cfg, dict):
-        return {"enabled": False}
-
-    suite_cfg = training_cfg.get("coeff_suite")
-    if not isinstance(suite_cfg, dict):
-        return {"enabled": False}
-
-    enabled = bool(suite_cfg.get("enabled", False))
-    if not enabled:
-        return {"enabled": False}
-
-    checkpoints_raw = suite_cfg.get("checkpoints", None)
-    checkpoints: List[str] = []
-    if checkpoints_raw is not None:
-        if not isinstance(checkpoints_raw, list):
-            raise ValueError("training.coeff_suite.checkpoints must be a list when provided")
-        for item in checkpoints_raw:
-            name = str(item).strip()
-            if name:
-                checkpoints.append(name)
-
-    return {
-        "enabled": True,
-        "run_after_training": bool(suite_cfg.get("run_after_training", True)),
-        "split": str(suite_cfg.get("split", "test")),
-        "device": str(suite_cfg.get("device", "cpu")),
-        "max_samples": int(suite_cfg.get("max_samples", 8192)),
-        "sample_seed": int(suite_cfg.get("sample_seed", args.seed)),
-        "batch_size": int(suite_cfg.get("batch_size", args.batch_size)),
-        "num_workers": int(suite_cfg.get("num_workers", 0)),
-        "probe_train_ratio": float(suite_cfg.get("probe_train_ratio", 0.8)),
-        "ridge_alpha": float(suite_cfg.get("ridge_alpha", 1e-4)),
-        "mlp_hidden": int(suite_cfg.get("mlp_hidden", 128)),
-        "mlp_epochs": int(suite_cfg.get("mlp_epochs", 30)),
-        "mlp_lr": float(suite_cfg.get("mlp_lr", 1e-3)),
-        "mlp_batch_size": int(suite_cfg.get("mlp_batch_size", 256)),
-        "timeout_seconds": int(suite_cfg.get("timeout_seconds", 1800)),
-        "fail_on_timeout": bool(suite_cfg.get("fail_on_timeout", False)),
-        "checkpoints": checkpoints,
-    }
+    return _resolve_coeff_suite_config_impl(args)
 
 
 def _resolve_global_group_lrs(args: argparse.Namespace) -> Dict[str, float]:
-    cfg = getattr(args, "_config_obj", None)
-    if not isinstance(cfg, dict):
-        return {}
-
-    training_cfg = cfg.get("training")
-    if not isinstance(training_cfg, dict):
-        return {}
-
-    raw = training_cfg.get("group_lrs")
-    if raw is None:
-        return {}
-    if not isinstance(raw, dict):
-        raise ValueError("training.group_lrs must be a mapping")
-    return {str(k): float(v) for k, v in raw.items()}
+    return _resolve_global_group_lrs_impl(args)
 
 
 def _resolve_global_best_config(args: argparse.Namespace) -> Dict[str, Any]:
-    cfg = getattr(args, "_config_obj", None)
-    defaults = {
-        "enabled": True,
-        "track_falcor": True,
-        "track_soft_profile": True,
-        "soft_profile_name": "soft8_t018",
-        "soft_metric": "img_psnr",
-        "soft_metric_maximize": True,
-    }
-    if not isinstance(cfg, dict):
-        return defaults
-
-    training_cfg = cfg.get("training")
-    if not isinstance(training_cfg, dict):
-        return defaults
-
-    raw = training_cfg.get("global_best")
-    if raw is None:
-        return defaults
-    if not isinstance(raw, dict):
-        raise ValueError("training.global_best must be a mapping when provided")
-
-    out = dict(defaults)
-    out["enabled"] = bool(raw.get("enabled", out["enabled"]))
-    out["track_falcor"] = bool(raw.get("track_falcor", out["track_falcor"]))
-    out["track_soft_profile"] = bool(raw.get("track_soft_profile", out["track_soft_profile"]))
-    out["soft_profile_name"] = str(raw.get("soft_profile_name", out["soft_profile_name"])).strip() or str(
-        out["soft_profile_name"]
-    )
-    out["soft_metric"] = str(raw.get("soft_metric", out["soft_metric"])).strip() or str(out["soft_metric"])
-    out["soft_metric_maximize"] = bool(raw.get("soft_metric_maximize", out["soft_metric_maximize"]))
-    return out
+    return _resolve_global_best_config_impl(args)
 
 
 def _resolve_proxy_image_loss_config(args: argparse.Namespace) -> Dict[str, Any]:
-    cfg = getattr(args, "_config_obj", None)
-    lambda_default = float(getattr(args, "lambda_image", 0.0))
-    warmup_default = int(getattr(args, "image_loss_warmup_epochs", 0))
-    mix_mode_default = str(getattr(args, "proxy_image_mix_mode", "linear_log_mix")).strip().lower()
-    log_mix_weight_default = float(getattr(args, "proxy_image_log_mix_weight", 0.3))
+    return _resolve_proxy_image_loss_config_impl(args)
 
-    def _normalize_mix_mode(raw: Any) -> str:
-        mode = str(raw if raw is not None else mix_mode_default).strip().lower()
-        if mode not in {"linear_log_mix", "linear_only", "log_only"}:
-            raise ValueError(
-                "training.proxy_image_loss.mix_mode must be one of: "
-                "linear_log_mix, linear_only, log_only"
-            )
-        return mode
 
-    def _normalize_weight(raw: Any) -> float:
-        value = float(raw if raw is not None else log_mix_weight_default)
-        return float(np.clip(value, 0.0, 1.0))
-
-    if not isinstance(cfg, dict):
-        return {
-            "enabled": bool(lambda_default > 0.0),
-            "lambda": lambda_default,
-            "warmup_epochs": warmup_default,
-            "enable_val_image_metrics": bool(lambda_default > 0.0),
-            "mix_mode": _normalize_mix_mode(mix_mode_default),
-            "log_mix_weight": _normalize_weight(log_mix_weight_default),
-        }
-
-    training_cfg = cfg.get("training")
-    if not isinstance(training_cfg, dict):
-        return {
-            "enabled": bool(lambda_default > 0.0),
-            "lambda": lambda_default,
-            "warmup_epochs": warmup_default,
-            "enable_val_image_metrics": bool(lambda_default > 0.0),
-            "mix_mode": _normalize_mix_mode(mix_mode_default),
-            "log_mix_weight": _normalize_weight(log_mix_weight_default),
-        }
-
-    raw = training_cfg.get("proxy_image_loss")
-    if not isinstance(raw, dict):
-        return {
-            "enabled": bool(lambda_default > 0.0),
-            "lambda": lambda_default,
-            "warmup_epochs": warmup_default,
-            "enable_val_image_metrics": bool(lambda_default > 0.0),
-            "mix_mode": _normalize_mix_mode(mix_mode_default),
-            "log_mix_weight": _normalize_weight(log_mix_weight_default),
-        }
-
-    enabled = bool(raw.get("enabled", lambda_default > 0.0))
-    return {
-        "enabled": enabled,
-        "lambda": float(raw.get("lambda", lambda_default)),
-        "warmup_epochs": int(raw.get("warmup_epochs", warmup_default)),
-        "enable_val_image_metrics": bool(raw.get("enable_val_image_metrics", True if enabled else False)),
-        "mix_mode": _normalize_mix_mode(raw.get("mix_mode", raw.get("mode", mix_mode_default))),
-        "log_mix_weight": _normalize_weight(raw.get("log_mix_weight", raw.get("mix_weight", log_mix_weight_default))),
-    }
+def _resolve_gbuffer_image_loss_config(args: argparse.Namespace) -> Dict[str, Any]:
+    return _resolve_gbuffer_image_loss_config_impl(args)
 
 
 def _resolve_routing_balance_anneal_config(args: argparse.Namespace) -> Dict[str, Any]:
-    cfg = getattr(args, "_config_obj", None)
-    default_lambda = max(0.0, float(getattr(args, "lambda_routing_balance", 0.0)))
-    default_ratio = 0.6
-
-    if not isinstance(cfg, dict):
-        return {
-            "enabled": False,
-            "start": float(default_lambda),
-            "end": 0.0,
-            "decay_end_ratio": float(default_ratio),
-        }
-
-    training_cfg = cfg.get("training")
-    if not isinstance(training_cfg, dict):
-        return {
-            "enabled": False,
-            "start": float(default_lambda),
-            "end": 0.0,
-            "decay_end_ratio": float(default_ratio),
-        }
-
-    raw = training_cfg.get("routing_balance_anneal")
-    if not isinstance(raw, dict):
-        return {
-            "enabled": False,
-            "start": float(default_lambda),
-            "end": 0.0,
-            "decay_end_ratio": float(default_ratio),
-        }
-
-    ratio = float(raw.get("decay_end_ratio", default_ratio))
-    ratio = float(np.clip(ratio, 0.0, 1.0))
-    return {
-        "enabled": bool(raw.get("enabled", False)),
-        "start": float(max(0.0, float(raw.get("start", default_lambda)))),
-        "end": float(max(0.0, float(raw.get("end", 0.0)))),
-        "decay_end_ratio": ratio,
-    }
+    return _resolve_routing_balance_anneal_config_impl(args)
 
 
 def _resolve_performance_config(args: argparse.Namespace) -> Dict[str, Any]:
-    cfg = getattr(args, "_config_obj", None)
-
-    def _normalize_amp_mode(raw_mode: Any) -> str:
-        if isinstance(raw_mode, bool):
-            return "off" if raw_mode is False else "bf16"
-        mode = str(raw_mode).strip().lower()
-        if mode in {"off", "false", "0", "none", ""}:
-            return "off"
-        if mode in {"bf16", "bfloat16"}:
-            return "bf16"
-        if mode in {"fp16", "float16", "half"}:
-            return "fp16"
-        return "off"
-
-    defaults = {
-        "amp_mode": _normalize_amp_mode(getattr(args, "amp_mode", "off")),
-        "torch_compile_enabled": bool(getattr(args, "torch_compile", False)),
-        "torch_compile_mode": str(getattr(args, "torch_compile_mode", "reduce-overhead")),
-        "torch_compile_dynamic": bool(getattr(args, "torch_compile_dynamic", False)),
-        "grad_norm_log_every_steps": int(getattr(args, "grad_norm_log_every_steps", 1)),
-        "enable_soft_profile_sharing": bool(getattr(args, "enable_soft_profile_sharing", False)),
-        "soft_profile_equiv_check_batches": int(getattr(args, "soft_profile_equiv_check_batches", 2)),
-        "soft_profile_mae_tolerance": float(getattr(args, "soft_profile_mae_tolerance", 1e-6)),
-        "soft_profile_img_psnr_tolerance": float(getattr(args, "soft_profile_img_psnr_tolerance", 5e-4)),
-    }
-    if not isinstance(cfg, dict):
-        return defaults
-    training_cfg = cfg.get("training")
-    if not isinstance(training_cfg, dict):
-        return defaults
-    raw = training_cfg.get("performance", {})
-    if not isinstance(raw, dict):
-        return defaults
-
-    compile_raw = raw.get("torch_compile", {})
-    if compile_raw is None:
-        compile_raw = {}
-    if not isinstance(compile_raw, dict):
-        compile_raw = {}
-
-    soft_profile_raw = raw.get("soft_profile_sharing", {})
-    if soft_profile_raw is None:
-        soft_profile_raw = {}
-    if not isinstance(soft_profile_raw, dict):
-        soft_profile_raw = {}
-
-    out = dict(defaults)
-    out["amp_mode"] = _normalize_amp_mode(raw.get("amp_mode", out["amp_mode"]))
-    out["torch_compile_enabled"] = bool(compile_raw.get("enabled", out["torch_compile_enabled"]))
-    out["torch_compile_mode"] = str(compile_raw.get("mode", out["torch_compile_mode"]))
-    out["torch_compile_dynamic"] = bool(compile_raw.get("dynamic", out["torch_compile_dynamic"]))
-    out["grad_norm_log_every_steps"] = max(0, int(raw.get("grad_norm_log_every_steps", out["grad_norm_log_every_steps"])))
-    out["enable_soft_profile_sharing"] = bool(soft_profile_raw.get("enabled", out["enable_soft_profile_sharing"]))
-    out["soft_profile_equiv_check_batches"] = max(
-        1, int(soft_profile_raw.get("equiv_check_batches", out["soft_profile_equiv_check_batches"]))
-    )
-    out["soft_profile_mae_tolerance"] = float(
-        soft_profile_raw.get("mae_tolerance", out["soft_profile_mae_tolerance"])
-    )
-    out["soft_profile_img_psnr_tolerance"] = float(
-        soft_profile_raw.get("img_psnr_tolerance", out["soft_profile_img_psnr_tolerance"])
-    )
-    return out
+    return _resolve_performance_config_impl(args)
 
 
 def _resolve_falcor_periodic_eval_config(args: argparse.Namespace) -> Dict[str, Any]:
-    cfg = getattr(args, "_config_obj", None)
-    if not isinstance(cfg, dict):
-        return {"enabled": False}
-
-    training_cfg = cfg.get("training")
-    if not isinstance(training_cfg, dict):
-        return {"enabled": False}
-
-    raw = training_cfg.get("falcor_periodic_eval")
-    if not isinstance(raw, dict) or not bool(raw.get("enabled", False)):
-        return {"enabled": False}
-
-    scene = raw.get("scene", None)
-    if scene is None or not str(scene).strip():
-        raise ValueError("training.falcor_periodic_eval.scene is required when enabled=true")
-
-    profile_raw = raw.get("profile", {})
-    if not isinstance(profile_raw, dict):
-        raise ValueError("training.falcor_periodic_eval.profile must be a mapping")
-    profile = {
-        "name": str(profile_raw.get("name", "soft8_t018")).strip() or "soft8_t018",
-        "top_k": int(profile_raw.get("top_k", args.top_k)),
-        "training_soft_routing": bool(profile_raw.get("training_soft_routing", True)),
-        "routing_soft_topk": profile_raw.get("routing_soft_topk", 8),
-        "routing_temperature": profile_raw.get("routing_temperature", 0.18),
-    }
-    if profile["routing_soft_topk"] is not None:
-        profile["routing_soft_topk"] = int(profile["routing_soft_topk"])
-    if profile["routing_temperature"] is not None:
-        profile["routing_temperature"] = float(profile["routing_temperature"])
-
-    return {
-        "enabled": True,
-        "scene": str(scene),
-        "every_n_epochs": int(raw.get("every_n_epochs", 0)),
-        "stage_end_full": bool(raw.get("stage_end_full", True)),
-        "profile": profile,
-        "best_metric": str(raw.get("best_metric", "mean_real_render_hdr_psnr")),
-        "maximize": bool(raw.get("maximize", True)),
-        "timeout_seconds": int(raw.get("timeout_seconds", 1800)),
-        "fail_on_timeout": bool(raw.get("fail_on_timeout", False)),
-        "fail_on_error": bool(raw.get("fail_on_error", False)),
-        "max_frames": int(raw.get("max_frames", 24)),
-        "warmup_frames": int(raw.get("warmup_frames", 8)),
-        "benchmark_frames": int(raw.get("benchmark_frames", 24)),
-        "save_frame_metrics_every": int(raw.get("save_frame_metrics_every", 8)),
-        "width": int(raw.get("width", 1280)),
-        "height": int(raw.get("height", 720)),
-        "fps": float(raw.get("fps", 30.0)),
-        "route": str(raw.get("route", "both")),
-        "compute_image_metrics": bool(raw.get("compute_image_metrics", True)),
-        "split_runtime": bool(raw.get("split_runtime", True)),
-        "async_mode": bool(raw.get("async_mode", True)),
-        "falcor_python_path": str(raw.get("falcor_python_path", "")),
-        "falcor_python_bin": str(raw.get("falcor_python_bin", "")),
-        "worker_script": str(raw.get("worker_script", "")),
-        "device": str(raw.get("device", args.device or "cuda")),
-    }
+    return _resolve_falcor_periodic_eval_config_impl(args)
 
 
 def _resolve_val_profiles_config(args: argparse.Namespace) -> Dict[str, Any]:
-    cfg = getattr(args, "_config_obj", None)
-    if not isinstance(cfg, dict):
-        return {"enabled": False, "best_metric": "mae", "profiles": [], "run_test_compare": False}
-
-    training_cfg = cfg.get("training")
-    if not isinstance(training_cfg, dict):
-        return {"enabled": False, "best_metric": "mae", "profiles": [], "run_test_compare": False}
-
-    raw = training_cfg.get("val_profiles")
-    if not isinstance(raw, dict) or not bool(raw.get("enabled", False)):
-        return {"enabled": False, "best_metric": "mae", "profiles": [], "run_test_compare": False}
-
-    raw_profiles = raw.get("profiles", [])
-    if not isinstance(raw_profiles, list):
-        raise ValueError("training.val_profiles.profiles must be a list")
-
-    profiles: List[Dict[str, Any]] = []
-    for idx, item in enumerate(raw_profiles):
-        if not isinstance(item, dict):
-            raise ValueError(f"training.val_profiles.profiles[{idx}] must be a mapping")
-        name = str(item.get("name") or f"profile_{idx+1}").strip()
-        if not name:
-            raise ValueError(f"training.val_profiles.profiles[{idx}] has empty name")
-        profile_cfg = {
-            "name": name,
-            "top_k": int(item.get("top_k", args.top_k)),
-            "training_soft_routing": bool(item.get("training_soft_routing", False)),
-            "routing_soft_topk": item.get("routing_soft_topk", None),
-            "routing_temperature": item.get("routing_temperature", None),
-        }
-        if profile_cfg["routing_soft_topk"] is not None:
-            profile_cfg["routing_soft_topk"] = int(profile_cfg["routing_soft_topk"])
-        if profile_cfg["routing_temperature"] is not None:
-            profile_cfg["routing_temperature"] = float(profile_cfg["routing_temperature"])
-        profiles.append(profile_cfg)
-
-    best_metric = str(raw.get("best_metric", "mae"))
-    allowed_metrics = {"mae", "rmse", "charbonnier", "img_mae", "img_rmse", "img_psnr"}
-    if best_metric not in allowed_metrics:
-        raise ValueError(
-            "training.val_profiles.best_metric must be one of: "
-            + ", ".join(sorted(allowed_metrics))
-        )
-
-    raw_test_compare = training_cfg.get("test_compare_profiles", {})
-    if isinstance(raw_test_compare, dict):
-        run_test_compare = bool(raw_test_compare.get("enabled", False))
-    elif isinstance(raw_test_compare, bool):
-        run_test_compare = bool(raw_test_compare)
-    else:
-        run_test_compare = False
-
-    return {
-        "enabled": True,
-        "best_metric": best_metric,
-        "profiles": profiles,
-        "run_test_compare": run_test_compare,
-    }
-
-
-def _normalize_route_profiles(raw_profiles: Any, default_top_k: int) -> List[Dict[str, Any]]:
-    if not raw_profiles:
-        return []
-    if not isinstance(raw_profiles, list):
-        raise ValueError("route profiles must be a list")
-    profiles: List[Dict[str, Any]] = []
-    for idx, item in enumerate(raw_profiles):
-        if not isinstance(item, dict):
-            raise ValueError(f"route profiles[{idx}] must be a mapping")
-        name = str(item.get("name") or f"profile_{idx+1}").strip()
-        if not name:
-            raise ValueError(f"route profiles[{idx}] has empty name")
-        profile_cfg = {
-            "name": name,
-            "top_k": int(item.get("top_k", default_top_k)),
-            "training_soft_routing": bool(item.get("training_soft_routing", False)),
-            "routing_soft_topk": item.get("routing_soft_topk", None),
-            "routing_temperature": item.get("routing_temperature", None),
-        }
-        if profile_cfg["routing_soft_topk"] is not None:
-            profile_cfg["routing_soft_topk"] = int(profile_cfg["routing_soft_topk"])
-        if profile_cfg["routing_temperature"] is not None:
-            profile_cfg["routing_temperature"] = float(profile_cfg["routing_temperature"])
-        profiles.append(profile_cfg)
-    return profiles
+    return _resolve_val_profiles_config_impl(args)
 
 
 def _resolve_expert_utilization_audit_config(args: argparse.Namespace) -> Dict[str, Any]:
-    cfg = getattr(args, "_config_obj", None)
-    if not isinstance(cfg, dict):
-        return {"enabled": False}
-    training_cfg = cfg.get("training")
-    if not isinstance(training_cfg, dict):
-        return {"enabled": False}
-    raw = training_cfg.get("expert_utilization_audit")
-    if not isinstance(raw, dict) or not bool(raw.get("enabled", False)):
-        return {"enabled": False}
-    profiles = _normalize_route_profiles(raw.get("profiles", []), int(args.top_k))
-    checkpoint = raw.get("checkpoint", None)
-    checkpoint_str = str(checkpoint) if checkpoint is not None else None
-    return {
-        "enabled": True,
-        "run_after_training": bool(raw.get("run_after_training", True)),
-        "split": str(raw.get("split", "test")),
-        "device": str(raw.get("device", "cpu")),
-        "max_samples": int(raw.get("max_samples", 8192)),
-        "sample_seed": int(raw.get("sample_seed", args.seed)),
-        "batch_size": int(raw.get("batch_size", args.batch_size)),
-        "num_workers": int(raw.get("num_workers", 0)),
-        "checkpoint": checkpoint_str,
-        "profiles": profiles,
-        "timeout_seconds": int(raw.get("timeout_seconds", 900)),
-        "fail_on_timeout": bool(raw.get("fail_on_timeout", False)),
-    }
+    return _resolve_expert_utilization_audit_config_impl(args)
 
 
 def _resolve_semantic_drift_audit_config(args: argparse.Namespace) -> Dict[str, Any]:
-    cfg = getattr(args, "_config_obj", None)
-    if not isinstance(cfg, dict):
-        return {"enabled": False}
-    training_cfg = cfg.get("training")
-    if not isinstance(training_cfg, dict):
-        return {"enabled": False}
-    raw = training_cfg.get("semantic_drift_audit")
-    if not isinstance(raw, dict) or not bool(raw.get("enabled", False)):
-        return {"enabled": False}
-    profiles = _normalize_route_profiles(raw.get("profiles", []), int(args.top_k))
-    pairs_raw = raw.get("pairs", [])
-    if pairs_raw is None:
-        pairs_raw = []
-    if not isinstance(pairs_raw, list):
-        raise ValueError("training.semantic_drift_audit.pairs must be a list")
-    pairs: List[Dict[str, str]] = []
-    for idx, item in enumerate(pairs_raw):
-        if not isinstance(item, dict):
-            raise ValueError(f"semantic_drift_audit.pairs[{idx}] must be a mapping")
-        name = str(item.get("name") or f"pair_{idx+1}")
-        ckpt_a = item.get("checkpoint_a")
-        ckpt_b = item.get("checkpoint_b")
-        if ckpt_a is None or ckpt_b is None:
-            raise ValueError(f"semantic_drift_audit.pairs[{idx}] requires checkpoint_a/checkpoint_b")
-        pairs.append(
-            {
-                "name": name,
-                "checkpoint_a": str(ckpt_a),
-                "checkpoint_b": str(ckpt_b),
-            }
-        )
-    return {
-        "enabled": True,
-        "run_after_training": bool(raw.get("run_after_training", True)),
-        "split": str(raw.get("split", "test")),
-        "device": str(raw.get("device", "cpu")),
-        "max_samples": int(raw.get("max_samples", 8192)),
-        "sample_seed": int(raw.get("sample_seed", args.seed)),
-        "batch_size": int(raw.get("batch_size", args.batch_size)),
-        "num_workers": int(raw.get("num_workers", 0)),
-        "profiles": profiles,
-        "pairs": pairs,
-        "timeout_seconds": int(raw.get("timeout_seconds", 1200)),
-        "fail_on_timeout": bool(raw.get("fail_on_timeout", False)),
-    }
+    return _resolve_semantic_drift_audit_config_impl(args)
+
+
+def _resolve_runtime_config_bundle(args: argparse.Namespace) -> RuntimeConfigBundle:
+    return _resolve_runtime_config_bundle_impl(args)
+
+
+def _apply_runtime_overrides(args: argparse.Namespace, runtime_cfg: RuntimeConfigBundle) -> None:
+    _apply_runtime_overrides_impl(args, runtime_cfg)
 
 
 def _run_profile_test_compare(
@@ -1391,6 +879,30 @@ def _phase0_metrics_from_payload(payload: Dict[str, Any]) -> Dict[str, float]:
     val_m = payload.get("val_metrics", {}) if isinstance(payload, dict) else {}
     val_profiles_m = payload.get("val_profiles_metrics", {}) if isinstance(payload, dict) else {}
 
+    def _to_float_if_finite(value: Any) -> float | None:
+        try:
+            value_f = float(value)
+        except Exception:
+            return None
+        if not np.isfinite(value_f):
+            return None
+        return float(value_f)
+
+    def _safe_key(text: Any) -> str:
+        return str(text).strip().replace("/", "_").replace(" ", "_")
+
+    def _append_numeric_metrics(dst: Dict[str, float], src: Dict[str, Any], prefix: str) -> None:
+        if not isinstance(src, dict):
+            return
+        for key, value in src.items():
+            value_f = _to_float_if_finite(value)
+            if value_f is None:
+                continue
+            safe_key = _safe_key(key)
+            if not safe_key:
+                continue
+            dst[f"{prefix}{safe_key}"] = value_f
+
     grad_coeff = float(train_m.get("grad_post_clip/coeff", 0.0))
     grad_basis = float(train_m.get("grad_post_clip/basis", 0.0))
     grad_total = float(train_m.get("grad_post_clip/total", 0.0))
@@ -1411,6 +923,8 @@ def _phase0_metrics_from_payload(payload: Dict[str, Any]) -> Dict[str, float]:
         "grad_ratio_coeff_over_basis": float(coeff_over_basis),
         "grad_ratio_coeff_over_total": float(coeff_over_total),
     }
+    _append_numeric_metrics(metrics, train_m, "train_")
+    _append_numeric_metrics(metrics, val_m, "val_")
 
     if isinstance(val_profiles_m, dict):
         for profile_name, profile_metrics in val_profiles_m.items():
@@ -1755,20 +1269,66 @@ def run_training(args: argparse.Namespace) -> None:
             "lambda_temporal": float(args.lambda_temporal),
             "lambda_linearity": float(args.lambda_linearity),
             "linearity_aug_pairs": int(args.linearity_aug_pairs),
+            "linearity_every_steps": int(getattr(args, "linearity_every_steps", 4)),
             "lambda_spatial": float(args.lambda_spatial),
             "spatial_k": int(args.spatial_k),
             "lambda_image": float(args.lambda_image),
             "image_loss_warmup_epochs": int(getattr(args, "image_loss_warmup_epochs", 0)),
+            "gbuffer_image_loss_enabled": bool(getattr(args, "gbuffer_image_loss_enabled", False)),
+            "gbuffer_image_loss_lambda": float(getattr(args, "gbuffer_image_loss_lambda", 0.0)),
+            "gbuffer_image_loss_warmup_epochs": int(getattr(args, "gbuffer_image_loss_warmup_epochs", 0)),
+            "gbuffer_image_loss_every_steps": int(getattr(args, "gbuffer_image_loss_every_steps", 16)),
+            "gbuffer_image_loss_type": str(getattr(args, "gbuffer_image_loss_type", "charbonnier")),
+            "gbuffer_image_loss_dataset_root": str(getattr(args, "gbuffer_image_loss_dataset_root", "")),
+            "gbuffer_image_loss_pixel_sample_count": int(
+                getattr(args, "gbuffer_image_loss_pixel_sample_count", 8192)
+            ),
+            "gbuffer_image_loss_domain": str(getattr(args, "gbuffer_image_loss_domain", "linear")),
+            "gbuffer_image_loss_gt_color_space": str(getattr(args, "gbuffer_image_loss_gt_color_space", "linear")),
+            "gbuffer_image_loss_strict_keys": bool(getattr(args, "gbuffer_image_loss_strict_keys", True)),
+            "gbuffer_image_loss_pos_key": str(getattr(args, "gbuffer_image_loss_pos_key", "posW")),
+            "gbuffer_image_loss_normal_key": str(getattr(args, "gbuffer_image_loss_normal_key", "normW")),
+            "gbuffer_image_loss_albedo_key": str(getattr(args, "gbuffer_image_loss_albedo_key", "albedo")),
+            "gbuffer_image_loss_gt_linear_key": str(getattr(args, "gbuffer_image_loss_gt_linear_key", "gt_linear")),
+            "gbuffer_image_loss_light_params_key": str(
+                getattr(args, "gbuffer_image_loss_light_params_key", "light_params")
+            ),
+            "gbuffer_image_loss_light_mask_key": str(
+                getattr(args, "gbuffer_image_loss_light_mask_key", "light_mask")
+            ),
+            "gbuffer_image_loss_valid_mask_key": str(
+                getattr(args, "gbuffer_image_loss_valid_mask_key", "valid_mask")
+            ),
+            "gbuffer_image_loss_frame_idx_key": str(
+                getattr(args, "gbuffer_image_loss_frame_idx_key", "frame_idx")
+            ),
+            "gbuffer_image_loss_config_idx_key": str(
+                getattr(args, "gbuffer_image_loss_config_idx_key", "config_idx")
+            ),
+            "gbuffer_image_loss_target_source": str(
+                getattr(args, "gbuffer_image_loss_target_source", "dataset_sh")
+            ),
+            "gbuffer_image_loss_gt_knn": int(getattr(args, "gbuffer_image_loss_gt_knn", 8)),
+            "gbuffer_image_loss_gt_weight_eps": float(getattr(args, "gbuffer_image_loss_gt_weight_eps", 0.1)),
+            "gbuffer_image_loss_gt_chunk_size": int(getattr(args, "gbuffer_image_loss_gt_chunk_size", 32768)),
             "lambda_routing_balance": float(args.lambda_routing_balance),
             "routing_soft_train": bool(args.routing_soft_train),
             "routing_soft_topk": int(args.routing_soft_topk),
             "routing_temp_start": float(args.routing_temp_start),
             "routing_temp_end": float(args.routing_temp_end),
             "routing_temp_anneal_epochs": int(args.routing_temp_anneal_epochs),
+            "train_routing_param_mode": str(getattr(args, "train_routing_param_mode", "gather")),
+            "contraction_mode": str(getattr(args, "contraction_mode", "fused")),
             "image_loss_type": args.image_loss_type,
+            "image_loss_huber_delta": float(getattr(args, "image_loss_huber_delta", 0.1)),
+            "image_loss_domain": str(getattr(args, "image_loss_domain", "radiance")),
             "image_samples": int(args.image_samples),
             "image_sample_seed": int(args.image_sample_seed),
+            "image_sampling_mode": str(getattr(args, "image_sampling_mode", "fixed")),
             "image_loss_space": args.image_loss_space,
+            "image_soft_saturation_enabled": bool(getattr(args, "image_soft_saturation_enabled", False)),
+            "image_soft_saturation_mode": str(getattr(args, "image_soft_saturation_mode", "exp")),
+            "image_soft_saturation_k": float(getattr(args, "image_soft_saturation_k", 1.0)),
             "enable_weighted_sh_loss": bool(args.enable_weighted_sh_loss),
             "sh_loss_weights": list(args.sh_loss_weights) if args.sh_loss_weights is not None else None,
             "sh_weight_mode": args.sh_weight_mode,
@@ -1776,7 +1336,20 @@ def run_training(args: argparse.Namespace) -> None:
             "torch_compile": bool(getattr(args, "torch_compile", False)),
             "torch_compile_mode": str(getattr(args, "torch_compile_mode", "reduce-overhead")),
             "torch_compile_dynamic": bool(getattr(args, "torch_compile_dynamic", False)),
-            "grad_norm_log_every_steps": int(getattr(args, "grad_norm_log_every_steps", 1)),
+            "grad_norm_log_every_steps": int(getattr(args, "grad_norm_log_every_steps", 100)),
+            "cuda_graph_train": bool(getattr(args, "cuda_graph_train", False)),
+            "cuda_graph_mode": str(getattr(args, "cuda_graph_mode", "dual")),
+            "cuda_graph_warmup_steps": int(getattr(args, "cuda_graph_warmup_steps", 10)),
+            "cuda_graph_fallback_eager": bool(getattr(args, "cuda_graph_fallback_eager", True)),
+            "profile_train": bool(getattr(args, "profile_train", False)),
+            "profile_dir": getattr(args, "profile_dir", None),
+            "profile_wait": int(getattr(args, "profile_wait", 1)),
+            "profile_warmup": int(getattr(args, "profile_warmup", 1)),
+            "profile_active": int(getattr(args, "profile_active", 3)),
+            "profile_repeat": int(getattr(args, "profile_repeat", 1)),
+            "profile_record_shapes": bool(getattr(args, "profile_record_shapes", False)),
+            "profile_with_stack": bool(getattr(args, "profile_with_stack", False)),
+            "profile_memory": bool(getattr(args, "profile_memory", False)),
             "max_train_batches": int(getattr(args, "max_train_batches", 0)),
             "max_val_batches": int(getattr(args, "max_val_batches", 0)),
             "heartbeat_enabled": bool(heartbeat_enabled),
@@ -1789,79 +1362,115 @@ def run_training(args: argparse.Namespace) -> None:
         "sh_scaler": scaler_meta,
     }
 
-    ema_cfg = _resolve_ema_config(args)
-    oracle_monitor_cfg = _resolve_oracle_monitor_config(args)
-    coeff_suite_cfg = _resolve_coeff_suite_config(args)
-    global_best_cfg = _resolve_global_best_config(args)
-    val_profiles_cfg = _resolve_val_profiles_config(args)
-    proxy_image_loss_cfg = _resolve_proxy_image_loss_config(args)
-    routing_balance_anneal_cfg = _resolve_routing_balance_anneal_config(args)
-    performance_cfg = _resolve_performance_config(args)
-    falcor_periodic_eval_cfg = _resolve_falcor_periodic_eval_config(args)
-    expert_util_cfg = _resolve_expert_utilization_audit_config(args)
-    semantic_drift_cfg = _resolve_semantic_drift_audit_config(args)
-    global_group_lrs = _resolve_global_group_lrs(args)
-    staged_specs = _resolve_staged_specs(args)
-    total_training_epochs_global = (
-        int(sum(int(spec["epochs"]) for spec in staged_specs))
-        if staged_specs
-        else int(args.epochs)
-    )
-    routing_balance_decay_end_epoch = int(
-        np.ceil(float(total_training_epochs_global) * float(routing_balance_anneal_cfg.get("decay_end_ratio", 0.6)))
-    )
-    if routing_balance_decay_end_epoch <= 0:
-        routing_balance_anneal_epochs_global = 0
-    else:
-        routing_balance_anneal_epochs_global = max(0, int(routing_balance_decay_end_epoch - 1))
+    runtime_cfg = _resolve_runtime_config_bundle(args)
+    ema_cfg = runtime_cfg.ema_cfg
+    oracle_monitor_cfg = runtime_cfg.oracle_monitor_cfg
+    coeff_suite_cfg = runtime_cfg.coeff_suite_cfg
+    global_best_cfg = runtime_cfg.global_best_cfg
+    val_profiles_cfg = runtime_cfg.val_profiles_cfg
+    proxy_image_loss_cfg = runtime_cfg.proxy_image_loss_cfg
+    gbuffer_image_loss_cfg = runtime_cfg.gbuffer_image_loss_cfg
+    proxy_gbuffer_handover_cfg = runtime_cfg.proxy_gbuffer_handover_cfg
+    loss_effective_contribution_cfg = runtime_cfg.loss_effective_contribution_cfg
+    optimization_monitoring_cfg = runtime_cfg.optimization_monitoring_cfg
+    routing_balance_anneal_cfg = runtime_cfg.routing_balance_anneal_cfg
+    performance_cfg = runtime_cfg.performance_cfg
+    falcor_periodic_eval_cfg = runtime_cfg.falcor_periodic_eval_cfg
+    expert_util_cfg = runtime_cfg.expert_util_cfg
+    semantic_drift_cfg = runtime_cfg.semantic_drift_cfg
+    global_group_lrs = runtime_cfg.global_group_lrs
+    staged_specs = runtime_cfg.staged_specs
+    total_training_epochs_global = runtime_cfg.total_training_epochs_global
+    routing_balance_decay_end_epoch = runtime_cfg.routing_balance_decay_end_epoch
+    routing_balance_anneal_epochs_global = runtime_cfg.routing_balance_anneal_epochs_global
 
-    if bool(proxy_image_loss_cfg.get("enabled", False)):
-        args.lambda_image = float(proxy_image_loss_cfg.get("lambda", args.lambda_image))
-        args.image_loss_warmup_epochs = int(proxy_image_loss_cfg.get("warmup_epochs", getattr(args, "image_loss_warmup_epochs", 0)))
-        if bool(proxy_image_loss_cfg.get("enable_val_image_metrics", True)):
-            args.val_image_metrics = True
-    args.proxy_image_mix_mode = str(proxy_image_loss_cfg.get("mix_mode", "linear_log_mix"))
-    args.proxy_image_log_mix_weight = float(proxy_image_loss_cfg.get("log_mix_weight", 0.3))
-
-    args.amp_mode = str(performance_cfg.get("amp_mode", getattr(args, "amp_mode", "off")))
-    args.torch_compile = bool(performance_cfg.get("torch_compile_enabled", getattr(args, "torch_compile", False)))
-    args.torch_compile_mode = str(performance_cfg.get("torch_compile_mode", getattr(args, "torch_compile_mode", "reduce-overhead")))
-    args.torch_compile_dynamic = bool(
-        performance_cfg.get("torch_compile_dynamic", getattr(args, "torch_compile_dynamic", False))
-    )
-    args.grad_norm_log_every_steps = int(
-        performance_cfg.get("grad_norm_log_every_steps", getattr(args, "grad_norm_log_every_steps", 1))
-    )
-    args.enable_soft_profile_sharing = bool(
-        performance_cfg.get("enable_soft_profile_sharing", getattr(args, "enable_soft_profile_sharing", False))
-    )
-    args.soft_profile_equiv_check_batches = int(
-        performance_cfg.get(
-            "soft_profile_equiv_check_batches",
-            getattr(args, "soft_profile_equiv_check_batches", 2),
-        )
-    )
-    args.soft_profile_mae_tolerance = float(
-        performance_cfg.get("soft_profile_mae_tolerance", getattr(args, "soft_profile_mae_tolerance", 1e-6))
-    )
-    args.soft_profile_img_psnr_tolerance = float(
-        performance_cfg.get(
-            "soft_profile_img_psnr_tolerance",
-            getattr(args, "soft_profile_img_psnr_tolerance", 5e-4),
-        )
-    )
+    _apply_runtime_overrides(args, runtime_cfg)
 
     checkpoint_meta["training"].update(
         {
             "lambda_image": float(args.lambda_image),
             "image_loss_warmup_epochs": int(getattr(args, "image_loss_warmup_epochs", 0)),
+            "gbuffer_image_loss_enabled": bool(getattr(args, "gbuffer_image_loss_enabled", False)),
+            "gbuffer_image_loss_lambda": float(getattr(args, "gbuffer_image_loss_lambda", 0.0)),
+            "gbuffer_image_loss_warmup_epochs": int(getattr(args, "gbuffer_image_loss_warmup_epochs", 0)),
+            "gbuffer_image_loss_every_steps": int(getattr(args, "gbuffer_image_loss_every_steps", 16)),
+            "gbuffer_image_loss_type": str(getattr(args, "gbuffer_image_loss_type", "charbonnier")),
+            "gbuffer_image_loss_dataset_root": str(getattr(args, "gbuffer_image_loss_dataset_root", "")),
+            "gbuffer_image_loss_pixel_sample_count": int(
+                getattr(args, "gbuffer_image_loss_pixel_sample_count", 8192)
+            ),
+            "gbuffer_image_loss_domain": str(getattr(args, "gbuffer_image_loss_domain", "linear")),
+            "gbuffer_image_loss_gt_color_space": str(getattr(args, "gbuffer_image_loss_gt_color_space", "linear")),
+            "gbuffer_image_loss_strict_keys": bool(getattr(args, "gbuffer_image_loss_strict_keys", True)),
+            "gbuffer_image_loss_pos_key": str(getattr(args, "gbuffer_image_loss_pos_key", "posW")),
+            "gbuffer_image_loss_normal_key": str(getattr(args, "gbuffer_image_loss_normal_key", "normW")),
+            "gbuffer_image_loss_albedo_key": str(getattr(args, "gbuffer_image_loss_albedo_key", "albedo")),
+            "gbuffer_image_loss_gt_linear_key": str(getattr(args, "gbuffer_image_loss_gt_linear_key", "gt_linear")),
+            "gbuffer_image_loss_light_params_key": str(
+                getattr(args, "gbuffer_image_loss_light_params_key", "light_params")
+            ),
+            "gbuffer_image_loss_light_mask_key": str(
+                getattr(args, "gbuffer_image_loss_light_mask_key", "light_mask")
+            ),
+            "gbuffer_image_loss_valid_mask_key": str(
+                getattr(args, "gbuffer_image_loss_valid_mask_key", "valid_mask")
+            ),
+            "gbuffer_image_loss_frame_idx_key": str(
+                getattr(args, "gbuffer_image_loss_frame_idx_key", "frame_idx")
+            ),
+            "gbuffer_image_loss_config_idx_key": str(
+                getattr(args, "gbuffer_image_loss_config_idx_key", "config_idx")
+            ),
+            "gbuffer_image_loss_target_source": str(
+                getattr(args, "gbuffer_image_loss_target_source", "dataset_sh")
+            ),
+            "gbuffer_image_loss_gt_knn": int(getattr(args, "gbuffer_image_loss_gt_knn", 8)),
+            "gbuffer_image_loss_gt_weight_eps": float(getattr(args, "gbuffer_image_loss_gt_weight_eps", 0.1)),
+            "gbuffer_image_loss_gt_chunk_size": int(getattr(args, "gbuffer_image_loss_gt_chunk_size", 32768)),
             "proxy_image_mix_mode": str(args.proxy_image_mix_mode),
             "proxy_image_log_mix_weight": float(args.proxy_image_log_mix_weight),
+            "proxy_gbuffer_handover_enabled": bool(
+                getattr(args, "proxy_gbuffer_handover_enabled", False)
+            ),
+            "proxy_gbuffer_handover_start_epoch": int(
+                getattr(args, "proxy_gbuffer_handover_start_epoch", 160)
+            ),
+            "proxy_gbuffer_handover_end_epoch": int(
+                getattr(args, "proxy_gbuffer_handover_end_epoch", 220)
+            ),
+            "proxy_gbuffer_handover_proxy_start_scale": float(
+                getattr(args, "proxy_gbuffer_handover_proxy_start_scale", 1.0)
+            ),
+            "proxy_gbuffer_handover_proxy_end_scale": float(
+                getattr(args, "proxy_gbuffer_handover_proxy_end_scale", 0.0)
+            ),
+            "proxy_gbuffer_handover_gbuffer_start_scale": float(
+                getattr(args, "proxy_gbuffer_handover_gbuffer_start_scale", 0.0)
+            ),
+            "proxy_gbuffer_handover_gbuffer_end_scale": float(
+                getattr(args, "proxy_gbuffer_handover_gbuffer_end_scale", 1.0)
+            ),
             "amp_mode": str(args.amp_mode),
             "torch_compile": bool(args.torch_compile),
             "torch_compile_mode": str(args.torch_compile_mode),
             "torch_compile_dynamic": bool(args.torch_compile_dynamic),
+            "linearity_every_steps": int(getattr(args, "linearity_every_steps", 4)),
             "grad_norm_log_every_steps": int(args.grad_norm_log_every_steps),
+            "train_routing_param_mode": str(getattr(args, "train_routing_param_mode", "gather")),
+            "contraction_mode": str(getattr(args, "contraction_mode", "fused")),
+            "cuda_graph_train": bool(getattr(args, "cuda_graph_train", False)),
+            "cuda_graph_mode": str(getattr(args, "cuda_graph_mode", "dual")),
+            "cuda_graph_warmup_steps": int(getattr(args, "cuda_graph_warmup_steps", 10)),
+            "cuda_graph_fallback_eager": bool(getattr(args, "cuda_graph_fallback_eager", True)),
+            "profile_train": bool(getattr(args, "profile_train", False)),
+            "profile_dir": getattr(args, "profile_dir", None),
+            "profile_wait": int(getattr(args, "profile_wait", 1)),
+            "profile_warmup": int(getattr(args, "profile_warmup", 1)),
+            "profile_active": int(getattr(args, "profile_active", 3)),
+            "profile_repeat": int(getattr(args, "profile_repeat", 1)),
+            "profile_record_shapes": bool(getattr(args, "profile_record_shapes", False)),
+            "profile_with_stack": bool(getattr(args, "profile_with_stack", False)),
+            "profile_memory": bool(getattr(args, "profile_memory", False)),
             "enable_soft_profile_sharing": bool(args.enable_soft_profile_sharing),
             "soft_profile_equiv_check_batches": int(args.soft_profile_equiv_check_batches),
             "soft_profile_mae_tolerance": float(args.soft_profile_mae_tolerance),
@@ -1880,6 +1489,10 @@ def run_training(args: argparse.Namespace) -> None:
     checkpoint_meta["training"]["coeff_suite"] = coeff_suite_cfg
     checkpoint_meta["training"]["val_profiles"] = val_profiles_cfg
     checkpoint_meta["training"]["proxy_image_loss"] = proxy_image_loss_cfg
+    checkpoint_meta["training"]["gbuffer_image_loss"] = gbuffer_image_loss_cfg
+    checkpoint_meta["training"]["proxy_gbuffer_handover"] = proxy_gbuffer_handover_cfg
+    checkpoint_meta["training"]["loss_effective_contribution"] = loss_effective_contribution_cfg
+    checkpoint_meta["training"]["optimization_monitoring"] = optimization_monitoring_cfg
     checkpoint_meta["training"]["routing_balance_anneal"] = {
         **routing_balance_anneal_cfg,
         "total_training_epochs": int(total_training_epochs_global),
@@ -1953,7 +1566,61 @@ def run_training(args: argparse.Namespace) -> None:
             f"warmup_epochs={int(proxy_image_loss_cfg.get('warmup_epochs', 0))} "
             f"mix_mode={str(args.proxy_image_mix_mode)} "
             f"log_mix_weight={float(args.proxy_image_log_mix_weight):.3f} "
+            f"loss_type={str(getattr(args, 'image_loss_type', 'mse'))} "
+            f"huber_delta={float(getattr(args, 'image_loss_huber_delta', 0.1)):.4g} "
+            f"domain={str(getattr(args, 'image_loss_domain', 'radiance'))} "
+            f"sampling_mode={str(getattr(args, 'image_sampling_mode', 'fixed'))} "
+            f"soft_sat={bool(getattr(args, 'image_soft_saturation_enabled', False))} "
+            f"soft_sat_mode={str(getattr(args, 'image_soft_saturation_mode', 'exp'))} "
+            f"soft_sat_k={float(getattr(args, 'image_soft_saturation_k', 1.0)):.4g} "
             f"val_image_metrics={bool(args.val_image_metrics)}"
+        )
+    if args.show_progress:
+        print(
+            "[gbuffer-image-loss] "
+            f"enabled={bool(gbuffer_image_loss_cfg.get('enabled', False))} "
+            f"lambda={float(getattr(args, 'gbuffer_image_loss_lambda', 0.0)):.4g} "
+            f"warmup_epochs={int(getattr(args, 'gbuffer_image_loss_warmup_epochs', 0))} "
+            f"every_steps={int(getattr(args, 'gbuffer_image_loss_every_steps', 16))} "
+            f"loss_type={str(getattr(args, 'gbuffer_image_loss_type', 'charbonnier'))} "
+            f"pixel_sample_count={int(getattr(args, 'gbuffer_image_loss_pixel_sample_count', 8192))} "
+            f"domain={str(getattr(args, 'gbuffer_image_loss_domain', 'linear'))} "
+            f"gt_color_space={str(getattr(args, 'gbuffer_image_loss_gt_color_space', 'linear'))} "
+            f"target_source={str(getattr(args, 'gbuffer_image_loss_target_source', 'dataset_sh'))} "
+            f"gt_knn={int(getattr(args, 'gbuffer_image_loss_gt_knn', 8))} "
+            f"strict_keys={bool(getattr(args, 'gbuffer_image_loss_strict_keys', True))} "
+            f"dataset_root={str(getattr(args, 'gbuffer_image_loss_dataset_root', '')) or '<none>'}"
+        )
+    if args.show_progress:
+        print(
+            "[proxy-gbuffer-handover] "
+            f"enabled={bool(proxy_gbuffer_handover_cfg.get('enabled', False))} "
+            f"epoch={int(proxy_gbuffer_handover_cfg.get('start_epoch', 160))}"
+            f"->{int(proxy_gbuffer_handover_cfg.get('end_epoch', 220))} "
+            f"proxy_scale={float(proxy_gbuffer_handover_cfg.get('proxy_start_scale', 1.0)):.3g}"
+            f"->{float(proxy_gbuffer_handover_cfg.get('proxy_end_scale', 0.0)):.3g} "
+            f"gbuffer_scale={float(proxy_gbuffer_handover_cfg.get('gbuffer_start_scale', 0.0)):.3g}"
+            f"->{float(proxy_gbuffer_handover_cfg.get('gbuffer_end_scale', 1.0)):.3g}"
+        )
+    if args.show_progress:
+        print(
+            "[loss-effective-contribution] "
+            f"enabled={bool(loss_effective_contribution_cfg.get('enabled', False))} "
+            f"ema_decay={float(loss_effective_contribution_cfg.get('ema_decay', 0.98)):.4g} "
+            f"warmup_steps={int(loss_effective_contribution_cfg.get('warmup_steps', 0))} "
+            f"freq_aware={bool(loss_effective_contribution_cfg.get('frequency_aware', True))} "
+            f"ratio_default={float(loss_effective_contribution_cfg.get('target_ratio_default', 0.25)):.4g}"
+        )
+    if args.show_progress:
+        print(
+            "[optimization-monitoring] "
+            f"enabled={bool(optimization_monitoring_cfg.get('enabled', True))} "
+            f"grad_diag_every={int(optimization_monitoring_cfg.get('grad_diagnostics_every_steps', 50))} "
+            f"update_every={int(optimization_monitoring_cfg.get('update_ratio_every_steps', 20))} "
+            f"spectrum_every={int(optimization_monitoring_cfg.get('spectrum_every_epochs', 1))} "
+            f"pulse_tol={float(optimization_monitoring_cfg.get('pulse_recovery_tolerance', 0.02)):.4g} "
+            f"pulse_max={int(optimization_monitoring_cfg.get('pulse_recovery_max_steps', 64))} "
+            f"gns={bool(optimization_monitoring_cfg.get('gns_enabled', True))}"
         )
     if args.show_progress and bool(falcor_periodic_eval_cfg.get("enabled", False)):
         profile = falcor_periodic_eval_cfg.get("profile", {})
@@ -2002,13 +1669,130 @@ def run_training(args: argparse.Namespace) -> None:
             print(
                 "[performance] "
                 f"amp_mode={args.amp_mode} "
-                f"torch_compile={compile_ok} mode={args.torch_compile_mode} dynamic={bool(args.torch_compile_dynamic)}"
+                f"torch_compile={compile_ok} mode={args.torch_compile_mode} dynamic={bool(args.torch_compile_dynamic)} "
+                f"grad_norm_every={args.grad_norm_log_every_steps} "
+                f"linearity_every={int(getattr(args, 'linearity_every_steps', 4))} "
+                f"train_routing_param_mode={str(getattr(args, 'train_routing_param_mode', 'gather'))} "
+                f"contraction_mode={str(getattr(args, 'contraction_mode', 'fused'))} "
+                f"cuda_graph={bool(getattr(args, 'cuda_graph_train', False))} "
+                f"cuda_graph_mode={str(getattr(args, 'cuda_graph_mode', 'dual'))} "
+                f"cuda_graph_warmup_steps={int(getattr(args, 'cuda_graph_warmup_steps', 10))}"
             )
     elif args.show_progress:
         print(
             "[performance] "
-            f"amp_mode={args.amp_mode} torch_compile=False grad_norm_every={args.grad_norm_log_every_steps}"
+            f"amp_mode={args.amp_mode} torch_compile=False grad_norm_every={args.grad_norm_log_every_steps} "
+            f"linearity_every={int(getattr(args, 'linearity_every_steps', 4))} "
+            f"train_routing_param_mode={str(getattr(args, 'train_routing_param_mode', 'gather'))} "
+            f"contraction_mode={str(getattr(args, 'contraction_mode', 'fused'))} "
+            f"cuda_graph={bool(getattr(args, 'cuda_graph_train', False))} "
+            f"cuda_graph_mode={str(getattr(args, 'cuda_graph_mode', 'dual'))} "
+            f"cuda_graph_warmup_steps={int(getattr(args, 'cuda_graph_warmup_steps', 10))}"
         )
+    if args.show_progress and bool(getattr(args, "profile_train", False)):
+        print(
+            "[profile] "
+            f"enabled=True wait={int(getattr(args, 'profile_wait', 1))} "
+            f"warmup={int(getattr(args, 'profile_warmup', 1))} "
+            f"active={int(getattr(args, 'profile_active', 3))} "
+            f"repeat={int(getattr(args, 'profile_repeat', 1))} "
+            f"record_shapes={bool(getattr(args, 'profile_record_shapes', False))} "
+            f"with_stack={bool(getattr(args, 'profile_with_stack', False))} "
+            f"profile_memory={bool(getattr(args, 'profile_memory', False))} "
+            f"dir={getattr(args, 'profile_dir', None) or '<output_dir>/profiling'}"
+        )
+
+    gbuffer_loader = None
+    gbuffer_probe_min = None
+    gbuffer_probe_max = None
+    gbuffer_gt_sh_tensor = None
+    gbuffer_gt_probe_positions = None
+    gbuffer_gt_light_configs = None
+    gbuffer_gt_light_mask = None
+    gbuffer_gt_frame_indices = None
+    if bool(gbuffer_image_loss_cfg.get("enabled", False)):
+        dataset_obj = getattr(train_loader, "dataset", None)
+        probe_min = getattr(dataset_obj, "probe_min", None)
+        probe_max = getattr(dataset_obj, "probe_max", None)
+        if probe_min is None or probe_max is None:
+            raise ValueError(
+                "GBuffer image loss requires train dataset probe_min/probe_max for world-position normalization."
+            )
+        gbuffer_probe_min = np.asarray(probe_min, dtype=np.float32)
+        gbuffer_probe_max = np.asarray(probe_max, dtype=np.float32)
+        gbuffer_dataset_root = str(gbuffer_image_loss_cfg.get("dataset_root", "")).strip()
+        gbuffer_target_source = str(gbuffer_image_loss_cfg.get("target_source", "dataset_sh")).strip().lower()
+        if not gbuffer_dataset_root:
+            raise ValueError("GBuffer image loss enabled but dataset_root is empty")
+        require_gt_linear = bool(gbuffer_target_source == "gbuffer_linear")
+        require_light_params = bool(gbuffer_target_source == "gbuffer_linear")
+        gbuffer_loader = create_gbuffer_supervision_dataloader(
+            data_root=gbuffer_dataset_root,
+            pixel_sample_count=int(gbuffer_image_loss_cfg.get("pixel_sample_count", 8192)),
+            strict_keys=bool(gbuffer_image_loss_cfg.get("strict_keys", True)),
+            pos_key=str(gbuffer_image_loss_cfg.get("pos_key", "posW")),
+            normal_key=str(gbuffer_image_loss_cfg.get("normal_key", "normW")),
+            albedo_key=str(gbuffer_image_loss_cfg.get("albedo_key", "albedo")),
+            gt_linear_key=str(gbuffer_image_loss_cfg.get("gt_linear_key", "gt_linear")),
+            light_params_key=str(gbuffer_image_loss_cfg.get("light_params_key", "light_params")),
+            light_mask_key=str(gbuffer_image_loss_cfg.get("light_mask_key", "light_mask")),
+            valid_mask_key=str(gbuffer_image_loss_cfg.get("valid_mask_key", "valid_mask")),
+            frame_idx_key=str(gbuffer_image_loss_cfg.get("frame_idx_key", "frame_idx")),
+            config_idx_key=str(gbuffer_image_loss_cfg.get("config_idx_key", "config_idx")),
+            require_gt_linear=require_gt_linear,
+            require_light_params=require_light_params,
+            gt_color_space=str(gbuffer_image_loss_cfg.get("gt_color_space", "linear")),
+            batch_size=1,
+            shuffle=True,
+            num_workers=0,
+            pin_memory=bool(device.type == "cuda"),
+            persistent_workers=False,
+        )
+        if gbuffer_target_source == "dataset_sh":
+            parametric_path = Path(args.data_root) / "parametric_tensor.npz"
+            if not parametric_path.exists():
+                raise FileNotFoundError(
+                    f"GBuffer image loss target_source=dataset_sh requires parametric tensor: {parametric_path}"
+                )
+            with np.load(parametric_path, allow_pickle=True) as npz_obj:
+                gbuffer_gt_sh_tensor = np.asarray(npz_obj["tensor"], dtype=np.float32)
+                gbuffer_gt_probe_positions = np.asarray(npz_obj["probe_positions"], dtype=np.float32)
+                gbuffer_gt_light_configs = np.asarray(npz_obj["light_configs"], dtype=np.float32)
+                if "light_mask" in npz_obj.files:
+                    gbuffer_gt_light_mask = np.asarray(npz_obj["light_mask"], dtype=np.float32)
+                else:
+                    gbuffer_gt_light_mask = np.ones(gbuffer_gt_light_configs.shape[:2], dtype=np.float32)
+                if "valid_mask" in npz_obj.files:
+                    valid_probe = np.asarray(npz_obj["valid_mask"], dtype=np.float32).reshape(-1) > 0.5
+                    if valid_probe.shape[0] == gbuffer_gt_probe_positions.shape[0]:
+                        gbuffer_gt_probe_positions = gbuffer_gt_probe_positions[valid_probe]
+                        gbuffer_gt_sh_tensor = gbuffer_gt_sh_tensor[valid_probe]
+                frame_indices_arr = None
+                if "frame_indices" in npz_obj.files:
+                    frame_indices_arr = np.asarray(npz_obj["frame_indices"], dtype=np.int64).reshape(-1)
+                elif "metadata" in npz_obj.files:
+                    try:
+                        md_raw = npz_obj["metadata"]
+                        md_obj = md_raw.item() if isinstance(md_raw, np.ndarray) and md_raw.dtype == object else md_raw
+                        if isinstance(md_obj, dict) and "frame_indices" in md_obj:
+                            frame_indices_arr = np.asarray(md_obj["frame_indices"], dtype=np.int64).reshape(-1)
+                    except Exception:
+                        frame_indices_arr = None
+                if frame_indices_arr is None:
+                    frame_indices_arr = np.arange(int(gbuffer_gt_sh_tensor.shape[1]), dtype=np.int64)
+                gbuffer_gt_frame_indices = frame_indices_arr
+        if args.show_progress:
+            print(
+                "[gbuffer-image-loss] loader_ready "
+                f"samples={len(gbuffer_loader.dataset)} root={gbuffer_dataset_root} "
+                f"target_source={gbuffer_target_source}"
+            )
+            if gbuffer_target_source == "dataset_sh":
+                print(
+                    "[gbuffer-image-loss] dataset_sh_target "
+                    f"probes={int(gbuffer_gt_probe_positions.shape[0]) if gbuffer_gt_probe_positions is not None else 0} "
+                    f"configs={int(gbuffer_gt_sh_tensor.shape[1]) if gbuffer_gt_sh_tensor is not None else 0}"
+                )
 
     def _build_trainer(
         *,
@@ -2030,6 +1814,7 @@ def run_training(args: argparse.Namespace) -> None:
             lr_min=lr_min,
             warmup_epochs=warmup_epochs_local,
             recon_loss=args.recon_loss,
+            recon_weight=float(getattr(args, "recon_weight", 1.0)),
             charbonnier_eps=args.charbonnier_eps,
             temporal_weight=args.lambda_temporal,
             temporal_loss_fn=helpers.get("temporal_loss_fn"),
@@ -2037,6 +1822,7 @@ def run_training(args: argparse.Namespace) -> None:
             grad_clip=args.grad_clip,
             linearity_weight=args.lambda_linearity,
             linearity_aug_pairs=args.linearity_aug_pairs,
+            linearity_every_steps=int(getattr(args, "linearity_every_steps", 4)),
             spatial_weight=args.lambda_spatial,
             spatial_k=args.spatial_k,
             image_loss_weight=args.lambda_image,
@@ -2054,10 +1840,17 @@ def run_training(args: argparse.Namespace) -> None:
             routing_temp_start=args.routing_temp_start,
             routing_temp_end=args.routing_temp_end,
             routing_temp_anneal_epochs=args.routing_temp_anneal_epochs,
+            train_routing_param_mode=str(getattr(args, "train_routing_param_mode", "gather")),
             image_loss_type=args.image_loss_type,
+            image_loss_huber_delta=float(getattr(args, "image_loss_huber_delta", 0.1)),
+            image_loss_domain=str(getattr(args, "image_loss_domain", "radiance")),
             image_samples=args.image_samples,
             image_sample_seed=args.image_sample_seed,
+            image_sampling_mode=str(getattr(args, "image_sampling_mode", "fixed")),
             image_loss_space=args.image_loss_space,
+            image_soft_saturation_enabled=bool(getattr(args, "image_soft_saturation_enabled", False)),
+            image_soft_saturation_mode=str(getattr(args, "image_soft_saturation_mode", "exp")),
+            image_soft_saturation_k=float(getattr(args, "image_soft_saturation_k", 1.0)),
             enable_weighted_sh_loss=args.enable_weighted_sh_loss,
             sh_loss_weights=args.sh_loss_weights,
             sh_weight_mode=args.sh_weight_mode,
@@ -2069,14 +1862,43 @@ def run_training(args: argparse.Namespace) -> None:
             ema_eval=bool(ema_cfg["eval_on_ema"]),
             ema_save_best=bool(ema_cfg["save_best_with_ema"]),
             amp_mode=str(args.amp_mode),
-            grad_norm_log_every_steps=int(getattr(args, "grad_norm_log_every_steps", 1)),
+            grad_norm_log_every_steps=int(getattr(args, "grad_norm_log_every_steps", 100)),
+            cuda_graph_train=bool(getattr(args, "cuda_graph_train", False)),
+            cuda_graph_mode=str(getattr(args, "cuda_graph_mode", "dual")),
+            cuda_graph_warmup_steps=int(getattr(args, "cuda_graph_warmup_steps", 10)),
+            cuda_graph_fallback_eager=bool(getattr(args, "cuda_graph_fallback_eager", True)),
             raw_eval_every_epochs=int(ema_cfg.get("raw_eval_every_epochs", 1)),
+            profile_train=bool(getattr(args, "profile_train", False)),
+            profile_dir=getattr(args, "profile_dir", None),
+            profile_wait=int(getattr(args, "profile_wait", 1)),
+            profile_warmup=int(getattr(args, "profile_warmup", 1)),
+            profile_active=int(getattr(args, "profile_active", 3)),
+            profile_repeat=int(getattr(args, "profile_repeat", 1)),
+            profile_record_shapes=bool(getattr(args, "profile_record_shapes", False)),
+            profile_with_stack=bool(getattr(args, "profile_with_stack", False)),
+            profile_memory=bool(getattr(args, "profile_memory", False)),
             max_train_batches=int(getattr(args, "max_train_batches", 0)),
             max_val_batches=int(getattr(args, "max_val_batches", 0)),
             enable_soft_profile_sharing=bool(getattr(args, "enable_soft_profile_sharing", False)),
             soft_profile_equiv_check_batches=int(getattr(args, "soft_profile_equiv_check_batches", 2)),
             soft_profile_mae_tolerance=float(getattr(args, "soft_profile_mae_tolerance", 1e-6)),
             soft_profile_img_psnr_tolerance=float(getattr(args, "soft_profile_img_psnr_tolerance", 5e-4)),
+            gbuffer_image_loss_cfg=gbuffer_image_loss_cfg,
+            proxy_gbuffer_handover_cfg=proxy_gbuffer_handover_cfg,
+            proxy_gbuffer_handover_epoch_offset=int(routing_balance_epoch_offset),
+            loss_effective_contribution_cfg=loss_effective_contribution_cfg,
+            optimization_monitoring_cfg=optimization_monitoring_cfg,
+            gbuffer_loader=gbuffer_loader,
+            gbuffer_probe_min=gbuffer_probe_min,
+            gbuffer_probe_max=gbuffer_probe_max,
+            gbuffer_gt_sh_tensor=gbuffer_gt_sh_tensor,
+            gbuffer_gt_probe_positions=gbuffer_gt_probe_positions,
+            gbuffer_gt_light_configs=gbuffer_gt_light_configs,
+            gbuffer_gt_light_mask=gbuffer_gt_light_mask,
+            gbuffer_gt_frame_indices=gbuffer_gt_frame_indices,
+            gbuffer_gt_knn=int(gbuffer_image_loss_cfg.get("gt_knn", 8)),
+            gbuffer_gt_weight_eps=float(gbuffer_image_loss_cfg.get("gt_weight_eps", 0.1)),
+            gbuffer_gt_chunk_size=int(gbuffer_image_loss_cfg.get("gt_chunk_size", 32768)),
             rerun_logger=rerun_logger,
             show_progress=args.show_progress,
         )
@@ -2107,6 +1929,44 @@ def run_training(args: argparse.Namespace) -> None:
     global_best_falcor_summary_path = output_dir / "global_best_falcor_summary.json"
     global_best_soft_value = float("-inf") if global_best_soft_maximize else float("inf")
     global_best_falcor_value = float("-inf") if falcor_best_maximize else float("inf")
+
+    hook_manager = HookManager()
+
+    def _hook_update_heartbeat(
+        *,
+        state: str,
+        last_event: str,
+        stage_index: int,
+        stage_name: str,
+        epoch: int,
+        num_epochs: int,
+        metrics: Dict[str, float] | None = None,
+        extra: Dict[str, Any] | None = None,
+    ) -> None:
+        _update_heartbeat(
+            heartbeat_path=heartbeat_path,
+            history_path=heartbeat_history_path,
+            enabled=heartbeat_enabled,
+            save_history=heartbeat_history_enabled,
+            run_context=run_context,
+            state=state,
+            last_event=last_event,
+            stage_index=stage_index,
+            stage_name=stage_name,
+            epoch=epoch,
+            num_epochs=num_epochs,
+            metrics=metrics,
+            extra=extra,
+        )
+
+    hook_manager.register(HeartbeatHook(update_heartbeat=_hook_update_heartbeat))
+    hook_manager.register(
+        Phase0MetricsHook(
+            jsonl_path=phase0_metrics_path,
+            append_jsonl=_append_jsonl,
+            now_iso=_now_iso,
+        )
+    )
 
     def _metric_is_better(value: float, best: float, maximize: bool) -> bool:
         if not np.isfinite(float(value)):
@@ -2238,351 +2098,96 @@ def run_training(args: argparse.Namespace) -> None:
             encoding="utf-8",
         )
 
-    falcor_async_enabled = bool(falcor_periodic_eval_cfg.get("enabled", False)) and bool(
-        falcor_periodic_eval_cfg.get("async_mode", True)
-    )
-    falcor_executor: ThreadPoolExecutor | None = ThreadPoolExecutor(max_workers=1) if falcor_async_enabled else None
-    falcor_pending: List[Dict[str, Any]] = []
-
-    def _falcor_task_runner(*, checkpoint_path: Path, output_dir: Path) -> Dict[str, Any]:
-        try:
-            summary = _run_falcor_periodic_eval(
-                checkpoint_path=checkpoint_path,
-                output_dir=output_dir,
-                args=args,
-                eval_cfg=falcor_periodic_eval_cfg,
-            )
-            return {"status": "success", "summary": summary}
-        except subprocess.TimeoutExpired as timeout_error:
-            return {"status": "timeout", "error": str(timeout_error)}
-        except Exception as falcor_error:
-            return {"status": "error", "error": str(falcor_error)}
-
-    def _schedule_falcor_task(
-        *,
-        stage_index: int,
-        stage_name: str,
-        epoch: int,
-        num_epochs: int,
-        checkpoint_path: Path,
-        run_dir: Path,
-    ) -> None:
-        if falcor_executor is None:
-            return
-        future: Future = falcor_executor.submit(
-            _falcor_task_runner,
-            checkpoint_path=checkpoint_path,
-            output_dir=run_dir,
-        )
-        falcor_pending.append(
+    def _save_eval_checkpoint(checkpoint_path: Path, epoch: int, checkpoint_meta_obj: Dict[str, Any]) -> None:
+        torch.save(
             {
-                "future": future,
-                "stage_index": int(stage_index),
-                "stage_name": str(stage_name),
                 "epoch": int(epoch),
-                "num_epochs": int(num_epochs),
-                "checkpoint_path": str(checkpoint_path),
-                "run_dir": str(run_dir),
-            }
+                "model_state_dict": model.state_dict(),
+                "meta": checkpoint_meta_obj,
+            },
+            checkpoint_path,
         )
 
-    def _handle_falcor_task_done(task: Dict[str, Any], result: Dict[str, Any]) -> None:
-        stage_index = int(task["stage_index"])
-        stage_name = str(task["stage_name"])
-        epoch = int(task["epoch"])
-        num_epochs = int(task["num_epochs"])
-        checkpoint_path = Path(str(task["checkpoint_path"]))
-        run_dir = Path(str(task["run_dir"]))
-        summary_path = run_dir / "benchmark_summary.json"
-
-        status = str(result.get("status", "error"))
-        if status == "success":
-            summary = result.get("summary", None)
-            falcor_metrics = _extract_falcor_metrics_from_summary(summary or {})
-            primary = _falcor_primary_metric_value(falcor_metrics)
-            payload = {
-                "timestamp": _now_iso(),
-                "kind": "periodic",
-                "stage_index": stage_index,
-                "stage_name": stage_name,
-                "epoch": epoch,
-                "metric_name": falcor_best_metric_name,
-                "metric_value": float(primary) if np.isfinite(primary) else None,
-                "metrics": falcor_metrics,
-                "summary": str(summary_path),
-                "checkpoint": str(checkpoint_path),
-                "async": True,
-            }
-            _append_jsonl(falcor_periodic_history_path, payload)
-            _append_jsonl(
-                phase0_metrics_path,
-                {
-                    "timestamp": _now_iso(),
-                    "kind": "falcor_periodic",
-                    "stage_index": stage_index,
-                    "stage_name": stage_name,
-                    "epoch": epoch,
-                    "num_epochs": num_epochs,
-                    "metrics": {"falcor_primary": float(primary) if np.isfinite(primary) else 0.0, **falcor_metrics},
-                    "summary": str(summary_path),
-                    "async": True,
-                },
-            )
-            if _falcor_is_better(primary):
-                _update_falcor_best(
-                    checkpoint_path=checkpoint_path,
-                    summary_path=summary_path,
-                    metric_value=float(primary),
-                    stage_index=stage_index,
-                    stage_name=stage_name,
-                    epoch=epoch,
-                    kind="periodic_async",
-                )
-            _update_heartbeat(
-                heartbeat_path=heartbeat_path,
-                history_path=heartbeat_history_path,
-                enabled=heartbeat_enabled,
-                save_history=heartbeat_history_enabled,
-                run_context=run_context,
-                state="running",
-                last_event="falcor_periodic_success",
-                stage_index=stage_index,
-                stage_name=stage_name,
-                epoch=epoch,
-                num_epochs=num_epochs,
-                metrics={"falcor_primary": float(primary) if np.isfinite(primary) else 0.0},
-                extra={"summary": str(summary_path), "async": True},
-            )
-            return
-
-        error_msg = str(result.get("error", "unknown"))
-        if status == "timeout":
-            timeout_path = run_dir / "timeout.json"
-            timeout_path.write_text(
-                json.dumps(
-                    {
-                        "kind": "falcor_periodic_timeout",
-                        "stage": stage_name,
-                        "epoch": epoch,
-                        "timeout_seconds": int(falcor_periodic_eval_cfg.get("timeout_seconds", 1800)),
-                        "error": error_msg,
-                        "timestamp": _now_iso(),
-                        "async": True,
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-            _update_heartbeat(
-                heartbeat_path=heartbeat_path,
-                history_path=heartbeat_history_path,
-                enabled=heartbeat_enabled,
-                save_history=heartbeat_history_enabled,
-                run_context=run_context,
-                state="running",
-                last_event="falcor_periodic_timeout",
-                stage_index=stage_index,
-                stage_name=stage_name,
-                epoch=epoch,
-                num_epochs=num_epochs,
-                extra={"timeout_file": str(timeout_path), "async": True},
-            )
-            if bool(falcor_periodic_eval_cfg.get("fail_on_timeout", False)):
-                raise RuntimeError(
-                    f"Falcor periodic async eval timed out at stage={stage_name} epoch={epoch}"
-                )
-            return
-
-        _update_heartbeat(
-            heartbeat_path=heartbeat_path,
-            history_path=heartbeat_history_path,
-            enabled=heartbeat_enabled,
-            save_history=heartbeat_history_enabled,
-            run_context=run_context,
-            state="running",
-            last_event="falcor_periodic_error",
-            stage_index=stage_index,
-            stage_name=stage_name,
-            epoch=epoch,
-            num_epochs=num_epochs,
-            extra={"error": error_msg, "async": True},
+    def _run_falcor_eval(checkpoint_path: Path, out_dir: Path) -> Dict[str, Any] | None:
+        return _run_falcor_periodic_eval(
+            checkpoint_path=checkpoint_path,
+            output_dir=out_dir,
+            args=args,
+            eval_cfg=falcor_periodic_eval_cfg,
         )
-        if bool(falcor_periodic_eval_cfg.get("fail_on_error", False)):
-            raise RuntimeError(
-                f"Falcor periodic async eval failed at stage={stage_name} epoch={epoch}: {error_msg}"
-            )
 
-    def _drain_falcor_tasks(*, block: bool = False) -> None:
-        while True:
-            pending_now = list(falcor_pending)
-            done_any = False
-            for task in pending_now:
-                future = task["future"]
-                if block:
-                    result = future.result()
-                    falcor_pending.remove(task)
-                    _handle_falcor_task_done(task, result)
-                    done_any = True
-                    continue
-                if future.done():
-                    result = future.result()
-                    falcor_pending.remove(task)
-                    _handle_falcor_task_done(task, result)
-                    done_any = True
-            if not block or not falcor_pending:
-                break
-            if not done_any:
-                time.sleep(0.2)
-
-    def _run_falcor_periodic_sync(
-        *,
-        stage_index: int,
-        stage_name: str,
-        epoch: int,
-        num_epochs: int,
-        checkpoint_path: Path,
-        run_dir: Path,
-    ) -> None:
-        summary_path = run_dir / "benchmark_summary.json"
-        try:
-            summary = _run_falcor_periodic_eval(
-                checkpoint_path=checkpoint_path,
-                output_dir=run_dir,
-                args=args,
-                eval_cfg=falcor_periodic_eval_cfg,
-            )
-            falcor_metrics = _extract_falcor_metrics_from_summary(summary or {})
-            primary = _falcor_primary_metric_value(falcor_metrics)
-            payload = {
-                "timestamp": _now_iso(),
-                "kind": "periodic",
-                "stage_index": int(stage_index),
-                "stage_name": str(stage_name),
-                "epoch": int(epoch),
-                "metric_name": falcor_best_metric_name,
-                "metric_value": float(primary) if np.isfinite(primary) else None,
-                "metrics": falcor_metrics,
-                "summary": str(summary_path),
-                "checkpoint": str(checkpoint_path),
-                "async": False,
+    def _resolve_audit_profiles(explicit_profiles: List[Dict[str, Any]] | None) -> List[Dict[str, Any]]:
+        if explicit_profiles:
+            return explicit_profiles
+        if bool(val_profiles_cfg.get("enabled", False)):
+            return list(val_profiles_cfg.get("profiles", []))
+        return [
+            {
+                "name": f"hard{int(args.top_k)}",
+                "top_k": int(args.top_k),
+                "training_soft_routing": False,
+                "routing_soft_topk": None,
+                "routing_temperature": None,
             }
-            _append_jsonl(falcor_periodic_history_path, payload)
-            _append_jsonl(
-                phase0_metrics_path,
-                {
-                    "timestamp": _now_iso(),
-                    "kind": "falcor_periodic",
-                    "stage_index": int(stage_index),
-                    "stage_name": str(stage_name),
-                    "epoch": int(epoch),
-                    "num_epochs": int(num_epochs),
-                    "metrics": {"falcor_primary": float(primary) if np.isfinite(primary) else 0.0, **falcor_metrics},
-                    "summary": str(summary_path),
-                    "async": False,
-                },
-            )
-            if _falcor_is_better(primary):
-                _update_falcor_best(
-                    checkpoint_path=checkpoint_path,
-                    summary_path=summary_path,
-                    metric_value=float(primary),
-                    stage_index=int(stage_index),
-                    stage_name=str(stage_name),
-                    epoch=int(epoch),
-                    kind="periodic_sync",
-                )
-            _update_heartbeat(
-                heartbeat_path=heartbeat_path,
-                history_path=heartbeat_history_path,
-                enabled=heartbeat_enabled,
-                save_history=heartbeat_history_enabled,
-                run_context=run_context,
-                state="running",
-                last_event="falcor_periodic_success",
-                stage_index=int(stage_index),
-                stage_name=str(stage_name),
-                epoch=int(epoch),
-                num_epochs=int(num_epochs),
-                metrics={"falcor_primary": float(primary) if np.isfinite(primary) else 0.0},
-                extra={"summary": str(summary_path), "async": False},
-            )
-        except subprocess.TimeoutExpired as timeout_error:
-            timeout_path = run_dir / "timeout.json"
-            timeout_path.write_text(
-                json.dumps(
-                    {
-                        "kind": "falcor_periodic_timeout",
-                        "stage": str(stage_name),
-                        "epoch": int(epoch),
-                        "timeout_seconds": int(falcor_periodic_eval_cfg.get("timeout_seconds", 1800)),
-                        "error": str(timeout_error),
-                        "timestamp": _now_iso(),
-                        "async": False,
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-            _update_heartbeat(
-                heartbeat_path=heartbeat_path,
-                history_path=heartbeat_history_path,
-                enabled=heartbeat_enabled,
-                save_history=heartbeat_history_enabled,
-                run_context=run_context,
-                state="running",
-                last_event="falcor_periodic_timeout",
-                stage_index=int(stage_index),
-                stage_name=str(stage_name),
-                epoch=int(epoch),
-                num_epochs=int(num_epochs),
-                extra={"timeout_file": str(timeout_path), "async": False},
-            )
-            print(
-                f"Warning: Falcor periodic eval timeout at stage={stage_name} "
-                f"epoch={epoch} timeout={falcor_periodic_eval_cfg.get('timeout_seconds', 1800)}s"
-            )
-            if bool(falcor_periodic_eval_cfg.get("fail_on_timeout", False)):
-                raise RuntimeError(
-                    f"Falcor periodic eval timed out at stage={stage_name} epoch={epoch}"
-                ) from timeout_error
-        except Exception as falcor_error:
-            _update_heartbeat(
-                heartbeat_path=heartbeat_path,
-                history_path=heartbeat_history_path,
-                enabled=heartbeat_enabled,
-                save_history=heartbeat_history_enabled,
-                run_context=run_context,
-                state="running",
-                last_event="falcor_periodic_error",
-                stage_index=int(stage_index),
-                stage_name=str(stage_name),
-                epoch=int(epoch),
-                num_epochs=int(num_epochs),
-                extra={"error": str(falcor_error), "async": False},
-            )
-            print(f"Warning: Falcor periodic eval failed at stage={stage_name} epoch={epoch}: {falcor_error}")
-            if bool(falcor_periodic_eval_cfg.get("fail_on_error", False)):
-                raise
+        ]
 
-    falcor_cleanup_done = {"value": False}
-
-    def _finalize_falcor_resources(*, block: bool = True) -> None:
-        if falcor_cleanup_done["value"]:
-            return
-        try:
-            _drain_falcor_tasks(block=block)
-        except Exception as cleanup_error:
-            print(f"Warning: falcor pending task cleanup failed: {cleanup_error}")
-        if falcor_executor is not None:
-            falcor_executor.shutdown(wait=True)
-        falcor_cleanup_done["value"] = True
-
-    def _falcor_exit_guard() -> None:
-        _finalize_falcor_resources(block=True)
-
-    atexit.register(_falcor_exit_guard)
+    falcor_audit_hook = FalcorPeriodicAuditHook(
+        model=model,
+        eval_cfg=falcor_periodic_eval_cfg,
+        phase0_metrics_path=phase0_metrics_path,
+        falcor_periodic_history_path=falcor_periodic_history_path,
+        now_iso=_now_iso,
+        append_jsonl=_append_jsonl,
+        update_heartbeat=_hook_update_heartbeat,
+        run_falcor_eval=_run_falcor_eval,
+        save_checkpoint=_save_eval_checkpoint,
+        extract_metrics_from_summary=_extract_falcor_metrics_from_summary,
+        primary_metric_name=falcor_best_metric_name,
+        primary_metric_value=_falcor_primary_metric_value,
+        is_better_than_best=_falcor_is_better,
+        update_best_checkpoint=_update_falcor_best,
+    )
+    oracle_audit_hook = OracleAuditHook(
+        args=args,
+        model=model,
+        oracle_cfg=oracle_monitor_cfg,
+        phase0_metrics_path=phase0_metrics_path,
+        now_iso=_now_iso,
+        append_jsonl=_append_jsonl,
+        update_heartbeat=_hook_update_heartbeat,
+        save_checkpoint=_save_eval_checkpoint,
+        run_oracle_monitor=_run_oracle_monitor,
+        metrics_from_summary=_oracle_metrics_from_summary,
+        rerun_logger=rerun_logger,
+    )
+    post_training_audit_hook = PostTrainingAuditHook(
+        args=args,
+        output_dir=output_dir,
+        val_profiles_cfg=val_profiles_cfg,
+        coeff_suite_cfg=coeff_suite_cfg,
+        expert_util_cfg=expert_util_cfg,
+        semantic_drift_cfg=semantic_drift_cfg,
+        global_best_track_falcor=global_best_track_falcor,
+        global_best_track_soft=global_best_track_soft,
+        global_best_falcor_ckpt_path=global_best_falcor_ckpt_path,
+        global_best_soft_ckpt_path=global_best_soft_ckpt_path,
+        phase0_metrics_path=phase0_metrics_path,
+        now_iso=_now_iso,
+        append_jsonl=_append_jsonl,
+        update_heartbeat=_hook_update_heartbeat,
+        run_profile_test_compare=_run_profile_test_compare,
+        run_coeff_suite=_run_coeff_suite,
+        coeff_suite_metrics_from_summary=_coeff_suite_metrics_from_summary,
+        run_expert_utilization_audit=_run_expert_utilization_audit,
+        expert_util_metrics_from_summary=_expert_util_metrics_from_summary,
+        run_semantic_drift_audit=_run_semantic_drift_audit,
+        resolve_audit_profiles=_resolve_audit_profiles,
+        sanitize_stage_name=_sanitize_stage_name,
+        rerun_logger=rerun_logger,
+    )
+    hook_manager.register(falcor_audit_hook)
+    hook_manager.register(oracle_audit_hook)
+    hook_manager.register(post_training_audit_hook)
     if staged_specs and resume_requested and resume_stage_index is None:
         resume_stage_index = 1
     if staged_specs and resume_requested and resume_stage_index is not None:
@@ -2685,48 +2290,28 @@ def run_training(args: argparse.Namespace) -> None:
 
             stage_oracle_runs: List[Dict[str, Any]] = []
 
-            _update_heartbeat(
-                heartbeat_path=heartbeat_path,
-                history_path=heartbeat_history_path,
-                enabled=heartbeat_enabled,
-                save_history=heartbeat_history_enabled,
-                run_context=run_context,
-                state="running",
-                last_event="stage_start",
-                stage_index=int(stage_idx),
-                stage_name=stage_name,
-                epoch=int(stage_resume_epoch),
-                num_epochs=int(stage["epochs"]),
+            hook_manager.on_stage_start(
+                TrainingEvent(
+                    stage_index=int(stage_idx),
+                    stage_name=stage_name,
+                    epoch=int(stage_resume_epoch),
+                    num_epochs=int(stage["epochs"]),
+                    run_context=run_context,
+                )
             )
 
             def _stage_epoch_end_callback(payload: Dict[str, Any]) -> None:
                 current_epoch = int(payload.get("epoch", 0))
                 phase0_metrics = _phase0_metrics_from_payload(payload)
-                _append_jsonl(
-                    phase0_metrics_path,
-                    {
-                        "timestamp": _now_iso(),
-                        "kind": "epoch_end",
-                        "stage_index": int(stage_idx),
-                        "stage_name": stage_name,
-                        "epoch": int(current_epoch),
-                        "num_epochs": int(stage["epochs"]),
-                        "metrics": phase0_metrics,
-                    },
-                )
-                _update_heartbeat(
-                    heartbeat_path=heartbeat_path,
-                    history_path=heartbeat_history_path,
-                    enabled=heartbeat_enabled,
-                    save_history=heartbeat_history_enabled,
-                    run_context=run_context,
-                    state="running",
-                    last_event="epoch_end",
-                    stage_index=int(stage_idx),
-                    stage_name=stage_name,
-                    epoch=current_epoch,
-                    num_epochs=int(stage["epochs"]),
-                    metrics=phase0_metrics,
+                hook_manager.on_epoch_end(
+                    TrainingEvent(
+                        stage_index=int(stage_idx),
+                        stage_name=stage_name,
+                        epoch=int(current_epoch),
+                        num_epochs=int(stage["epochs"]),
+                        run_context=run_context,
+                        metrics=phase0_metrics,
+                    )
                 )
                 if bool(val_profiles_cfg.get("enabled", False)):
                     best_value_by_profile = payload.get("best_value_by_profile", {})
@@ -2743,196 +2328,21 @@ def run_training(args: argparse.Namespace) -> None:
                         except Exception:
                             pass
 
-                _drain_falcor_tasks(block=False)
-                if bool(falcor_periodic_eval_cfg.get("enabled", False)):
-                    every_n = int(falcor_periodic_eval_cfg.get("every_n_epochs", 0))
-                    if every_n > 0 and current_epoch > 0 and current_epoch % every_n == 0:
-                        falcor_run_dir = stage_dir / "falcor_periodic_eval" / f"epoch_{current_epoch:04d}"
-                        falcor_ckpt = falcor_run_dir / "checkpoint.pt"
-                        falcor_run_dir.mkdir(parents=True, exist_ok=True)
-                        torch.save(
-                            {
-                                "epoch": int(current_epoch),
-                                "model_state_dict": model.state_dict(),
-                                "meta": stage_meta,
-                            },
-                            falcor_ckpt,
-                        )
-                        if falcor_async_enabled and falcor_executor is not None:
-                            _update_heartbeat(
-                                heartbeat_path=heartbeat_path,
-                                history_path=heartbeat_history_path,
-                                enabled=heartbeat_enabled,
-                                save_history=heartbeat_history_enabled,
-                                run_context=run_context,
-                                state="falcor_eval_running",
-                                last_event="falcor_periodic_start",
-                                stage_index=int(stage_idx),
-                                stage_name=stage_name,
-                                epoch=current_epoch,
-                                num_epochs=int(stage["epochs"]),
-                                extra={"checkpoint": str(falcor_ckpt), "output_dir": str(falcor_run_dir), "async": True},
-                            )
-                            _schedule_falcor_task(
-                                stage_index=int(stage_idx),
-                                stage_name=stage_name,
-                                epoch=current_epoch,
-                                num_epochs=int(stage["epochs"]),
-                                checkpoint_path=falcor_ckpt,
-                                run_dir=falcor_run_dir,
-                            )
-                        else:
-                            _run_falcor_periodic_sync(
-                                stage_index=int(stage_idx),
-                                stage_name=stage_name,
-                                epoch=int(current_epoch),
-                                num_epochs=int(stage["epochs"]),
-                                checkpoint_path=falcor_ckpt,
-                                run_dir=falcor_run_dir,
-                            )
-
-                if not bool(oracle_monitor_cfg.get("enabled", False)):
-                    return
-                period_epochs = int(oracle_monitor_cfg.get("period_epochs", 0))
-                if period_epochs <= 0:
-                    return
-                if current_epoch <= 0 or current_epoch % period_epochs != 0:
-                    return
-
-                monitor_dir = stage_dir / "oracle_monitor"
-                checkpoint_path = monitor_dir / f"epoch_{current_epoch:04d}.pt"
-                summary_path = monitor_dir / f"epoch_{current_epoch:04d}_light.json"
-                monitor_dir.mkdir(parents=True, exist_ok=True)
-                torch.save(
-                    {
-                        "epoch": current_epoch,
-                        "model_state_dict": model.state_dict(),
-                        "meta": stage_meta,
-                    },
-                    checkpoint_path,
+                hook_manager.on_epoch_audit(
+                    TrainingEvent(
+                        stage_index=int(stage_idx),
+                        stage_name=stage_name,
+                        epoch=int(current_epoch),
+                        num_epochs=int(stage["epochs"]),
+                        run_context=run_context,
+                        extra={
+                            "stage_dir": str(stage_dir),
+                            "stage_slug": str(stage_slug),
+                            "checkpoint_meta": stage_meta,
+                            "oracle_runs": stage_oracle_runs,
+                        },
+                    )
                 )
-                try:
-                    _update_heartbeat(
-                        heartbeat_path=heartbeat_path,
-                        history_path=heartbeat_history_path,
-                        enabled=heartbeat_enabled,
-                        save_history=heartbeat_history_enabled,
-                        run_context=run_context,
-                        state="oracle_running",
-                        last_event="oracle_light_start",
-                        stage_index=int(stage_idx),
-                        stage_name=stage_name,
-                        epoch=current_epoch,
-                        num_epochs=int(stage["epochs"]),
-                        extra={"checkpoint": str(checkpoint_path), "summary": str(summary_path)},
-                    )
-                    summary = _run_oracle_monitor(
-                        checkpoint_path=checkpoint_path,
-                        output_json_path=summary_path,
-                        args=args,
-                        oracle_cfg=oracle_monitor_cfg,
-                        max_samples=int(oracle_monitor_cfg.get("lightweight_max_samples", 4096)),
-                        sample_seed=int(oracle_monitor_cfg.get("lightweight_sample_seed", args.seed)) + current_epoch,
-                        timeout_seconds=int(oracle_monitor_cfg.get("timeout_seconds", 180)),
-                    )
-                    if summary is not None:
-                        metrics = _oracle_metrics_from_summary(summary)
-                        stage_oracle_runs.append(
-                            {
-                                "kind": "lightweight",
-                                "epoch": current_epoch,
-                                "summary": str(summary_path),
-                                "metrics": metrics,
-                            }
-                        )
-                        if rerun_logger is not None:
-                            rerun_logger.log_scalars(current_epoch, metrics, f"oracle/{stage_slug}/light")
-                        _append_jsonl(
-                            phase0_metrics_path,
-                            {
-                                "timestamp": _now_iso(),
-                                "kind": "oracle_light",
-                                "stage_index": int(stage_idx),
-                                "stage_name": stage_name,
-                                "epoch": int(current_epoch),
-                                "num_epochs": int(stage["epochs"]),
-                                "metrics": metrics,
-                                "summary": str(summary_path),
-                            },
-                        )
-                    _update_heartbeat(
-                        heartbeat_path=heartbeat_path,
-                        history_path=heartbeat_history_path,
-                        enabled=heartbeat_enabled,
-                        save_history=heartbeat_history_enabled,
-                        run_context=run_context,
-                        state="running",
-                        last_event="oracle_light_success",
-                        stage_index=int(stage_idx),
-                        stage_name=stage_name,
-                        epoch=current_epoch,
-                        num_epochs=int(stage["epochs"]),
-                        metrics=metrics,
-                    )
-                except subprocess.TimeoutExpired as timeout_error:
-                    timeout_path = monitor_dir / f"epoch_{current_epoch:04d}_light_timeout.json"
-                    timeout_payload = {
-                        "kind": "lightweight_timeout",
-                        "stage": stage_name,
-                        "epoch": int(current_epoch),
-                        "timeout_seconds": int(oracle_monitor_cfg.get("timeout_seconds", 180)),
-                        "error": str(timeout_error),
-                        "timestamp": _now_iso(),
-                    }
-                    timeout_path.write_text(json.dumps(timeout_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-                    stage_oracle_runs.append(
-                        {
-                            "kind": "lightweight_timeout",
-                            "epoch": int(current_epoch),
-                            "summary": str(timeout_path),
-                            "metrics": {},
-                        }
-                    )
-                    _update_heartbeat(
-                        heartbeat_path=heartbeat_path,
-                        history_path=heartbeat_history_path,
-                        enabled=heartbeat_enabled,
-                        save_history=heartbeat_history_enabled,
-                        run_context=run_context,
-                        state="running",
-                        last_event="oracle_light_timeout",
-                        stage_index=int(stage_idx),
-                        stage_name=stage_name,
-                        epoch=current_epoch,
-                        num_epochs=int(stage["epochs"]),
-                        extra={"timeout_file": str(timeout_path)},
-                    )
-                    print(
-                        f"Warning: Oracle monitor timeout at stage={stage_name} "
-                        f"epoch={current_epoch} timeout={oracle_monitor_cfg.get('timeout_seconds', 180)}s"
-                    )
-                    if bool(oracle_monitor_cfg.get("fail_on_timeout", False)):
-                        raise RuntimeError(
-                            f"Oracle monitor timed out at stage={stage_name} epoch={current_epoch}"
-                        ) from timeout_error
-                except Exception as monitor_error:
-                    _update_heartbeat(
-                        heartbeat_path=heartbeat_path,
-                        history_path=heartbeat_history_path,
-                        enabled=heartbeat_enabled,
-                        save_history=heartbeat_history_enabled,
-                        run_context=run_context,
-                        state="running",
-                        last_event="oracle_light_error",
-                        stage_index=int(stage_idx),
-                        stage_name=stage_name,
-                        epoch=current_epoch,
-                        num_epochs=int(stage["epochs"]),
-                        extra={"error": str(monitor_error)},
-                    )
-                    print(f"Warning: Oracle monitor failed at stage={stage_name} epoch={current_epoch}: {monitor_error}")
-
-                # Falcor periodic evaluation is executed before Oracle early-return checks.
 
             stage_history = trainer.fit(
                 train_loader=train_loader,
@@ -2953,248 +2363,20 @@ def run_training(args: argparse.Namespace) -> None:
             if stage_resume_state is not None:
                 resume_consumed = True
             _merge_history(history, stage_history)
-
-            if bool(oracle_monitor_cfg.get("enabled", False)) and bool(oracle_monitor_cfg.get("stage_end_full", True)):
-                stage_monitor_dir = stage_dir / "oracle_monitor"
-                stage_monitor_dir.mkdir(parents=True, exist_ok=True)
-                stage_best = stage_dir / "best_model.pt"
-                stage_last = stage_dir / "last_model.pt"
-                stage_ckpt = stage_best if stage_best.exists() else stage_last
-                if stage_ckpt.exists():
-                    full_summary_path = stage_monitor_dir / "stage_end_full.json"
-                    try:
-                        _update_heartbeat(
-                            heartbeat_path=heartbeat_path,
-                            history_path=heartbeat_history_path,
-                            enabled=heartbeat_enabled,
-                            save_history=heartbeat_history_enabled,
-                            run_context=run_context,
-                            state="oracle_running",
-                            last_event="oracle_stage_end_start",
-                            stage_index=int(stage_idx),
-                            stage_name=stage_name,
-                            epoch=int(stage["epochs"]),
-                            num_epochs=int(stage["epochs"]),
-                            extra={"checkpoint": str(stage_ckpt), "summary": str(full_summary_path)},
-                        )
-                        full_summary = _run_oracle_monitor(
-                            checkpoint_path=stage_ckpt,
-                            output_json_path=full_summary_path,
-                            args=args,
-                            oracle_cfg=oracle_monitor_cfg,
-                            max_samples=int(oracle_monitor_cfg.get("full_max_samples", 0)),
-                            sample_seed=int(oracle_monitor_cfg.get("lightweight_sample_seed", args.seed)),
-                            timeout_seconds=int(oracle_monitor_cfg.get("timeout_seconds", 180)),
-                        )
-                        if full_summary is not None:
-                            full_metrics = _oracle_metrics_from_summary(full_summary)
-                            stage_oracle_runs.append(
-                                {
-                                    "kind": "stage_end_full",
-                                    "epoch": int(stage["epochs"]),
-                                    "summary": str(full_summary_path),
-                                    "metrics": full_metrics,
-                                }
-                            )
-                            if rerun_logger is not None:
-                                rerun_logger.log_scalars(int(stage["epochs"]), full_metrics, f"oracle/{stage_slug}/full")
-                            _update_heartbeat(
-                                heartbeat_path=heartbeat_path,
-                                history_path=heartbeat_history_path,
-                                enabled=heartbeat_enabled,
-                                save_history=heartbeat_history_enabled,
-                                run_context=run_context,
-                                state="running",
-                                last_event="oracle_stage_end_success",
-                                stage_index=int(stage_idx),
-                                stage_name=stage_name,
-                                epoch=int(stage["epochs"]),
-                                num_epochs=int(stage["epochs"]),
-                                metrics=full_metrics,
-                            )
-                    except subprocess.TimeoutExpired as timeout_error:
-                        timeout_path = stage_monitor_dir / "stage_end_full_timeout.json"
-                        timeout_payload = {
-                            "kind": "stage_end_full_timeout",
-                            "stage": stage_name,
-                            "epoch": int(stage["epochs"]),
-                            "timeout_seconds": int(oracle_monitor_cfg.get("timeout_seconds", 180)),
-                            "error": str(timeout_error),
-                            "timestamp": _now_iso(),
-                        }
-                        timeout_path.write_text(json.dumps(timeout_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-                        stage_oracle_runs.append(
-                            {
-                                "kind": "stage_end_full_timeout",
-                                "epoch": int(stage["epochs"]),
-                                "summary": str(timeout_path),
-                                "metrics": {},
-                            }
-                        )
-                        _update_heartbeat(
-                            heartbeat_path=heartbeat_path,
-                            history_path=heartbeat_history_path,
-                            enabled=heartbeat_enabled,
-                            save_history=heartbeat_history_enabled,
-                            run_context=run_context,
-                            state="running",
-                            last_event="oracle_stage_end_timeout",
-                            stage_index=int(stage_idx),
-                            stage_name=stage_name,
-                            epoch=int(stage["epochs"]),
-                            num_epochs=int(stage["epochs"]),
-                            extra={"timeout_file": str(timeout_path)},
-                        )
-                        print(
-                            f"Warning: Oracle stage-end monitor timeout at stage={stage_name} "
-                            f"timeout={oracle_monitor_cfg.get('timeout_seconds', 180)}s"
-                        )
-                        if bool(oracle_monitor_cfg.get("fail_on_timeout", False)):
-                            raise RuntimeError(f"Oracle stage-end monitor timed out at stage={stage_name}") from timeout_error
-                    except Exception as monitor_error:
-                        _update_heartbeat(
-                            heartbeat_path=heartbeat_path,
-                            history_path=heartbeat_history_path,
-                            enabled=heartbeat_enabled,
-                            save_history=heartbeat_history_enabled,
-                            run_context=run_context,
-                            state="running",
-                            last_event="oracle_stage_end_error",
-                            stage_index=int(stage_idx),
-                            stage_name=stage_name,
-                            epoch=int(stage["epochs"]),
-                            num_epochs=int(stage["epochs"]),
-                            extra={"error": str(monitor_error)},
-                        )
-                        print(f"Warning: Oracle stage-end monitor failed at stage={stage_name}: {monitor_error}")
-
-            _drain_falcor_tasks(block=True)
-            if bool(falcor_periodic_eval_cfg.get("enabled", False)) and bool(falcor_periodic_eval_cfg.get("stage_end_full", True)):
-                stage_falcor_dir = stage_dir / "falcor_periodic_eval" / "stage_end_full"
-                stage_falcor_dir.mkdir(parents=True, exist_ok=True)
-                stage_best = stage_dir / "best_model.pt"
-                stage_last = stage_dir / "last_model.pt"
-                stage_ckpt = stage_best if stage_best.exists() else stage_last
-                if stage_ckpt.exists():
-                    stage_end_summary_path = stage_falcor_dir / "benchmark_summary.json"
-                    try:
-                        _update_heartbeat(
-                            heartbeat_path=heartbeat_path,
-                            history_path=heartbeat_history_path,
-                            enabled=heartbeat_enabled,
-                            save_history=heartbeat_history_enabled,
-                            run_context=run_context,
-                            state="falcor_eval_running",
-                            last_event="falcor_stage_end_start",
-                            stage_index=int(stage_idx),
-                            stage_name=stage_name,
-                            epoch=int(stage["epochs"]),
-                            num_epochs=int(stage["epochs"]),
-                            extra={"checkpoint": str(stage_ckpt), "output_dir": str(stage_falcor_dir)},
-                        )
-                        stage_summary = _run_falcor_periodic_eval(
-                            checkpoint_path=stage_ckpt,
-                            output_dir=stage_falcor_dir,
-                            args=args,
-                            eval_cfg=falcor_periodic_eval_cfg,
-                        )
-                        stage_metrics = _extract_falcor_metrics_from_summary(stage_summary or {})
-                        primary = _falcor_primary_metric_value(stage_metrics)
-                        _append_jsonl(
-                            falcor_periodic_history_path,
-                            {
-                                "timestamp": _now_iso(),
-                                "kind": "stage_end_full",
-                                "stage_index": int(stage_idx),
-                                "stage_name": stage_name,
-                                "epoch": int(stage["epochs"]),
-                                "metric_name": falcor_best_metric_name,
-                                "metric_value": float(primary) if np.isfinite(primary) else None,
-                                "metrics": stage_metrics,
-                                "summary": str(stage_end_summary_path),
-                                "checkpoint": str(stage_ckpt),
-                            },
-                        )
-                        if _falcor_is_better(primary):
-                            _update_falcor_best(
-                                checkpoint_path=stage_ckpt,
-                                summary_path=stage_end_summary_path,
-                                metric_value=float(primary),
-                                stage_index=int(stage_idx),
-                                stage_name=stage_name,
-                                epoch=int(stage["epochs"]),
-                                kind="stage_end_full",
-                            )
-                        _update_heartbeat(
-                            heartbeat_path=heartbeat_path,
-                            history_path=heartbeat_history_path,
-                            enabled=heartbeat_enabled,
-                            save_history=heartbeat_history_enabled,
-                            run_context=run_context,
-                            state="running",
-                            last_event="falcor_stage_end_success",
-                            stage_index=int(stage_idx),
-                            stage_name=stage_name,
-                            epoch=int(stage["epochs"]),
-                            num_epochs=int(stage["epochs"]),
-                            metrics={"falcor_primary": float(primary) if np.isfinite(primary) else 0.0},
-                            extra={"summary": str(stage_end_summary_path)},
-                        )
-                    except subprocess.TimeoutExpired as timeout_error:
-                        timeout_path = stage_falcor_dir / "timeout.json"
-                        timeout_path.write_text(
-                            json.dumps(
-                                {
-                                    "kind": "falcor_stage_end_timeout",
-                                    "stage": stage_name,
-                                    "epoch": int(stage["epochs"]),
-                                    "timeout_seconds": int(falcor_periodic_eval_cfg.get("timeout_seconds", 1800)),
-                                    "error": str(timeout_error),
-                                    "timestamp": _now_iso(),
-                                },
-                                ensure_ascii=False,
-                                indent=2,
-                            ),
-                            encoding="utf-8",
-                        )
-                        _update_heartbeat(
-                            heartbeat_path=heartbeat_path,
-                            history_path=heartbeat_history_path,
-                            enabled=heartbeat_enabled,
-                            save_history=heartbeat_history_enabled,
-                            run_context=run_context,
-                            state="running",
-                            last_event="falcor_stage_end_timeout",
-                            stage_index=int(stage_idx),
-                            stage_name=stage_name,
-                            epoch=int(stage["epochs"]),
-                            num_epochs=int(stage["epochs"]),
-                            extra={"timeout_file": str(timeout_path)},
-                        )
-                        print(
-                            f"Warning: Falcor stage-end eval timeout at stage={stage_name} "
-                            f"timeout={falcor_periodic_eval_cfg.get('timeout_seconds', 1800)}s"
-                        )
-                        if bool(falcor_periodic_eval_cfg.get("fail_on_timeout", False)):
-                            raise RuntimeError(f"Falcor stage-end eval timed out at stage={stage_name}") from timeout_error
-                    except Exception as falcor_error:
-                        _update_heartbeat(
-                            heartbeat_path=heartbeat_path,
-                            history_path=heartbeat_history_path,
-                            enabled=heartbeat_enabled,
-                            save_history=heartbeat_history_enabled,
-                            run_context=run_context,
-                            state="running",
-                            last_event="falcor_stage_end_error",
-                            stage_index=int(stage_idx),
-                            stage_name=stage_name,
-                            epoch=int(stage["epochs"]),
-                            num_epochs=int(stage["epochs"]),
-                            extra={"error": str(falcor_error)},
-                        )
-                        print(f"Warning: Falcor stage-end eval failed at stage={stage_name}: {falcor_error}")
-                        if bool(falcor_periodic_eval_cfg.get("fail_on_error", False)):
-                            raise
+            hook_manager.on_stage_end(
+                TrainingEvent(
+                    stage_index=int(stage_idx),
+                    stage_name=stage_name,
+                    epoch=int(stage["epochs"]),
+                    num_epochs=int(stage["epochs"]),
+                    run_context=run_context,
+                    extra={
+                        "stage_dir": str(stage_dir),
+                        "stage_slug": str(stage_slug),
+                        "oracle_runs": stage_oracle_runs,
+                    },
+                )
+            )
 
             _update_heartbeat(
                 heartbeat_path=heartbeat_path,
@@ -3270,48 +2452,28 @@ def run_training(args: argparse.Namespace) -> None:
             routing_balance_epoch_offset=0,
         )
 
-        _update_heartbeat(
-            heartbeat_path=heartbeat_path,
-            history_path=heartbeat_history_path,
-            enabled=heartbeat_enabled,
-            save_history=heartbeat_history_enabled,
-            run_context=run_context,
-            state="running",
-            last_event="stage_start",
-            stage_index=1,
-            stage_name="single_stage",
-            epoch=single_stage_resume_epoch,
-            num_epochs=int(args.epochs),
+        hook_manager.on_stage_start(
+            TrainingEvent(
+                stage_index=1,
+                stage_name="single_stage",
+                epoch=single_stage_resume_epoch,
+                num_epochs=int(args.epochs),
+                run_context=run_context,
+            )
         )
 
         def _single_stage_epoch_end_callback(payload: Dict[str, Any]) -> None:
             current_epoch = int(payload.get("epoch", 0))
             phase0_metrics = _phase0_metrics_from_payload(payload)
-            _append_jsonl(
-                phase0_metrics_path,
-                {
-                    "timestamp": _now_iso(),
-                    "kind": "epoch_end",
-                    "stage_index": 1,
-                    "stage_name": "single_stage",
-                    "epoch": int(current_epoch),
-                    "num_epochs": int(args.epochs),
-                    "metrics": phase0_metrics,
-                },
-            )
-            _update_heartbeat(
-                heartbeat_path=heartbeat_path,
-                history_path=heartbeat_history_path,
-                enabled=heartbeat_enabled,
-                save_history=heartbeat_history_enabled,
-                run_context=run_context,
-                state="running",
-                last_event="epoch_end",
-                stage_index=1,
-                stage_name="single_stage",
-                epoch=current_epoch,
-                num_epochs=int(args.epochs),
-                metrics=phase0_metrics,
+            hook_manager.on_epoch_end(
+                TrainingEvent(
+                    stage_index=1,
+                    stage_name="single_stage",
+                    epoch=int(current_epoch),
+                    num_epochs=int(args.epochs),
+                    run_context=run_context,
+                    metrics=phase0_metrics,
+                )
             )
             if bool(val_profiles_cfg.get("enabled", False)):
                 best_value_by_profile = payload.get("best_value_by_profile", {})
@@ -3328,176 +2490,20 @@ def run_training(args: argparse.Namespace) -> None:
                     except Exception:
                         pass
 
-            _drain_falcor_tasks(block=False)
-            if bool(falcor_periodic_eval_cfg.get("enabled", False)):
-                every_n = int(falcor_periodic_eval_cfg.get("every_n_epochs", 0))
-                if every_n > 0 and current_epoch > 0 and current_epoch % every_n == 0:
-                    falcor_run_dir = output_dir / "falcor_periodic_eval" / f"epoch_{current_epoch:04d}"
-                    falcor_ckpt = falcor_run_dir / "checkpoint.pt"
-                    falcor_run_dir.mkdir(parents=True, exist_ok=True)
-                    torch.save(
-                        {
-                            "epoch": int(current_epoch),
-                            "model_state_dict": model.state_dict(),
-                            "meta": checkpoint_meta,
-                        },
-                        falcor_ckpt,
-                    )
-                    if falcor_async_enabled and falcor_executor is not None:
-                        _update_heartbeat(
-                            heartbeat_path=heartbeat_path,
-                            history_path=heartbeat_history_path,
-                            enabled=heartbeat_enabled,
-                            save_history=heartbeat_history_enabled,
-                            run_context=run_context,
-                            state="falcor_eval_running",
-                            last_event="falcor_periodic_start",
-                            stage_index=1,
-                            stage_name="single_stage",
-                            epoch=current_epoch,
-                            num_epochs=int(args.epochs),
-                            extra={"checkpoint": str(falcor_ckpt), "output_dir": str(falcor_run_dir), "async": True},
-                        )
-                        _schedule_falcor_task(
-                            stage_index=1,
-                            stage_name="single_stage",
-                            epoch=current_epoch,
-                            num_epochs=int(args.epochs),
-                            checkpoint_path=falcor_ckpt,
-                            run_dir=falcor_run_dir,
-                        )
-                    else:
-                        _run_falcor_periodic_sync(
-                            stage_index=1,
-                            stage_name="single_stage",
-                            epoch=int(current_epoch),
-                            num_epochs=int(args.epochs),
-                            checkpoint_path=falcor_ckpt,
-                            run_dir=falcor_run_dir,
-                        )
-
-            if not bool(oracle_monitor_cfg.get("enabled", False)):
-                return
-            period_epochs = int(oracle_monitor_cfg.get("period_epochs", 0))
-            if period_epochs <= 0:
-                return
-            if current_epoch <= 0 or current_epoch % period_epochs != 0:
-                return
-
-            monitor_dir = output_dir / "oracle_monitor"
-            checkpoint_path = monitor_dir / f"epoch_{current_epoch:04d}.pt"
-            summary_path = monitor_dir / f"epoch_{current_epoch:04d}_light.json"
-            monitor_dir.mkdir(parents=True, exist_ok=True)
-            torch.save(
-                {
-                    "epoch": current_epoch,
-                    "model_state_dict": model.state_dict(),
-                    "meta": checkpoint_meta,
-                },
-                checkpoint_path,
+            hook_manager.on_epoch_audit(
+                TrainingEvent(
+                    stage_index=1,
+                    stage_name="single_stage",
+                    epoch=int(current_epoch),
+                    num_epochs=int(args.epochs),
+                    run_context=run_context,
+                    extra={
+                        "stage_dir": str(output_dir),
+                        "stage_slug": "main",
+                        "checkpoint_meta": checkpoint_meta,
+                    },
+                )
             )
-            try:
-                _update_heartbeat(
-                    heartbeat_path=heartbeat_path,
-                    history_path=heartbeat_history_path,
-                    enabled=heartbeat_enabled,
-                    save_history=heartbeat_history_enabled,
-                    run_context=run_context,
-                    state="oracle_running",
-                    last_event="oracle_light_start",
-                    stage_index=1,
-                    stage_name="single_stage",
-                    epoch=current_epoch,
-                    num_epochs=int(args.epochs),
-                    extra={"checkpoint": str(checkpoint_path), "summary": str(summary_path)},
-                )
-                summary = _run_oracle_monitor(
-                    checkpoint_path=checkpoint_path,
-                    output_json_path=summary_path,
-                    args=args,
-                    oracle_cfg=oracle_monitor_cfg,
-                    max_samples=int(oracle_monitor_cfg.get("lightweight_max_samples", 4096)),
-                    sample_seed=int(oracle_monitor_cfg.get("lightweight_sample_seed", args.seed)) + current_epoch,
-                    timeout_seconds=int(oracle_monitor_cfg.get("timeout_seconds", 180)),
-                )
-                if summary is not None:
-                    metrics = _oracle_metrics_from_summary(summary)
-                    if rerun_logger is not None:
-                        rerun_logger.log_scalars(current_epoch, metrics, "oracle/main/light")
-                    _append_jsonl(
-                        phase0_metrics_path,
-                        {
-                            "timestamp": _now_iso(),
-                            "kind": "oracle_light",
-                            "stage_index": 1,
-                            "stage_name": "single_stage",
-                            "epoch": int(current_epoch),
-                            "num_epochs": int(args.epochs),
-                            "metrics": metrics,
-                            "summary": str(summary_path),
-                        },
-                    )
-                    _update_heartbeat(
-                        heartbeat_path=heartbeat_path,
-                        history_path=heartbeat_history_path,
-                        enabled=heartbeat_enabled,
-                        save_history=heartbeat_history_enabled,
-                        run_context=run_context,
-                        state="running",
-                        last_event="oracle_light_success",
-                        stage_index=1,
-                        stage_name="single_stage",
-                        epoch=current_epoch,
-                        num_epochs=int(args.epochs),
-                        metrics=metrics,
-                    )
-            except subprocess.TimeoutExpired as timeout_error:
-                timeout_path = monitor_dir / f"epoch_{current_epoch:04d}_light_timeout.json"
-                timeout_payload = {
-                    "kind": "lightweight_timeout",
-                    "stage": "single_stage",
-                    "epoch": int(current_epoch),
-                    "timeout_seconds": int(oracle_monitor_cfg.get("timeout_seconds", 180)),
-                    "error": str(timeout_error),
-                    "timestamp": _now_iso(),
-                }
-                timeout_path.write_text(json.dumps(timeout_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-                _update_heartbeat(
-                    heartbeat_path=heartbeat_path,
-                    history_path=heartbeat_history_path,
-                    enabled=heartbeat_enabled,
-                    save_history=heartbeat_history_enabled,
-                    run_context=run_context,
-                    state="running",
-                    last_event="oracle_light_timeout",
-                    stage_index=1,
-                    stage_name="single_stage",
-                    epoch=current_epoch,
-                    num_epochs=int(args.epochs),
-                    extra={"timeout_file": str(timeout_path)},
-                )
-                print(
-                    f"Warning: Oracle monitor timeout at epoch={current_epoch} "
-                    f"timeout={oracle_monitor_cfg.get('timeout_seconds', 180)}s"
-                )
-                if bool(oracle_monitor_cfg.get("fail_on_timeout", False)):
-                    raise RuntimeError(f"Oracle monitor timed out at epoch={current_epoch}") from timeout_error
-            except Exception as monitor_error:
-                _update_heartbeat(
-                    heartbeat_path=heartbeat_path,
-                    history_path=heartbeat_history_path,
-                    enabled=heartbeat_enabled,
-                    save_history=heartbeat_history_enabled,
-                    run_context=run_context,
-                    state="running",
-                    last_event="oracle_light_error",
-                    stage_index=1,
-                    stage_name="single_stage",
-                    epoch=current_epoch,
-                    num_epochs=int(args.epochs),
-                    extra={"error": str(monitor_error)},
-                )
-                print(f"Warning: Oracle monitor failed at epoch={current_epoch}: {monitor_error}")
 
         history = trainer.fit(
             train_loader=train_loader,
@@ -3516,229 +2522,19 @@ def run_training(args: argparse.Namespace) -> None:
             resume_checkpoint_name=str(getattr(args, "resume_checkpoint_name", "resume_latest.pt")),
         )
 
-        if bool(oracle_monitor_cfg.get("enabled", False)) and bool(oracle_monitor_cfg.get("stage_end_full", True)):
-            monitor_dir = output_dir / "oracle_monitor"
-            monitor_dir.mkdir(parents=True, exist_ok=True)
-            best_ckpt = output_dir / "best_model.pt"
-            last_ckpt = output_dir / "last_model.pt"
-            final_ckpt = best_ckpt if best_ckpt.exists() else last_ckpt
-            if final_ckpt.exists():
-                full_summary_path = monitor_dir / "stage_end_full.json"
-                try:
-                    _update_heartbeat(
-                        heartbeat_path=heartbeat_path,
-                        history_path=heartbeat_history_path,
-                        enabled=heartbeat_enabled,
-                        save_history=heartbeat_history_enabled,
-                        run_context=run_context,
-                        state="oracle_running",
-                        last_event="oracle_stage_end_start",
-                        stage_index=1,
-                        stage_name="single_stage",
-                        epoch=int(args.epochs),
-                        num_epochs=int(args.epochs),
-                        extra={"checkpoint": str(final_ckpt), "summary": str(full_summary_path)},
-                    )
-                    full_summary = _run_oracle_monitor(
-                        checkpoint_path=final_ckpt,
-                        output_json_path=full_summary_path,
-                        args=args,
-                        oracle_cfg=oracle_monitor_cfg,
-                        max_samples=int(oracle_monitor_cfg.get("full_max_samples", 0)),
-                        sample_seed=int(oracle_monitor_cfg.get("lightweight_sample_seed", args.seed)),
-                        timeout_seconds=int(oracle_monitor_cfg.get("timeout_seconds", 180)),
-                    )
-                    if full_summary is not None:
-                        full_metrics = _oracle_metrics_from_summary(full_summary)
-                        if rerun_logger is not None:
-                            rerun_logger.log_scalars(int(args.epochs), full_metrics, "oracle/main/full")
-                        _update_heartbeat(
-                            heartbeat_path=heartbeat_path,
-                            history_path=heartbeat_history_path,
-                            enabled=heartbeat_enabled,
-                            save_history=heartbeat_history_enabled,
-                            run_context=run_context,
-                            state="running",
-                            last_event="oracle_stage_end_success",
-                            stage_index=1,
-                            stage_name="single_stage",
-                            epoch=int(args.epochs),
-                            num_epochs=int(args.epochs),
-                            metrics=full_metrics,
-                        )
-                except subprocess.TimeoutExpired as timeout_error:
-                    timeout_path = monitor_dir / "stage_end_full_timeout.json"
-                    timeout_payload = {
-                        "kind": "stage_end_full_timeout",
-                        "stage": "single_stage",
-                        "epoch": int(args.epochs),
-                        "timeout_seconds": int(oracle_monitor_cfg.get("timeout_seconds", 180)),
-                        "error": str(timeout_error),
-                        "timestamp": _now_iso(),
-                    }
-                    timeout_path.write_text(json.dumps(timeout_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-                    _update_heartbeat(
-                        heartbeat_path=heartbeat_path,
-                        history_path=heartbeat_history_path,
-                        enabled=heartbeat_enabled,
-                        save_history=heartbeat_history_enabled,
-                        run_context=run_context,
-                        state="running",
-                        last_event="oracle_stage_end_timeout",
-                        stage_index=1,
-                        stage_name="single_stage",
-                        epoch=int(args.epochs),
-                        num_epochs=int(args.epochs),
-                        extra={"timeout_file": str(timeout_path)},
-                    )
-                    print(
-                        f"Warning: Oracle stage-end monitor timeout timeout={oracle_monitor_cfg.get('timeout_seconds', 180)}s"
-                    )
-                    if bool(oracle_monitor_cfg.get("fail_on_timeout", False)):
-                        raise RuntimeError("Oracle stage-end monitor timed out") from timeout_error
-                except Exception as monitor_error:
-                    _update_heartbeat(
-                        heartbeat_path=heartbeat_path,
-                        history_path=heartbeat_history_path,
-                        enabled=heartbeat_enabled,
-                        save_history=heartbeat_history_enabled,
-                        run_context=run_context,
-                        state="running",
-                        last_event="oracle_stage_end_error",
-                        stage_index=1,
-                        stage_name="single_stage",
-                        epoch=int(args.epochs),
-                        num_epochs=int(args.epochs),
-                        extra={"error": str(monitor_error)},
-                    )
-                    print(f"Warning: Oracle stage-end monitor failed: {monitor_error}")
-
-        _drain_falcor_tasks(block=True)
-        if bool(falcor_periodic_eval_cfg.get("enabled", False)) and bool(falcor_periodic_eval_cfg.get("stage_end_full", True)):
-            stage_falcor_dir = output_dir / "falcor_periodic_eval" / "stage_end_full"
-            stage_falcor_dir.mkdir(parents=True, exist_ok=True)
-            best_ckpt = output_dir / "best_model.pt"
-            last_ckpt = output_dir / "last_model.pt"
-            final_ckpt = best_ckpt if best_ckpt.exists() else last_ckpt
-            if final_ckpt.exists():
-                stage_end_summary_path = stage_falcor_dir / "benchmark_summary.json"
-                try:
-                    _update_heartbeat(
-                        heartbeat_path=heartbeat_path,
-                        history_path=heartbeat_history_path,
-                        enabled=heartbeat_enabled,
-                        save_history=heartbeat_history_enabled,
-                        run_context=run_context,
-                        state="falcor_eval_running",
-                        last_event="falcor_stage_end_start",
-                        stage_index=1,
-                        stage_name="single_stage",
-                        epoch=int(args.epochs),
-                        num_epochs=int(args.epochs),
-                        extra={"checkpoint": str(final_ckpt), "output_dir": str(stage_falcor_dir)},
-                    )
-                    stage_summary = _run_falcor_periodic_eval(
-                        checkpoint_path=final_ckpt,
-                        output_dir=stage_falcor_dir,
-                        args=args,
-                        eval_cfg=falcor_periodic_eval_cfg,
-                    )
-                    stage_metrics = _extract_falcor_metrics_from_summary(stage_summary or {})
-                    primary = _falcor_primary_metric_value(stage_metrics)
-                    _append_jsonl(
-                        falcor_periodic_history_path,
-                        {
-                            "timestamp": _now_iso(),
-                            "kind": "stage_end_full",
-                            "stage_index": 1,
-                            "stage_name": "single_stage",
-                            "epoch": int(args.epochs),
-                            "metric_name": falcor_best_metric_name,
-                            "metric_value": float(primary) if np.isfinite(primary) else None,
-                            "metrics": stage_metrics,
-                            "summary": str(stage_end_summary_path),
-                            "checkpoint": str(final_ckpt),
-                        },
-                    )
-                    if _falcor_is_better(primary):
-                        _update_falcor_best(
-                            checkpoint_path=final_ckpt,
-                            summary_path=stage_end_summary_path,
-                            metric_value=float(primary),
-                            stage_index=1,
-                            stage_name="single_stage",
-                            epoch=int(args.epochs),
-                            kind="stage_end_full",
-                        )
-                    _update_heartbeat(
-                        heartbeat_path=heartbeat_path,
-                        history_path=heartbeat_history_path,
-                        enabled=heartbeat_enabled,
-                        save_history=heartbeat_history_enabled,
-                        run_context=run_context,
-                        state="running",
-                        last_event="falcor_stage_end_success",
-                        stage_index=1,
-                        stage_name="single_stage",
-                        epoch=int(args.epochs),
-                        num_epochs=int(args.epochs),
-                        metrics={"falcor_primary": float(primary) if np.isfinite(primary) else 0.0},
-                        extra={"summary": str(stage_end_summary_path)},
-                    )
-                except subprocess.TimeoutExpired as timeout_error:
-                    timeout_path = stage_falcor_dir / "timeout.json"
-                    timeout_path.write_text(
-                        json.dumps(
-                            {
-                                "kind": "falcor_stage_end_timeout",
-                                "stage": "single_stage",
-                                "epoch": int(args.epochs),
-                                "timeout_seconds": int(falcor_periodic_eval_cfg.get("timeout_seconds", 1800)),
-                                "error": str(timeout_error),
-                                "timestamp": _now_iso(),
-                            },
-                            ensure_ascii=False,
-                            indent=2,
-                        ),
-                        encoding="utf-8",
-                    )
-                    _update_heartbeat(
-                        heartbeat_path=heartbeat_path,
-                        history_path=heartbeat_history_path,
-                        enabled=heartbeat_enabled,
-                        save_history=heartbeat_history_enabled,
-                        run_context=run_context,
-                        state="running",
-                        last_event="falcor_stage_end_timeout",
-                        stage_index=1,
-                        stage_name="single_stage",
-                        epoch=int(args.epochs),
-                        num_epochs=int(args.epochs),
-                        extra={"timeout_file": str(timeout_path)},
-                    )
-                    print(
-                        f"Warning: Falcor stage-end eval timeout timeout={falcor_periodic_eval_cfg.get('timeout_seconds', 1800)}s"
-                    )
-                    if bool(falcor_periodic_eval_cfg.get("fail_on_timeout", False)):
-                        raise RuntimeError("Falcor stage-end eval timed out") from timeout_error
-                except Exception as falcor_error:
-                    _update_heartbeat(
-                        heartbeat_path=heartbeat_path,
-                        history_path=heartbeat_history_path,
-                        enabled=heartbeat_enabled,
-                        save_history=heartbeat_history_enabled,
-                        run_context=run_context,
-                        state="running",
-                        last_event="falcor_stage_end_error",
-                        stage_index=1,
-                        stage_name="single_stage",
-                        epoch=int(args.epochs),
-                        num_epochs=int(args.epochs),
-                        extra={"error": str(falcor_error)},
-                    )
-                    print(f"Warning: Falcor stage-end eval failed: {falcor_error}")
-                    if bool(falcor_periodic_eval_cfg.get("fail_on_error", False)):
-                        raise
+        hook_manager.on_stage_end(
+            TrainingEvent(
+                stage_index=1,
+                stage_name="single_stage",
+                epoch=int(args.epochs),
+                num_epochs=int(args.epochs),
+                run_context=run_context,
+                extra={
+                    "stage_dir": str(output_dir),
+                    "stage_slug": "main",
+                },
+            )
+        )
 
         _update_heartbeat(
             heartbeat_path=heartbeat_path,
@@ -3793,436 +2589,26 @@ def run_training(args: argparse.Namespace) -> None:
             encoding="utf-8",
         )
 
-    if (
-        trainer is not None
-        and bool(val_profiles_cfg.get("enabled", False))
-        and bool(val_profiles_cfg.get("run_test_compare", False))
-    ):
-        try:
-            _update_heartbeat(
-                heartbeat_path=heartbeat_path,
-                history_path=heartbeat_history_path,
-                enabled=heartbeat_enabled,
-                save_history=heartbeat_history_enabled,
-                run_context=run_context,
-                state="profile_test_compare_running",
-                last_event="profile_test_compare_start",
-                stage_index=int(len(staged_specs)) if staged_specs else 1,
-                stage_name="staged" if staged_specs else "single_stage",
-                epoch=int(args.epochs),
-                num_epochs=int(args.epochs),
-            )
-            val_profile_test_compare = _run_profile_test_compare(
-                trainer=trainer,
-                model=model,
-                test_loader=test_loader,
-                output_dir=output_dir,
-                profile_cfg=val_profiles_cfg,
-            )
-            if val_profile_test_compare is not None:
-                _update_heartbeat(
-                    heartbeat_path=heartbeat_path,
-                    history_path=heartbeat_history_path,
-                    enabled=heartbeat_enabled,
-                    save_history=heartbeat_history_enabled,
-                    run_context=run_context,
-                    state="running",
-                    last_event="profile_test_compare_success",
-                    stage_index=int(len(staged_specs)) if staged_specs else 1,
-                    stage_name="staged" if staged_specs else "single_stage",
-                    epoch=int(args.epochs),
-                    num_epochs=int(args.epochs),
-                    extra={"summary": str(output_dir / "val_profile_test_compare.json")},
-                )
-        except Exception as compare_error:
-            _update_heartbeat(
-                heartbeat_path=heartbeat_path,
-                history_path=heartbeat_history_path,
-                enabled=heartbeat_enabled,
-                save_history=heartbeat_history_enabled,
-                run_context=run_context,
-                state="running",
-                last_event="profile_test_compare_error",
-                stage_index=int(len(staged_specs)) if staged_specs else 1,
-                stage_name="staged" if staged_specs else "single_stage",
-                epoch=int(args.epochs),
-                num_epochs=int(args.epochs),
-                extra={"error": str(compare_error)},
-            )
-            print(f"Warning: val profile test compare failed: {compare_error}")
+    hook_manager.on_run_audits(
+        TrainingEvent(
+            stage_index=int(len(staged_specs)) if staged_specs else 1,
+            stage_name="staged" if staged_specs else "single_stage",
+            epoch=int(args.epochs),
+            num_epochs=int(args.epochs),
+            run_context=run_context,
+            extra={
+                "trainer": trainer,
+                "model": model,
+                "test_loader": test_loader,
+            },
+        )
+    )
 
-    coeff_suite_summary: Dict[str, Any] | None = None
-    coeff_suite_multi_summary: Dict[str, Any] | None = None
-    expert_util_summary: Dict[str, Any] | None = None
-    semantic_drift_summary: Dict[str, Any] | None = None
-    if bool(coeff_suite_cfg.get("enabled", False)) and bool(coeff_suite_cfg.get("run_after_training", True)):
-        timeout_seconds = int(coeff_suite_cfg.get("timeout_seconds", 1800))
-        configured_ckpts = [str(x) for x in coeff_suite_cfg.get("checkpoints", [])]
-        auto_ckpts: List[str] = []
-        if global_best_track_falcor:
-            auto_ckpts.append(str(global_best_falcor_ckpt_path.name))
-        if global_best_track_soft:
-            auto_ckpts.append(str(global_best_soft_ckpt_path.name))
-        auto_ckpts.extend(["best_model.pt", "last_model.pt"])
-        raw_candidates = configured_ckpts if configured_ckpts else auto_ckpts
-
-        def _resolve_suite_checkpoint(raw_name: str) -> Path:
-            token = str(raw_name).strip()
-            alias = token.lower()
-            alias_map = {
-                "global_best_falcor": global_best_falcor_ckpt_path,
-                "global_best_falcor.pt": global_best_falcor_ckpt_path,
-                "global_best_soft": global_best_soft_ckpt_path,
-                "global_best_soft_profile": global_best_soft_ckpt_path,
-                "global_best_soft.pt": global_best_soft_ckpt_path,
-                "best_model": output_dir / "best_model.pt",
-                "best_model.pt": output_dir / "best_model.pt",
-                "last_model": output_dir / "last_model.pt",
-                "last_model.pt": output_dir / "last_model.pt",
-            }
-            if alias in alias_map:
-                return alias_map[alias]
-            ckpt = Path(token)
-            if not ckpt.is_absolute():
-                ckpt = output_dir / ckpt
-            return ckpt
-
-        suite_runs: List[Dict[str, Any]] = []
-        seen_suite_paths: set[str] = set()
-        successful_runs = 0
-        for raw_name in raw_candidates:
-            suite_ckpt = _resolve_suite_checkpoint(raw_name)
-            if suite_ckpt.exists():
-                key = str(suite_ckpt.resolve())
-            else:
-                key = str(suite_ckpt)
-            if key in seen_suite_paths:
-                continue
-            seen_suite_paths.add(key)
-
-            label_base = str(Path(str(raw_name)).stem or str(raw_name))
-            label = _sanitize_stage_name(label_base)
-            if not suite_ckpt.exists():
-                suite_runs.append(
-                    {
-                        "name": label,
-                        "checkpoint": str(suite_ckpt),
-                        "exists": False,
-                        "status": "missing",
-                    }
-                )
-                continue
-
-            if successful_runs == 0:
-                suite_out_dir = output_dir / "diagnostics" / "coeff_suite"
-            else:
-                suite_out_dir = output_dir / "diagnostics" / "coeff_suite_multi" / f"{successful_runs:02d}_{label}"
-            try:
-                _update_heartbeat(
-                    heartbeat_path=heartbeat_path,
-                    history_path=heartbeat_history_path,
-                    enabled=heartbeat_enabled,
-                    save_history=heartbeat_history_enabled,
-                    run_context=run_context,
-                    state="coeff_suite_running",
-                    last_event="coeff_suite_start",
-                    stage_index=int(len(staged_specs)) if staged_specs else 1,
-                    stage_name="staged" if staged_specs else "single_stage",
-                    epoch=int(args.epochs),
-                    num_epochs=int(args.epochs),
-                    extra={"checkpoint": str(suite_ckpt), "output_dir": str(suite_out_dir), "name": label},
-                )
-                summary_obj = _run_coeff_suite(
-                    checkpoint_path=suite_ckpt,
-                    output_dir=suite_out_dir,
-                    args=args,
-                    suite_cfg=coeff_suite_cfg,
-                    timeout_seconds=timeout_seconds,
-                )
-                metrics_obj = _coeff_suite_metrics_from_summary(summary_obj or {})
-                if rerun_logger is not None and metrics_obj:
-                    rerun_logger.log_scalars(int(args.epochs), metrics_obj, f"coeff_suite/{label}")
-                _append_jsonl(
-                    phase0_metrics_path,
-                    {
-                        "timestamp": _now_iso(),
-                        "kind": "coeff_suite",
-                        "stage_index": int(len(staged_specs)) if staged_specs else 1,
-                        "stage_name": "staged" if staged_specs else "single_stage",
-                        "epoch": int(args.epochs),
-                        "num_epochs": int(args.epochs),
-                        "metrics": metrics_obj,
-                        "summary": str(suite_out_dir / "phase1_summary.json"),
-                        "checkpoint": str(suite_ckpt),
-                        "name": label,
-                    },
-                )
-                _update_heartbeat(
-                    heartbeat_path=heartbeat_path,
-                    history_path=heartbeat_history_path,
-                    enabled=heartbeat_enabled,
-                    save_history=heartbeat_history_enabled,
-                    run_context=run_context,
-                    state="running",
-                    last_event="coeff_suite_success",
-                    stage_index=int(len(staged_specs)) if staged_specs else 1,
-                    stage_name="staged" if staged_specs else "single_stage",
-                    epoch=int(args.epochs),
-                    num_epochs=int(args.epochs),
-                    metrics=metrics_obj,
-                    extra={"summary": str(suite_out_dir / "phase1_summary.json"), "checkpoint": str(suite_ckpt), "name": label},
-                )
-                suite_runs.append(
-                    {
-                        "name": label,
-                        "checkpoint": str(suite_ckpt),
-                        "exists": True,
-                        "status": "success",
-                        "summary": str(suite_out_dir / "phase1_summary.json"),
-                        "metrics": metrics_obj,
-                    }
-                )
-                if coeff_suite_summary is None:
-                    coeff_suite_summary = summary_obj
-                successful_runs += 1
-            except subprocess.TimeoutExpired as timeout_error:
-                timeout_path = output_dir / "diagnostics" / "coeff_suite_multi" / f"{label}_timeout.json"
-                timeout_payload = {
-                    "kind": "coeff_suite_timeout",
-                    "timeout_seconds": timeout_seconds,
-                    "error": str(timeout_error),
-                    "checkpoint": str(suite_ckpt),
-                    "name": label,
-                    "timestamp": _now_iso(),
-                }
-                timeout_path.parent.mkdir(parents=True, exist_ok=True)
-                timeout_path.write_text(json.dumps(timeout_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-                _update_heartbeat(
-                    heartbeat_path=heartbeat_path,
-                    history_path=heartbeat_history_path,
-                    enabled=heartbeat_enabled,
-                    save_history=heartbeat_history_enabled,
-                    run_context=run_context,
-                    state="running",
-                    last_event="coeff_suite_timeout",
-                    stage_index=int(len(staged_specs)) if staged_specs else 1,
-                    stage_name="staged" if staged_specs else "single_stage",
-                    epoch=int(args.epochs),
-                    num_epochs=int(args.epochs),
-                    extra={"timeout_file": str(timeout_path), "checkpoint": str(suite_ckpt), "name": label},
-                )
-                suite_runs.append(
-                    {
-                        "name": label,
-                        "checkpoint": str(suite_ckpt),
-                        "exists": True,
-                        "status": "timeout",
-                        "timeout_file": str(timeout_path),
-                    }
-                )
-                print(f"Warning: coeff suite timed out timeout={timeout_seconds}s checkpoint={suite_ckpt}")
-                if bool(coeff_suite_cfg.get("fail_on_timeout", False)):
-                    raise RuntimeError("Coeff suite timed out") from timeout_error
-            except Exception as coeff_error:
-                _update_heartbeat(
-                    heartbeat_path=heartbeat_path,
-                    history_path=heartbeat_history_path,
-                    enabled=heartbeat_enabled,
-                    save_history=heartbeat_history_enabled,
-                    run_context=run_context,
-                    state="running",
-                    last_event="coeff_suite_error",
-                    stage_index=int(len(staged_specs)) if staged_specs else 1,
-                    stage_name="staged" if staged_specs else "single_stage",
-                    epoch=int(args.epochs),
-                    num_epochs=int(args.epochs),
-                    extra={"error": str(coeff_error), "checkpoint": str(suite_ckpt), "name": label},
-                )
-                suite_runs.append(
-                    {
-                        "name": label,
-                        "checkpoint": str(suite_ckpt),
-                        "exists": True,
-                        "status": "error",
-                        "error": str(coeff_error),
-                    }
-                )
-                print(f"Warning: coeff suite failed checkpoint={suite_ckpt}: {coeff_error}")
-
-        if suite_runs:
-            coeff_suite_multi_summary = {
-                "timestamp": _now_iso(),
-                "configured_checkpoints": configured_ckpts,
-                "resolved_default_checkpoints": auto_ckpts,
-                "runs": suite_runs,
-            }
-            multi_summary_path = output_dir / "diagnostics" / "coeff_suite_multi" / "coeff_suite_multi_summary.json"
-            multi_summary_path.parent.mkdir(parents=True, exist_ok=True)
-            multi_summary_path.write_text(
-                json.dumps(coeff_suite_multi_summary, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-
-    def _resolve_audit_profiles(explicit_profiles: List[Dict[str, Any]] | None) -> List[Dict[str, Any]]:
-        if explicit_profiles:
-            return explicit_profiles
-        if bool(val_profiles_cfg.get("enabled", False)):
-            return list(val_profiles_cfg.get("profiles", []))
-        return [
-            {
-                "name": f"hard{int(args.top_k)}",
-                "top_k": int(args.top_k),
-                "training_soft_routing": False,
-                "routing_soft_topk": None,
-                "routing_temperature": None,
-            }
-        ]
-
-    best_ckpt = output_dir / "best_model.pt"
-    last_ckpt = output_dir / "last_model.pt"
-
-    if bool(expert_util_cfg.get("enabled", False)) and bool(expert_util_cfg.get("run_after_training", True)):
-        cfg_ckpt = expert_util_cfg.get("checkpoint", None)
-        if cfg_ckpt:
-            ckpt_path = Path(str(cfg_ckpt))
-            if not ckpt_path.is_absolute():
-                ckpt_path = output_dir / ckpt_path
-        else:
-            ckpt_path = best_ckpt if best_ckpt.exists() else last_ckpt
-        if ckpt_path.exists():
-            audit_profiles = _resolve_audit_profiles(list(expert_util_cfg.get("profiles", [])))
-            out_path = output_dir / "diagnostics" / "expert_utilization" / "expert_utilization_summary.json"
-            timeout_seconds = int(expert_util_cfg.get("timeout_seconds", 900))
-            try:
-                _update_heartbeat(
-                    heartbeat_path=heartbeat_path,
-                    history_path=heartbeat_history_path,
-                    enabled=heartbeat_enabled,
-                    save_history=heartbeat_history_enabled,
-                    run_context=run_context,
-                    state="expert_utilization_audit_running",
-                    last_event="expert_utilization_audit_start",
-                    stage_index=int(len(staged_specs)) if staged_specs else 1,
-                    stage_name="staged" if staged_specs else "single_stage",
-                    epoch=int(args.epochs),
-                    num_epochs=int(args.epochs),
-                    extra={"checkpoint": str(ckpt_path), "summary": str(out_path)},
-                )
-                expert_util_summary = _run_expert_utilization_audit(
-                    checkpoint_path=ckpt_path,
-                    output_json_path=out_path,
-                    args=args,
-                    audit_cfg=expert_util_cfg,
-                    profiles=audit_profiles,
-                    timeout_seconds=timeout_seconds,
-                )
-                expert_metrics = _expert_util_metrics_from_summary(expert_util_summary or {})
-                if rerun_logger is not None and expert_metrics:
-                    rerun_logger.log_scalars(int(args.epochs), expert_metrics, "expert_utilization")
-                _append_jsonl(
-                    phase0_metrics_path,
-                    {
-                        "timestamp": _now_iso(),
-                        "kind": "expert_utilization_audit",
-                        "stage_index": int(len(staged_specs)) if staged_specs else 1,
-                        "stage_name": "staged" if staged_specs else "single_stage",
-                        "epoch": int(args.epochs),
-                        "num_epochs": int(args.epochs),
-                        "metrics": expert_metrics,
-                        "summary": str(out_path),
-                    },
-                )
-                _update_heartbeat(
-                    heartbeat_path=heartbeat_path,
-                    history_path=heartbeat_history_path,
-                    enabled=heartbeat_enabled,
-                    save_history=heartbeat_history_enabled,
-                    run_context=run_context,
-                    state="running",
-                    last_event="expert_utilization_audit_success",
-                    stage_index=int(len(staged_specs)) if staged_specs else 1,
-                    stage_name="staged" if staged_specs else "single_stage",
-                    epoch=int(args.epochs),
-                    num_epochs=int(args.epochs),
-                    metrics=expert_metrics,
-                    extra={"summary": str(out_path)},
-                )
-            except subprocess.TimeoutExpired as timeout_error:
-                timeout_path = output_dir / "diagnostics" / "expert_utilization_timeout.json"
-                timeout_path.parent.mkdir(parents=True, exist_ok=True)
-                timeout_path.write_text(
-                    json.dumps(
-                        {
-                            "kind": "expert_utilization_timeout",
-                            "timeout_seconds": timeout_seconds,
-                            "error": str(timeout_error),
-                            "timestamp": _now_iso(),
-                        },
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                    encoding="utf-8",
-                )
-                print(f"Warning: expert utilization audit timed out timeout={timeout_seconds}s")
-                if bool(expert_util_cfg.get("fail_on_timeout", False)):
-                    raise RuntimeError("expert utilization audit timed out") from timeout_error
-            except Exception as audit_error:
-                print(f"Warning: expert utilization audit failed: {audit_error}")
-
-    if bool(semantic_drift_cfg.get("enabled", False)) and bool(semantic_drift_cfg.get("run_after_training", True)):
-        pairs = list(semantic_drift_cfg.get("pairs", []))
-        if not pairs and best_ckpt.exists() and last_ckpt.exists():
-            pairs = [
-                {
-                    "name": "best_vs_last",
-                    "checkpoint_a": str(best_ckpt),
-                    "checkpoint_b": str(last_ckpt),
-                }
-            ]
-        drift_profiles = _resolve_audit_profiles(list(semantic_drift_cfg.get("profiles", [])))
-        pair_summaries: Dict[str, Any] = {}
-        timeout_seconds = int(semantic_drift_cfg.get("timeout_seconds", 1200))
-        for pair in pairs:
-            pair_name = str(pair.get("name", "pair"))
-            ckpt_a = Path(str(pair.get("checkpoint_a", "")))
-            ckpt_b = Path(str(pair.get("checkpoint_b", "")))
-            if not ckpt_a.is_absolute():
-                ckpt_a = output_dir / ckpt_a
-            if not ckpt_b.is_absolute():
-                ckpt_b = output_dir / ckpt_b
-            if not ckpt_a.exists() or not ckpt_b.exists():
-                print(f"Warning: semantic drift pair skipped (missing ckpt): {pair_name}")
-                continue
-            out_path = output_dir / "diagnostics" / "semantic_drift" / f"{_sanitize_stage_name(pair_name)}.json"
-            try:
-                pair_summary = _run_semantic_drift_audit(
-                    checkpoint_a=ckpt_a,
-                    checkpoint_b=ckpt_b,
-                    output_json_path=out_path,
-                    pair_name=pair_name,
-                    args=args,
-                    audit_cfg=semantic_drift_cfg,
-                    profiles=drift_profiles,
-                    timeout_seconds=timeout_seconds,
-                )
-                if pair_summary is not None:
-                    pair_summaries[pair_name] = pair_summary
-            except subprocess.TimeoutExpired as timeout_error:
-                print(f"Warning: semantic drift audit timed out for {pair_name}: {timeout_error}")
-                if bool(semantic_drift_cfg.get("fail_on_timeout", False)):
-                    raise RuntimeError(f"semantic drift audit timed out for {pair_name}") from timeout_error
-            except Exception as drift_error:
-                print(f"Warning: semantic drift audit failed for {pair_name}: {drift_error}")
-        if pair_summaries:
-            semantic_drift_summary = {
-                "pairs": pair_summaries,
-                "meta": {
-                    "num_pairs": int(len(pair_summaries)),
-                },
-            }
-            summary_path = output_dir / "diagnostics" / "semantic_drift" / "semantic_drift_summary.json"
-            summary_path.parent.mkdir(parents=True, exist_ok=True)
-            summary_path.write_text(json.dumps(semantic_drift_summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    val_profile_test_compare = post_training_audit_hook.outputs.val_profile_test_compare
+    coeff_suite_summary: Dict[str, Any] | None = post_training_audit_hook.outputs.coeff_suite_summary
+    coeff_suite_multi_summary: Dict[str, Any] | None = post_training_audit_hook.outputs.coeff_suite_multi_summary
+    expert_util_summary: Dict[str, Any] | None = post_training_audit_hook.outputs.expert_util_summary
+    semantic_drift_summary: Dict[str, Any] | None = post_training_audit_hook.outputs.semantic_drift_summary
 
     if args.print_history:
         print("Train history (last epoch):", {k: v[-1] for k, v in history["train"].items()})
@@ -4332,6 +2718,7 @@ def run_training(args: argparse.Namespace) -> None:
             "lambda_temporal": args.lambda_temporal,
             "lambda_linearity": args.lambda_linearity,
             "linearity_aug_pairs": args.linearity_aug_pairs,
+            "linearity_every_steps": int(getattr(args, "linearity_every_steps", 4)),
             "lambda_spatial": args.lambda_spatial,
             "spatial_k": args.spatial_k,
             "lambda_image": args.lambda_image,
@@ -4342,10 +2729,22 @@ def run_training(args: argparse.Namespace) -> None:
             "routing_temp_start": args.routing_temp_start,
             "routing_temp_end": args.routing_temp_end,
             "routing_temp_anneal_epochs": args.routing_temp_anneal_epochs,
+            "train_routing_param_mode": str(getattr(args, "train_routing_param_mode", "gather")),
+            "contraction_mode": str(getattr(args, "contraction_mode", "fused")),
+            "cuda_graph_train": bool(getattr(args, "cuda_graph_train", False)),
+            "cuda_graph_mode": str(getattr(args, "cuda_graph_mode", "dual")),
+            "cuda_graph_warmup_steps": int(getattr(args, "cuda_graph_warmup_steps", 10)),
+            "cuda_graph_fallback_eager": bool(getattr(args, "cuda_graph_fallback_eager", True)),
             "image_loss_type": args.image_loss_type,
+            "image_loss_huber_delta": float(getattr(args, "image_loss_huber_delta", 0.1)),
+            "image_loss_domain": str(getattr(args, "image_loss_domain", "radiance")),
             "image_samples": args.image_samples,
             "image_sample_seed": args.image_sample_seed,
+            "image_sampling_mode": str(getattr(args, "image_sampling_mode", "fixed")),
             "image_loss_space": args.image_loss_space,
+            "image_soft_saturation_enabled": bool(getattr(args, "image_soft_saturation_enabled", False)),
+            "image_soft_saturation_mode": str(getattr(args, "image_soft_saturation_mode", "exp")),
+            "image_soft_saturation_k": float(getattr(args, "image_soft_saturation_k", 1.0)),
             "enable_weighted_sh_loss": args.enable_weighted_sh_loss,
             "sh_loss_weights": args.sh_loss_weights,
             "sh_weight_mode": args.sh_weight_mode,
@@ -4402,6 +2801,105 @@ def run_training(args: argparse.Namespace) -> None:
             "proxy_image_loss_warmup_epochs": int(proxy_image_loss_cfg.get("warmup_epochs", 0)),
             "proxy_image_loss_mix_mode": str(proxy_image_loss_cfg.get("mix_mode", "linear_log_mix")),
             "proxy_image_loss_log_mix_weight": float(proxy_image_loss_cfg.get("log_mix_weight", 0.3)),
+            "proxy_image_loss_type": str(proxy_image_loss_cfg.get("loss_type", getattr(args, "image_loss_type", "mse"))),
+            "proxy_image_loss_huber_delta": float(
+                proxy_image_loss_cfg.get("huber_delta", getattr(args, "image_loss_huber_delta", 0.1))
+            ),
+            "proxy_image_loss_domain": str(
+                proxy_image_loss_cfg.get("domain", getattr(args, "image_loss_domain", "radiance"))
+            ),
+            "proxy_image_sampling_mode": str(
+                proxy_image_loss_cfg.get("sampling_mode", getattr(args, "image_sampling_mode", "fixed"))
+            ),
+            "proxy_image_soft_saturation_enabled": bool(
+                proxy_image_loss_cfg.get(
+                    "soft_saturation_enabled",
+                    getattr(args, "image_soft_saturation_enabled", False),
+                )
+            ),
+            "proxy_image_soft_saturation_mode": str(
+                proxy_image_loss_cfg.get(
+                    "soft_saturation_mode",
+                    getattr(args, "image_soft_saturation_mode", "exp"),
+                )
+            ),
+            "proxy_image_soft_saturation_k": float(
+                proxy_image_loss_cfg.get("soft_saturation_k", getattr(args, "image_soft_saturation_k", 1.0))
+            ),
+            "gbuffer_image_loss_enabled": bool(gbuffer_image_loss_cfg.get("enabled", False)),
+            "gbuffer_image_loss_lambda": float(gbuffer_image_loss_cfg.get("lambda", 0.0)),
+            "gbuffer_image_loss_warmup_epochs": int(gbuffer_image_loss_cfg.get("warmup_epochs", 0)),
+            "gbuffer_image_loss_every_steps": int(gbuffer_image_loss_cfg.get("every_steps", 16)),
+            "gbuffer_image_loss_type": str(gbuffer_image_loss_cfg.get("loss_type", "charbonnier")),
+            "gbuffer_image_loss_pixel_sample_count": int(gbuffer_image_loss_cfg.get("pixel_sample_count", 8192)),
+            "gbuffer_image_loss_dataset_root": str(gbuffer_image_loss_cfg.get("dataset_root", "")),
+            "gbuffer_image_loss_domain": str(gbuffer_image_loss_cfg.get("domain", "linear")),
+            "gbuffer_image_loss_gt_color_space": str(gbuffer_image_loss_cfg.get("gt_color_space", "linear")),
+            "gbuffer_image_loss_strict_keys": bool(gbuffer_image_loss_cfg.get("strict_keys", True)),
+            "gbuffer_image_loss_pos_key": str(gbuffer_image_loss_cfg.get("pos_key", "posW")),
+            "gbuffer_image_loss_normal_key": str(gbuffer_image_loss_cfg.get("normal_key", "normW")),
+            "gbuffer_image_loss_albedo_key": str(gbuffer_image_loss_cfg.get("albedo_key", "albedo")),
+            "gbuffer_image_loss_gt_linear_key": str(gbuffer_image_loss_cfg.get("gt_linear_key", "gt_linear")),
+            "gbuffer_image_loss_light_params_key": str(
+                gbuffer_image_loss_cfg.get("light_params_key", "light_params")
+            ),
+            "gbuffer_image_loss_light_mask_key": str(gbuffer_image_loss_cfg.get("light_mask_key", "light_mask")),
+            "gbuffer_image_loss_valid_mask_key": str(gbuffer_image_loss_cfg.get("valid_mask_key", "valid_mask")),
+            "gbuffer_image_loss_frame_idx_key": str(gbuffer_image_loss_cfg.get("frame_idx_key", "frame_idx")),
+            "gbuffer_image_loss_config_idx_key": str(gbuffer_image_loss_cfg.get("config_idx_key", "config_idx")),
+            "gbuffer_image_loss_target_source": str(gbuffer_image_loss_cfg.get("target_source", "dataset_sh")),
+            "gbuffer_image_loss_gt_knn": int(gbuffer_image_loss_cfg.get("gt_knn", 8)),
+            "gbuffer_image_loss_gt_weight_eps": float(gbuffer_image_loss_cfg.get("gt_weight_eps", 0.1)),
+            "gbuffer_image_loss_gt_chunk_size": int(gbuffer_image_loss_cfg.get("gt_chunk_size", 32768)),
+            "proxy_gbuffer_handover_enabled": bool(proxy_gbuffer_handover_cfg.get("enabled", False)),
+            "proxy_gbuffer_handover_start_epoch": int(proxy_gbuffer_handover_cfg.get("start_epoch", 160)),
+            "proxy_gbuffer_handover_end_epoch": int(proxy_gbuffer_handover_cfg.get("end_epoch", 220)),
+            "proxy_gbuffer_handover_proxy_start_scale": float(
+                proxy_gbuffer_handover_cfg.get("proxy_start_scale", 1.0)
+            ),
+            "proxy_gbuffer_handover_proxy_end_scale": float(
+                proxy_gbuffer_handover_cfg.get("proxy_end_scale", 0.0)
+            ),
+            "proxy_gbuffer_handover_gbuffer_start_scale": float(
+                proxy_gbuffer_handover_cfg.get("gbuffer_start_scale", 0.0)
+            ),
+            "proxy_gbuffer_handover_gbuffer_end_scale": float(
+                proxy_gbuffer_handover_cfg.get("gbuffer_end_scale", 1.0)
+            ),
+            "loss_effective_contribution_enabled": bool(loss_effective_contribution_cfg.get("enabled", False)),
+            "loss_effective_contribution_ema_decay": float(loss_effective_contribution_cfg.get("ema_decay", 0.98)),
+            "loss_effective_contribution_warmup_steps": int(loss_effective_contribution_cfg.get("warmup_steps", 0)),
+            "loss_effective_contribution_frequency_aware": bool(
+                loss_effective_contribution_cfg.get("frequency_aware", True)
+            ),
+            "loss_effective_contribution_target_ratio_default": float(
+                loss_effective_contribution_cfg.get("target_ratio_default", 0.25)
+            ),
+            "loss_effective_contribution_target_ratios": dict(
+                loss_effective_contribution_cfg.get("target_ratios", {})
+            ),
+            "optimization_monitoring_enabled": bool(optimization_monitoring_cfg.get("enabled", True)),
+            "optimization_monitoring_shared_groups": list(
+                optimization_monitoring_cfg.get("shared_groups", [])
+            ),
+            "optimization_monitoring_grad_diagnostics_every_steps": int(
+                optimization_monitoring_cfg.get("grad_diagnostics_every_steps", 50)
+            ),
+            "optimization_monitoring_update_ratio_every_steps": int(
+                optimization_monitoring_cfg.get("update_ratio_every_steps", 20)
+            ),
+            "optimization_monitoring_spectrum_every_epochs": int(
+                optimization_monitoring_cfg.get("spectrum_every_epochs", 1)
+            ),
+            "optimization_monitoring_pulse_recovery_tolerance": float(
+                optimization_monitoring_cfg.get("pulse_recovery_tolerance", 0.02)
+            ),
+            "optimization_monitoring_pulse_recovery_max_steps": int(
+                optimization_monitoring_cfg.get("pulse_recovery_max_steps", 64)
+            ),
+            "optimization_monitoring_gns_enabled": bool(
+                optimization_monitoring_cfg.get("gns_enabled", True)
+            ),
             "routing_balance_anneal_enabled": bool(routing_balance_anneal_cfg.get("enabled", False)),
             "routing_balance_anneal_start": float(routing_balance_anneal_cfg.get("start", args.lambda_routing_balance)),
             "routing_balance_anneal_end": float(routing_balance_anneal_cfg.get("end", 0.0)),
@@ -4429,6 +2927,15 @@ def run_training(args: argparse.Namespace) -> None:
             "staged_num_stages": int(len(staged_specs)),
             "staged_trainable_groups": [spec["trainable_groups"] for spec in staged_specs],
             "staged_group_lrs": [spec.get("group_lrs", {}) for spec in staged_specs],
+            "profile_train": bool(getattr(args, "profile_train", False)),
+            "profile_dir": getattr(args, "profile_dir", None),
+            "profile_wait": int(getattr(args, "profile_wait", 1)),
+            "profile_warmup": int(getattr(args, "profile_warmup", 1)),
+            "profile_active": int(getattr(args, "profile_active", 3)),
+            "profile_repeat": int(getattr(args, "profile_repeat", 1)),
+            "profile_record_shapes": bool(getattr(args, "profile_record_shapes", False)),
+            "profile_with_stack": bool(getattr(args, "profile_with_stack", False)),
+            "profile_memory": bool(getattr(args, "profile_memory", False)),
         }
 
         try:
@@ -4446,27 +2953,31 @@ def run_training(args: argparse.Namespace) -> None:
         except Exception as e:
             print(f"Warning: Auto-log failed: {e}")
 
-    _finalize_falcor_resources(block=True)
+    hook_manager.on_cleanup(
+        TrainingEvent(
+            stage_index=int(len(staged_specs)) if staged_specs else 1,
+            stage_name="staged" if staged_specs else "single_stage",
+            epoch=int(args.epochs),
+            num_epochs=int(args.epochs),
+            run_context=run_context,
+        )
+    )
     heartbeat_done["value"] = True
-    _update_heartbeat(
-        heartbeat_path=heartbeat_path,
-        history_path=heartbeat_history_path,
-        enabled=heartbeat_enabled,
-        save_history=heartbeat_history_enabled,
-        run_context=run_context,
-        state="finished",
-        last_event="train_end",
-        stage_index=int(len(staged_specs)) if staged_specs else 1,
-        stage_name="staged" if staged_specs else "single_stage",
-        epoch=int(args.epochs),
-        num_epochs=int(args.epochs),
+    hook_manager.on_run_end(
+        TrainingEvent(
+            stage_index=int(len(staged_specs)) if staged_specs else 1,
+            stage_name="staged" if staged_specs else "single_stage",
+            epoch=int(args.epochs),
+            num_epochs=int(args.epochs),
+            run_context=run_context,
+        )
     )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Unified Gaussian-Physics trainer")
 
-    parser.add_argument("--variant", choices=["unified_set"], required=False)
+    parser.add_argument("--variant", choices=list(_VARIANT_REGISTRY.names()), required=False)
     parser.add_argument("--config", default=None, help="YAML config for training")
     parser.add_argument(
         "--schema",
@@ -4509,6 +3020,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup-epochs", type=int, default=0,
                         help="Linear warmup epochs before scheduler stepping.")
     parser.add_argument("--recon-loss", choices=["mse", "l1", "charbonnier"], default=None)
+    parser.add_argument("--recon-weight", type=float, default=1.0)
     parser.add_argument("--charbonnier-eps", type=float, default=1e-3)
     parser.add_argument("--lambda-temporal", type=float, default=None)
     parser.add_argument("--grad-clip", type=float, default=1.0)
@@ -4516,6 +3028,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Weight for superposition linearity loss (requires light mask).")
     parser.add_argument("--linearity-aug-pairs", type=int, default=0,
                         help="Number of on-the-fly linearity augmentation pairs per batch.")
+    parser.add_argument("--linearity-every-steps", type=int, default=4,
+                        help="Evaluate linearity losses every N train steps (>=1).")
     parser.add_argument("--lambda-spatial", type=float, default=0.0,
                         help="Weight for spatial smoothness (KNN-TV) loss.")
     parser.add_argument("--spatial-k", type=int, default=1,
@@ -4539,6 +3053,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Ending soft-routing temperature.")
     parser.add_argument("--routing-temp-anneal-epochs", type=int, default=0,
                         help="Temperature anneal epochs for soft routing (0 disables anneal).")
+    parser.add_argument("--train-routing-param-mode", choices=["gather", "dense_masked"], default="gather",
+                        help="Parameter selection mode for training-time routed forward (eval/test always use gather).")
+    parser.add_argument("--contraction-mode", choices=["legacy", "fused"], default="fused",
+                        help="Low-rank contraction kernel mode in model forward.")
+    parser.add_argument("--cuda-graph-train", action="store_true", dest="cuda_graph_train",
+                        help="Enable CUDA Graph replay for eligible training steps.")
+    parser.add_argument("--no-cuda-graph-train", action="store_false", dest="cuda_graph_train",
+                        help="Disable CUDA Graph replay.")
+    parser.set_defaults(cuda_graph_train=False)
+    parser.add_argument("--cuda-graph-mode", choices=["single", "dual"], default="dual",
+                        help="CUDA Graph mode: single=regular-step only, dual=regular+linearity branches.")
+    parser.add_argument("--cuda-graph-warmup-steps", type=int, default=10,
+                        help="Warmup eager steps per graph branch before capture.")
+    parser.add_argument("--cuda-graph-fallback-eager", action="store_true", dest="cuda_graph_fallback_eager",
+                        help="Fallback to eager step when graph capture/replay is ineligible or fails.")
+    parser.add_argument("--no-cuda-graph-fallback-eager", action="store_false", dest="cuda_graph_fallback_eager",
+                        help="Fail fast instead of eager fallback when graph step cannot run.")
+    parser.set_defaults(cuda_graph_fallback_eager=True)
     parser.add_argument("--amp-mode", choices=["off", "bf16", "fp16"], default="off",
                         help="Mixed precision mode for train/val forward.")
     parser.add_argument("--torch-compile", action="store_true", dest="torch_compile",
@@ -4553,7 +3085,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-torch-compile-dynamic", action="store_false", dest="torch_compile_dynamic",
                         help="Disable dynamic shape support in torch.compile.")
     parser.set_defaults(torch_compile_dynamic=False)
-    parser.add_argument("--grad-norm-log-every-steps", type=int, default=1,
+    parser.add_argument("--profile-train", action="store_true", dest="profile_train",
+                        help="Enable torch.profiler during training loop.")
+    parser.add_argument("--no-profile-train", action="store_false", dest="profile_train",
+                        help="Disable torch.profiler.")
+    parser.set_defaults(profile_train=False)
+    parser.add_argument("--profile-dir", type=str, default=None,
+                        help="Optional profiler output directory (default: <output_dir>/profiling).")
+    parser.add_argument("--profile-wait", type=int, default=1,
+                        help="Profiler schedule wait steps.")
+    parser.add_argument("--profile-warmup", type=int, default=1,
+                        help="Profiler schedule warmup steps.")
+    parser.add_argument("--profile-active", type=int, default=3,
+                        help="Profiler schedule active steps per cycle.")
+    parser.add_argument("--profile-repeat", type=int, default=1,
+                        help="Profiler schedule repeat cycles.")
+    parser.add_argument("--profile-record-shapes", action="store_true", dest="profile_record_shapes",
+                        help="Record operator input shapes in profiler traces.")
+    parser.add_argument("--no-profile-record-shapes", action="store_false", dest="profile_record_shapes",
+                        help="Disable recording operator input shapes.")
+    parser.set_defaults(profile_record_shapes=False)
+    parser.add_argument("--profile-with-stack", action="store_true", dest="profile_with_stack",
+                        help="Capture stack traces for profiled operators (higher overhead).")
+    parser.add_argument("--no-profile-with-stack", action="store_false", dest="profile_with_stack",
+                        help="Disable stack trace capture in profiler.")
+    parser.set_defaults(profile_with_stack=False)
+    parser.add_argument("--profile-memory", action="store_true", dest="profile_memory",
+                        help="Track tensor memory usage in profiler traces.")
+    parser.add_argument("--no-profile-memory", action="store_false", dest="profile_memory",
+                        help="Disable profiler memory tracking.")
+    parser.set_defaults(profile_memory=False)
+    parser.add_argument("--grad-norm-log-every-steps", type=int, default=100,
                         help="Log gradient norms every N steps (0 disables grad norm logging).")
     parser.add_argument("--max-train-batches", type=int, default=0,
                         help="Optional cap on train batches per epoch (0 disables).")
@@ -4572,14 +3134,82 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Max allowed MAE delta between shared and legacy soft profile paths.")
     parser.add_argument("--soft-profile-img-psnr-tolerance", type=float, default=5e-4,
                         help="Max allowed image-PSNR delta between shared and legacy soft profile paths.")
-    parser.add_argument("--image-loss-type", choices=["mse", "charbonnier"], default="mse",
+    parser.add_argument("--image-loss-type", choices=["mse", "charbonnier", "huber"], default="mse",
                         help="Loss type for image-space supervision.")
+    parser.add_argument("--image-loss-huber-delta", type=float, default=0.1,
+                        help="Delta used by Huber image loss when --image-loss-type=huber.")
+    parser.add_argument("--image-loss-domain", choices=["radiance", "irradiance"], default="radiance",
+                        help="Proxy supervision domain: sampled radiance or analytic irradiance.")
     parser.add_argument("--image-samples", type=int, default=64,
                         help="Number of spherical directions sampled per batch for image loss.")
     parser.add_argument("--image-sample-seed", type=int, default=42,
                         help="Random seed for image-loss direction sampling.")
+    parser.add_argument("--image-sampling-mode", choices=["fixed", "per_epoch", "per_step"], default="fixed",
+                        help="Direction sampling policy for image loss.")
     parser.add_argument("--image-loss-space", choices=["linear", "srgb"], default="linear",
                         help="Image space used for image loss/metrics.")
+    parser.add_argument("--image-soft-saturation-enabled", action="store_true",
+                        help="Enable soft saturation before image-loss computation.")
+    parser.add_argument("--no-image-soft-saturation", action="store_false", dest="image_soft_saturation_enabled")
+    parser.set_defaults(image_soft_saturation_enabled=False)
+    parser.add_argument("--image-soft-saturation-mode", choices=["exp"], default="exp",
+                        help="Soft saturation mode for image loss pre-processing.")
+    parser.add_argument("--image-soft-saturation-k", type=float, default=1.0,
+                        help="Slope parameter for soft saturation (exp mode).")
+    parser.add_argument("--gbuffer-image-loss-enabled", action="store_true", dest="gbuffer_image_loss_enabled",
+                        help="Enable auxiliary GBuffer image loss branch.")
+    parser.add_argument("--no-gbuffer-image-loss", action="store_false", dest="gbuffer_image_loss_enabled",
+                        help="Disable auxiliary GBuffer image loss branch.")
+    parser.set_defaults(gbuffer_image_loss_enabled=False)
+    parser.add_argument("--gbuffer-image-loss-lambda", type=float, default=0.0,
+                        help="Weight for auxiliary GBuffer image loss.")
+    parser.add_argument("--gbuffer-image-loss-warmup-epochs", type=int, default=0,
+                        help="Warmup epochs for auxiliary GBuffer image loss weight.")
+    parser.add_argument("--gbuffer-image-loss-every-steps", type=int, default=16,
+                        help="Evaluate auxiliary GBuffer image loss every N train steps.")
+    parser.add_argument("--gbuffer-image-loss-type", choices=["charbonnier"], default="charbonnier",
+                        help="Loss type for auxiliary GBuffer image supervision (fixed to charbonnier).")
+    parser.add_argument("--gbuffer-image-loss-dataset-root", type=str, default="",
+                        help="Path to offline GBuffer supervision dataset root.")
+    parser.add_argument("--gbuffer-image-loss-pixel-sample-count", type=int, default=8192,
+                        help="Number of sampled pixels per GBuffer supervision sample.")
+    parser.add_argument("--gbuffer-image-loss-domain", choices=["linear"], default="linear",
+                        help="Loss domain for GBuffer supervision (currently only linear).")
+    parser.add_argument("--gbuffer-image-loss-gt-color-space", choices=["linear", "srgb"], default="linear",
+                        help="Color space of GT tensor in GBuffer samples.")
+    parser.add_argument("--gbuffer-image-loss-strict-keys", action="store_true",
+                        dest="gbuffer_image_loss_strict_keys",
+                        help="Require exact dataset keys (no fallback aliases) for GBuffer samples.")
+    parser.add_argument("--no-gbuffer-image-loss-strict-keys", action="store_false",
+                        dest="gbuffer_image_loss_strict_keys",
+                        help="Allow fallback alias keys when reading GBuffer samples.")
+    parser.set_defaults(gbuffer_image_loss_strict_keys=True)
+    parser.add_argument("--gbuffer-image-loss-pos-key", type=str, default="posW",
+                        help="Primary key for world-space position tensor in each GBuffer sample.")
+    parser.add_argument("--gbuffer-image-loss-normal-key", type=str, default="normW",
+                        help="Primary key for world-space normal tensor in each GBuffer sample.")
+    parser.add_argument("--gbuffer-image-loss-albedo-key", type=str, default="albedo",
+                        help="Primary key for albedo tensor in each GBuffer sample.")
+    parser.add_argument("--gbuffer-image-loss-gt-linear-key", type=str, default="gt_linear",
+                        help="Primary key for GT image tensor in each GBuffer sample.")
+    parser.add_argument("--gbuffer-image-loss-light-params-key", type=str, default="light_params",
+                        help="Primary key for light-parameter tensor in each GBuffer sample.")
+    parser.add_argument("--gbuffer-image-loss-light-mask-key", type=str, default="light_mask",
+                        help="Primary key for light-mask tensor in each GBuffer sample.")
+    parser.add_argument("--gbuffer-image-loss-valid-mask-key", type=str, default="valid_mask",
+                        help="Primary key for valid-pixel mask in each GBuffer sample.")
+    parser.add_argument("--gbuffer-image-loss-frame-idx-key", type=str, default="frame_idx",
+                        help="Primary key for frame index in each GBuffer sample.")
+    parser.add_argument("--gbuffer-image-loss-config-idx-key", type=str, default="config_idx",
+                        help="Optional config-index key in each GBuffer sample.")
+    parser.add_argument("--gbuffer-image-loss-target-source", choices=["dataset_sh", "gbuffer_linear"], default="dataset_sh",
+                        help="GT/light source for gbuffer loss: dataset_sh (parametric tensor) or gbuffer_linear.")
+    parser.add_argument("--gbuffer-image-loss-gt-knn", type=int, default=8,
+                        help="KNN for GT SH interpolation from probe tensor when target_source=dataset_sh.")
+    parser.add_argument("--gbuffer-image-loss-gt-weight-eps", type=float, default=0.1,
+                        help="Distance epsilon for inverse-distance GT SH interpolation.")
+    parser.add_argument("--gbuffer-image-loss-gt-chunk-size", type=int, default=32768,
+                        help="Chunk size for GT SH interpolation to limit memory usage.")
     parser.add_argument("--enable-weighted-sh-loss", action="store_true",
                         help="Enable basis-weighted SH reconstruction loss.")
     parser.add_argument("--no-weighted-sh-loss", action="store_false", dest="enable_weighted_sh_loss")

@@ -223,6 +223,7 @@ def create_dataloaders_lightset(
     dataloader_multiprocessing_context: Optional[str] = None,
     use_npz_cache: bool = True,
     use_torch_views: bool = True,
+    train_drop_last: bool = False,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     train_dataset = LightSetDataset(
         data_root=data_root,
@@ -274,7 +275,13 @@ def create_dataloaders_lightset(
         if context and context != "none":
             loader_kwargs["multiprocessing_context"] = context
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, **loader_kwargs)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=bool(train_drop_last),
+        **loader_kwargs,
+    )
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, **loader_kwargs)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, **loader_kwargs)
 

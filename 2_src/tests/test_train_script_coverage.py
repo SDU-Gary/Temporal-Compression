@@ -263,6 +263,25 @@ def test_resolve_proxy_and_falcor_periodic_config() -> None:
                         "routing_temperature": 0.18,
                     },
                 },
+                "gbuffer_image_loss": {
+                    "enabled": True,
+                    "lambda": 0.05,
+                    "warmup_epochs": 2,
+                    "every_steps": 8,
+                    "loss_type": "charbonnier",
+                    "dataset_root": "tmp/gbuffer",
+                    "pixel_sample_count": 1024,
+                    "domain": "linear",
+                    "gt_color_space": "linear",
+                    "strict_keys": True,
+                    "pos_key": "posW",
+                    "normal_key": "normW",
+                    "albedo_key": "albedo",
+                    "gt_linear_key": "gt_linear",
+                    "light_params_key": "light_params",
+                    "light_mask_key": "light_mask",
+                    "valid_mask_key": "valid_mask",
+                },
             }
         },
     )
@@ -280,6 +299,15 @@ def test_resolve_proxy_and_falcor_periodic_config() -> None:
     assert falcor_cfg["every_n_epochs"] == 20
     assert falcor_cfg["profile"]["name"] == "soft8_t018"
     assert falcor_cfg["profile"]["routing_temperature"] == 0.18
+
+    gbuffer_cfg = train_script._resolve_gbuffer_image_loss_config(args)
+    assert gbuffer_cfg["enabled"] is True
+    assert gbuffer_cfg["lambda"] == 0.05
+    assert gbuffer_cfg["every_steps"] == 8
+    assert gbuffer_cfg["dataset_root"] == "tmp/gbuffer"
+    assert gbuffer_cfg["domain"] == "linear"
+    assert gbuffer_cfg["gt_color_space"] == "linear"
+    assert gbuffer_cfg["strict_keys"] is True
 
 
 def test_resolve_routing_balance_anneal_config() -> None:
@@ -365,7 +393,7 @@ def test_resolve_performance_config_amp_mode_bool_off() -> None:
         torch_compile=False,
         torch_compile_mode="reduce-overhead",
         torch_compile_dynamic=False,
-        grad_norm_log_every_steps=1,
+        grad_norm_log_every_steps=100,
         enable_soft_profile_sharing=False,
         soft_profile_equiv_check_batches=2,
         soft_profile_mae_tolerance=1e-6,
@@ -380,6 +408,56 @@ def test_resolve_performance_config_amp_mode_bool_off() -> None:
     )
     cfg = train_script._resolve_performance_config(args)
     assert cfg["amp_mode"] == "off"
+
+
+def test_resolve_performance_config_profiler_block() -> None:
+    args = SimpleNamespace(
+        amp_mode="off",
+        torch_compile=False,
+        torch_compile_mode="reduce-overhead",
+        torch_compile_dynamic=False,
+        grad_norm_log_every_steps=100,
+        enable_soft_profile_sharing=False,
+        soft_profile_equiv_check_batches=2,
+        soft_profile_mae_tolerance=1e-6,
+        soft_profile_img_psnr_tolerance=5e-4,
+        profile_train=False,
+        profile_dir=None,
+        profile_wait=1,
+        profile_warmup=1,
+        profile_active=3,
+        profile_repeat=1,
+        profile_record_shapes=False,
+        profile_with_stack=False,
+        profile_memory=False,
+        _config_obj={
+            "training": {
+                "performance": {
+                    "profiler": {
+                        "enabled": True,
+                        "dir": "runs/profiler",
+                        "wait": 2,
+                        "warmup": 2,
+                        "active": 5,
+                        "repeat": 3,
+                        "record_shapes": True,
+                        "with_stack": True,
+                        "profile_memory": True,
+                    }
+                }
+            }
+        },
+    )
+    cfg = train_script._resolve_performance_config(args)
+    assert cfg["profile_train_enabled"] is True
+    assert cfg["profile_dir"] == "runs/profiler"
+    assert cfg["profile_wait_steps"] == 2
+    assert cfg["profile_warmup_steps"] == 2
+    assert cfg["profile_active_steps"] == 5
+    assert cfg["profile_repeat"] == 3
+    assert cfg["profile_record_shapes"] is True
+    assert cfg["profile_with_stack"] is True
+    assert cfg["profile_profile_memory"] is True
 
 
 def test_resolve_expert_and_drift_audit_config() -> None:
