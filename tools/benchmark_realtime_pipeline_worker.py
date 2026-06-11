@@ -245,6 +245,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Field construction backend (commit1 metadata only; logic unchanged)")
     p.add_argument("--gbuffer-mode", choices=["realtime", "reuse_first"], default="realtime",
                    help="GBuffer mode (commit1 metadata only; logic unchanged)")
+    p.add_argument("--gbuffer-pass", choices=["rt", "raster", "auto"], default="rt",
+                   help="GBuffer backend. Default rt preserves historical benchmark behavior.")
 
     p.add_argument("--falcor-python-path", default=None)
     p.add_argument("--sync-gpu", action="store_true", default=False,
@@ -378,17 +380,34 @@ def main() -> None:
         raise RuntimeError("Falcor Testbed not found in worker")
 
     testbed = testbed_cls(width=out_w, height=out_h, create_window=False)
-    graph = testbed.create_render_graph("BenchmarkProbeVolumeWorker")
-    graph.create_pass("GBufferRT", "GBufferRT", {"samplePattern": "Center", "sampleCount": 1})
-    for out_name in (
-        "GBufferRT.posW",
-        "GBufferRT.normW",
-        "GBufferRT.diffuseOpacity",
-        "GBufferRT.emissive",
-        "GBufferRT.depth",
-        "GBufferRT.linearZ",
-    ):
-        graph.mark_output(out_name)
+    if args.gbuffer_pass == "raster":
+        gbuffer_candidates = ["GBufferRaster"]
+    elif args.gbuffer_pass == "auto":
+        gbuffer_candidates = ["GBufferRaster", "GBufferRT"]
+    else:
+        gbuffer_candidates = ["GBufferRT"]
+
+    graph = None
+    gbuffer_pass = ""
+    last_gbuffer_exc: Exception | None = None
+    for cand in gbuffer_candidates:
+        try:
+            cand_graph = testbed.create_render_graph(f"BenchmarkProbeVolumeWorker_{cand}")
+            pass_props = {"samplePattern": "Center", "sampleCount": 1}
+            if cand == "GBufferRaster":
+                pass_props["allowNonRovUav"] = True
+            cand_graph.create_pass(cand, cand, pass_props)
+            for suffix in ("posW", "normW", "diffuseOpacity", "emissive", "depth", "linearZ"):
+                cand_graph.mark_output(f"{cand}.{suffix}")
+            graph = cand_graph
+            gbuffer_pass = cand
+            break
+        except Exception as exc:
+            last_gbuffer_exc = exc
+            if len(gbuffer_candidates) > 1:
+                print(f"[warn] {cand} unavailable; trying next GBuffer backend.")
+    if graph is None or not gbuffer_pass:
+        raise RuntimeError(f"Failed to create GBuffer graph: {last_gbuffer_exc}") from last_gbuffer_exc
     testbed.render_graph = graph
     testbed.load_scene(args.scene)
 
@@ -554,12 +573,12 @@ def main() -> None:
             rendered_gbuffer_this_frame = True
             gbuffer_frames_rendered += 1
 
-            pos_tex = graph.get_output("GBufferRT.posW")
-            norm_tex = graph.get_output("GBufferRT.normW")
-            alb_tex = graph.get_output("GBufferRT.diffuseOpacity")
-            emi_tex = graph.get_output("GBufferRT.emissive")
-            dep_tex = graph.get_output("GBufferRT.depth")
-            lin_tex = graph.get_output("GBufferRT.linearZ")
+            pos_tex = graph.get_output(f"{gbuffer_pass}.posW")
+            norm_tex = graph.get_output(f"{gbuffer_pass}.normW")
+            alb_tex = graph.get_output(f"{gbuffer_pass}.diffuseOpacity")
+            emi_tex = graph.get_output(f"{gbuffer_pass}.emissive")
+            dep_tex = graph.get_output(f"{gbuffer_pass}.depth")
+            lin_tex = graph.get_output(f"{gbuffer_pass}.linearZ")
 
             if gbuffer_mode == "reuse_first" and gbuffer_cache is None:
                 gbuffer_cache = (pos_tex, norm_tex, alb_tex, emi_tex, dep_tex, lin_tex)
@@ -905,6 +924,8 @@ def main() -> None:
         "benchmark_frames": int(len(frame_rows)),
         "field_builder": str(args.field_builder),
         "gbuffer_mode": str(args.gbuffer_mode),
+        "gbuffer_pass": str(gbuffer_pass),
+        "requested_gbuffer_pass": str(args.gbuffer_pass),
         "normal_transform": str(args.normal_transform),
         "cosine_mode": str(args.cosine_mode),
         "sh_debug_coeff": int(args.sh_debug_coeff),

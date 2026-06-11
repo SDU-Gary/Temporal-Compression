@@ -1,0 +1,35 @@
+{
+  "aliases": {
+    "a2_peak": "../../../3_experiments/results/thesis_visuals/20260427/a2_peak_f23/sampled_npz/frame_0023.npz",
+    "a2_tail": "../../../3_experiments/results/thesis_visuals/20260427/a2_tail_f23/sampled_npz/frame_0023.npz",
+    "a22a_tail": "../../../3_experiments/results/thesis_visuals/20260427/a22a_tail_f23/sampled_npz/frame_0023.npz"
+  },
+  "column_titles": ["GT", "A2 Peak", "A2 Tail", "A2.2-A Tail"],
+  "row_titles": ["Pred", "Err"],
+  "layout": {
+    "cell_size": [640, 360],
+    "outer_padding": 28,
+    "cell_gap": 16,
+    "row_title_width": 160,
+    "col_title_height": 44
+  },
+  "error_map": {
+    "source_space": "srgb",
+    "percentile": 99.0,
+    "colormap": "turbo"
+  },
+  "rows": [
+    [
+      {"kind": "gt", "npz": "a2_peak"},
+      {"kind": "pred", "npz": "a2_peak"},
+      {"kind": "pred", "npz": "a2_tail"},
+      {"kind": "pred", "npz": "a22a_tail"}
+    ],
+    [
+      {"kind": "blank"},
+      {"kind": "err", "npz": "a2_peak"},
+      {"kind": "err", "npz": "a2_tail"},
+      {"kind": "err", "npz": "a22a_tail"}
+    ]
+  ]
+}

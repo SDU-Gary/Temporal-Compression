@@ -1,0 +1,67 @@
+# Sponza OBJ scene wrapper for PG-CPL data generation and benchmarking.
+#
+# Environment overrides:
+#   SPONZA_OBJ=/path/to/sponza.obj
+#   SPONZA_SUN_INTENSITY=4.0
+#   SPONZA_LAMP_INTENSITY=1200000
+#   SPONZA_FAR_PLANE=12000
+
+import os
+
+
+def _parse_float(name, default):
+    val = os.environ.get(name, "")
+    try:
+        return float(val) if val != "" else float(default)
+    except Exception:
+        return float(default)
+
+
+def _parse_vec3(name, default):
+    val = os.environ.get(name, "")
+    if not val:
+        return default
+    try:
+        parts = [float(x.strip()) for x in val.split(",")]
+        if len(parts) == 3:
+            return float3(parts[0], parts[1], parts[2])
+    except Exception:
+        pass
+    return default
+
+
+scene_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+falcor_obj = os.path.abspath(os.path.join(scene_dir, "..", "..", "scenes", "Sponza", "sponza_falcor.obj"))
+raw_obj = os.path.abspath(os.path.join(scene_dir, "..", "..", "scenes", "Sponza", "sponza.obj"))
+default_obj = falcor_obj if os.path.exists(falcor_obj) else raw_obj
+scene_path = os.environ.get("SPONZA_OBJ", default_obj)
+sceneBuilder.importScene(scene_path)
+
+# Low-intensity environment fill keeps previews readable without dominating the
+# explicit sun/lamp pair used by the dataset generator.
+try:
+    sceneBuilder.envMap = EnvMap()
+    sceneBuilder.envMap.intensity = _parse_float("SPONZA_ENV_INTENSITY", 0.02)
+except Exception:
+    pass
+
+sun = DistantLight("Sun")
+sun.direction = _parse_vec3("SPONZA_SUN_DIR", float3(-0.35, -0.8, -0.35))
+sun.intensity = float3(_parse_float("SPONZA_SUN_INTENSITY", 4.0))
+sun.angle = _parse_float("SPONZA_SUN_ANGLE", 0.08)
+sceneBuilder.addLight(sun)
+
+lamp = PointLight("Lamp")
+lamp.position = _parse_vec3("SPONZA_LAMP_POS", float3(-350.0, 520.0, 120.0))
+lamp.intensity = float3(_parse_float("SPONZA_LAMP_INTENSITY", 1200000.0))
+sceneBuilder.addLight(lamp)
+
+camera = Camera("Camera0")
+camera.position = _parse_vec3("SPONZA_CAM_POS", float3(-900.0, 350.0, 0.0))
+camera.target = _parse_vec3("SPONZA_CAM_TARGET", float3(900.0, 350.0, 0.0))
+camera.up = float3(0.0, 1.0, 0.0)
+camera.focalLength = _parse_float("SPONZA_FOCAL_LENGTH", 28.0)
+camera.nearPlane = _parse_float("SPONZA_NEAR_PLANE", 0.1)
+camera.farPlane = _parse_float("SPONZA_FAR_PLANE", 12000.0)
+sceneBuilder.addCamera(camera)
+sceneBuilder.selectedCamera = camera

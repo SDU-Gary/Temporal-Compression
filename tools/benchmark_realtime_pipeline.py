@@ -400,6 +400,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Field construction backend (commit1 metadata only; logic unchanged)")
     parser.add_argument("--gbuffer-mode", choices=["realtime", "reuse_first"], default="realtime",
                         help="GBuffer mode (commit1 metadata only; logic unchanged)")
+    parser.add_argument("--gbuffer-pass", choices=["rt", "raster", "auto"], default="rt",
+                        help="GBuffer backend passed through to the Falcor worker.")
 
     parser.add_argument("--frame-start", type=int, default=0)
     parser.add_argument("--frame-step", type=int, default=1)
@@ -656,6 +658,7 @@ def _run_split_runtime(
         "--grid-chunk", str(args.grid_chunk),
         "--field-builder", str(args.field_builder),
         "--gbuffer-mode", str(args.gbuffer_mode),
+        "--gbuffer-pass", str(args.gbuffer_pass),
         "--normal-transform", str(args.normal_transform),
         "--cosine-mode", str(args.cosine_mode),
         "--sh-debug-coeff", str(int(args.sh_debug_coeff)),
@@ -739,6 +742,7 @@ def _run_split_runtime(
         "falcor_python_path": str(args.falcor_python_path),
         "field_builder": str(args.field_builder),
         "gbuffer_mode": str(args.gbuffer_mode),
+        "gbuffer_pass": str(args.gbuffer_pass),
         "normal_transform": str(args.normal_transform),
         "cosine_mode": str(args.cosine_mode),
         "sh_debug_coeff": int(args.sh_debug_coeff),

@@ -222,6 +222,15 @@ def _auto_grid_resolution(max_probes: int) -> int:
     return max(2, res)
 
 
+def _parse_vec3_arg(text: str | None) -> np.ndarray | None:
+    if text is None or str(text).strip() == "":
+        return None
+    parts = [p.strip() for p in str(text).split(",") if p.strip()]
+    if len(parts) != 3:
+        raise ValueError(f"Expected vec3 as 'x,y,z', got: {text}")
+    return np.array([float(parts[0]), float(parts[1]), float(parts[2])], dtype=np.float32)
+
+
 def _sample_uniform_positions(
     bounds: Tuple[np.ndarray, np.ndarray],
     count: int,
@@ -371,6 +380,12 @@ def main():
         max_probes = os.environ.get("FALCOR_MAX_PROBES", "")
         args.max_configs = int(max_configs) if max_configs else None
         args.max_probes = int(max_probes) if max_probes else None
+        args.bounds_min = os.environ.get("FALCOR_BOUNDS_MIN", "")
+        args.bounds_max = os.environ.get("FALCOR_BOUNDS_MAX", "")
+        args.camera_near_plane = float(os.environ.get("FALCOR_CAMERA_NEAR_PLANE", "0.001"))
+        args.camera_far_plane = float(os.environ.get("FALCOR_CAMERA_FAR_PLANE", "12000.0"))
+        args.sun_intensity_scale = float(os.environ.get("FALCOR_SUN_INTENSITY_SCALE", "1.0"))
+        args.lamp_intensity_scale = float(os.environ.get("FALCOR_LAMP_INTENSITY_SCALE", "1.0"))
         args.falcor_python_path = os.environ.get("FALCOR_PYTHON_PATH")
     else:
         parser = argparse.ArgumentParser(description="Generate multi-light dataset (Falcor)")
@@ -392,6 +407,12 @@ def main():
         parser.add_argument("--probe-surface-offset-max", type=float, default=0.5)
         parser.add_argument("--config-mode", type=str, default="mix", choices=["grid", "mix"])
         parser.add_argument("--uniform-ratio", type=float, default=0.7)
+        parser.add_argument("--bounds-min", type=str, default=None, help="Optional sampling bounds min as x,y,z")
+        parser.add_argument("--bounds-max", type=str, default=None, help="Optional sampling bounds max as x,y,z")
+        parser.add_argument("--camera-near-plane", type=float, default=0.001)
+        parser.add_argument("--camera-far-plane", type=float, default=12000.0)
+        parser.add_argument("--sun-intensity-scale", type=float, default=1.0)
+        parser.add_argument("--lamp-intensity-scale", type=float, default=1.0)
         parser.add_argument("--falcor-python-path", type=str, default=None)
         args = parser.parse_args()
         args.use_russian_roulette = False
@@ -417,11 +438,26 @@ def main():
     )
     scene = load_scene(testbed, args.scene)
     configure_scene_for_sun(scene)
+    try:
+        scene.camera.nearPlane = float(args.camera_near_plane)
+        scene.camera.farPlane = float(args.camera_far_plane)
+    except Exception:
+        pass
 
     sun = get_light(scene, name="Sun")
     lamp = get_light(scene, name="Lamp")
 
     bounds = get_scene_bounds(scene)
+    scene_bounds = (bounds[0].copy(), bounds[1].copy())
+    override_min = _parse_vec3_arg(getattr(args, "bounds_min", None))
+    override_max = _parse_vec3_arg(getattr(args, "bounds_max", None))
+    if (override_min is None) != (override_max is None):
+        raise ValueError("--bounds-min and --bounds-max must be provided together.")
+    if override_min is not None and override_max is not None:
+        if np.any(override_max <= override_min):
+            raise ValueError(f"Invalid sampling bounds: min={override_min}, max={override_max}")
+        bounds = (override_min.astype(np.float32), override_max.astype(np.float32))
+
     scene_name = Path(args.scene).name.lower()
     obstacles: List[Tuple[np.ndarray, np.ndarray]] = []
     if "cornell_box" in scene_name:
@@ -567,12 +603,19 @@ def main():
                 cube_res=args.cube_res,
                 num_frames=args.num_frames,
                 seed_base=getattr(args, "fixed_seed", None),
+                near_plane=float(args.camera_near_plane),
+                far_plane=float(args.camera_far_plane),
             )
         if directions is None:
             raise RuntimeError("Directional SH sampling selected but directions are not initialized.")
         radiances = []
         for d in directions:
             set_camera_look(scene, probe, d)
+            try:
+                scene.camera.nearPlane = float(args.camera_near_plane)
+                scene.camera.farPlane = float(args.camera_far_plane)
+            except Exception:
+                pass
             radiances.append(
                 render_single_pixel(
                     testbed,
@@ -589,13 +632,14 @@ def main():
         zenith, azimuth = sun_angles.tolist()
         direction = zenith_azimuth_to_direction(float(zenith), float(azimuth))
         sun_rgb = compute_sun_rgb(float(zenith), 1.0, 5500.0, float(cloud))
+        sun_rgb = np.asarray(sun_rgb, dtype=np.float32) * float(args.sun_intensity_scale)
 
         # Set scene lights
         sun.direction = falcor.float3(float(direction[0]), float(direction[1]), float(direction[2]))
         sun.intensity = falcor.float3(float(sun_rgb[0]), float(sun_rgb[1]), float(sun_rgb[2]))
 
         lamp.position = falcor.float3(float(lamp_pos[0]), float(lamp_pos[1]), float(lamp_pos[2]))
-        lamp_i = clamp_lamp_intensity(float(lamp_intensity[0]), lamp_pos)
+        lamp_i = clamp_lamp_intensity(float(lamp_intensity[0]) * float(args.lamp_intensity_scale), lamp_pos)
         lamp_rgb = np.array([lamp_i] * 3, dtype=np.float32)
         lamp.intensity = falcor.float3(float(lamp_rgb[0]), float(lamp_rgb[1]), float(lamp_rgb[2]))
         lamp_intensities_out.append(lamp_i)
@@ -648,7 +692,13 @@ def main():
         "num_sh_samples": int(args.num_sh_samples),
         "num_samples": num_samples,
         "spp": int(args.spp),
+        "camera_near_plane": float(args.camera_near_plane),
+        "camera_far_plane": float(args.camera_far_plane),
+        "sun_intensity_scale": float(args.sun_intensity_scale),
+        "lamp_intensity_scale": float(args.lamp_intensity_scale),
         "bounds": {"min": bounds[0].tolist(), "max": bounds[1].tolist()},
+        "scene_bounds": {"min": scene_bounds[0].tolist(), "max": scene_bounds[1].tolist()},
+        "bounds_overridden": bool(override_min is not None),
         "probe_mode": args.probe_mode,
         "probe_uniform_ratio": float(args.probe_uniform_ratio),
         "probe_surface_offset_range": [

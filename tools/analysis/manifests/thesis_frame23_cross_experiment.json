@@ -1,0 +1,38 @@
+{
+  "aliases": {
+    "a15": "../../../3_experiments/results/thesis_visuals/20260427/a15_proxyfix_f23/sampled_npz/frame_0023.npz",
+    "a16": "../../../3_experiments/results/thesis_visuals/20260427/a16_seed19_f23/sampled_npz/frame_0023.npz",
+    "a22a": "../../../3_experiments/results/thesis_visuals/20260427/a22a_tail_f23/sampled_npz/frame_0023.npz"
+  },
+  "column_titles": ["GT", "Pred", "Err"],
+  "row_titles": ["A1.5", "A1.6", "A2.2-A Tail"],
+  "layout": {
+    "cell_size": [640, 360],
+    "outer_padding": 28,
+    "cell_gap": 16,
+    "row_title_width": 160,
+    "col_title_height": 44
+  },
+  "error_map": {
+    "source_space": "srgb",
+    "percentile": 99.0,
+    "colormap": "turbo"
+  },
+  "rows": [
+    [
+      {"kind": "gt", "npz": "a15"},
+      {"kind": "pred", "npz": "a15"},
+      {"kind": "err", "npz": "a15"}
+    ],
+    [
+      {"kind": "gt", "npz": "a16"},
+      {"kind": "pred", "npz": "a16"},
+      {"kind": "err", "npz": "a16"}
+    ],
+    [
+      {"kind": "gt", "npz": "a22a"},
+      {"kind": "pred", "npz": "a22a"},
+      {"kind": "err", "npz": "a22a"}
+    ]
+  ]
+}
